@@ -1,0 +1,39 @@
+docker run -d \
+  --restart=unless-stopped \
+  --pull=always \
+  --health-cmd="cat /proc/net/udp | grep D96" \
+  --name=firezone-relay-selfhost \
+  --cap-add=NET_ADMIN \
+  --volume /var/lib/firezone \
+  --sysctl net.ipv4.ip_forward=1 \
+  --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+  --sysctl net.ipv6.conf.all.forwarding=1 \
+  --sysctl net.ipv6.conf.default.forwarding=1 \
+  --device="/dev/net/tun:/dev/net/tun" \
+  --env FIREZONE_ID="" \
+  --env FIREZONE_TOKEN="" \
+  --env PUBLIC_IP4_ADDR="" \
+  --env RUST_LOG="firezone_relay=info,firezone_tunnel=info,connlib_shared=info,tunnel_state=info,phoenix_channel=info,snownet=info,str0m=info,warn" \
+  --env LOG_FORMAT="json" \
+  --env FIREZONE_API_URL="" \
+  --env FIREZONE_NAME=$(hostname) \
+  ghcr.io/firezone/relay:latest
+
+docker run -d \
+  --restart=unless-stopped \
+  --pull=always \
+  --network host \
+  --health-cmd="cat /proc/net/udp | grep D96" \
+  --name=firezone-relay-selfhost \
+  --cap-add=NET_ADMIN \
+  --volume /var/lib/firezone \
+  --device="/dev/net/tun:/dev/net/tun" \
+  --env FIREZONE_ID="" \
+  --env FIREZONE_TOKEN="" \
+  --env PUBLIC_IP4_ADDR="" \
+  --env RUST_LOG="firezone_relay=info,firezone_tunnel=info,connlib_shared=info,tunnel_state=info,phoenix_channel=info,snownet=info,str0m=info,warn" \
+  --env LOG_FORMAT="json" \
+  --env FIREZONE_API_URL="" \
+  --env FIREZONE_NAME=$(hostname) \
+  ghcr.io/firezone/relay:latest

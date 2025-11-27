@@ -1,0 +1,176 @@
+services:
+  traefik:
+    image: traefik:v3.6
+    container_name: firezone-traefik
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    command:
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certificates:/letsencrypt
+    networks:
+      - firezone-network
+
+  postgres:
+    image: postgres:17
+    container_name: firezone-postgres
+    command:
+      ["postgres", "-c", "wal_level=logical", "-c", "max_connections=200"]
+    restart: always
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TZ}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+    ports:
+      - 5432:5432/tcp
+    networks:
+      - firezone-network
+
+  vault:
+    image: hashicorp/vault:1.13.3
+    container_name: firezone-vault
+    restart: always
+    volumes:
+      - vault-data:/vault/file
+    environment:
+      VAULT_ADDR: "http://0.0.0.0:8200"
+      VAULT_API_ADDR: "http://0.0.0.0:8200"
+      VAULT_LOCAL_CONFIG: '{"backend": {"file": {"path": "/vault/file"}}, "listener": {"tcp": {"address": "0.0.0.0:8200", "tls_disable": true}}, "ui": false, "disable_mlock": true}'
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - firezone-network
+    command: server
+
+  web:
+    image: ghcr.io/firezone/web:latest
+    container_name: firezone-web
+    restart: always
+    env_file: .env
+    hostname: web.firezone
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      # Feature flags
+      FEATURE_POLICY_CONDITIONS_ENABLED: "true"
+      FEATURE_MULTI_SITE_RESOURCES_ENABLED: "true"
+      FEATURE_SELF_HOSTED_RELAYS_ENABLED: "true"
+      FEATURE_IDP_SYNC_ENABLED: "true"
+      FEATURE_REST_API_ENABLED: "true"
+      FEATURE_INTERNET_RESOURCE_ENABLED: "true"
+      WEB_EXTERNAL_URL: ${WEB_EXTERNAL_URL:-https://speed18.abc.vn/}
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-https://api.speed18.abc.vn/}
+      PHOENIX_HTTP_WEB_PORT: "8080"
+      PHOENIX_SECURE_COOKIES: "true"
+      RELEASE_HOSTNAME: web.firezone
+      RELEASE_NODE: web@web.firezone
+      RELEASE_COOKIE: ${SECRET_KEY_BASE}
+      ERLANG_CLUSTER_ADAPTER: "Elixir.Cluster.Strategy.Epmd"
+      ERLANG_CLUSTER_ADAPTER_CONFIG: '{"hosts":["api@api.firezone","web@web.firezone"]}'
+      OUTBOUND_EMAIL_ADAPTER: ${OUTBOUND_EMAIL_ADAPTER:-"Elixir.Swoosh.Adapters.SMTP"}
+      OUTBOUND_EMAIL_FROM: ${OUTBOUND_EMAIL_FROM:-"firezone-uat@abc.net"}
+      OUTBOUND_EMAIL_ADAPTER_OPTS: ${OUTBOUND_EMAIL_ADAPTER_OPTS:-'{"relay":"210.x.x.x"}'}
+      TZ: ${TZ}
+      LOG_LEVEL: "info"
+      MIX_ENV: "prod"
+      VAULT_ADDR: "http://vault:8200"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      firezone-network:
+        aliases:
+          - web.firezone
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fz-web.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.fz-web.entrypoints=websecure"
+      - "traefik.http.routers.fz-web.tls.certresolver=myresolver"
+      - "traefik.http.services.fz-web.loadbalancer.server.port=8080"
+
+  api:
+    image: ghcr.io/firezone/api:latest
+    container_name: firezone-api
+    restart: always
+    env_file: .env
+    hostname: api.firezone
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB}
+      DATABASE_USER: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      # Feature flags
+      FEATURE_POLICY_CONDITIONS_ENABLED: "true"
+      FEATURE_MULTI_SITE_RESOURCES_ENABLED: "true"
+      FEATURE_SELF_HOSTED_RELAYS_ENABLED: "true"
+      FEATURE_IDP_SYNC_ENABLED: "true"
+      FEATURE_REST_API_ENABLED: "true"
+      FEATURE_INTERNET_RESOURCE_ENABLED: "true"
+      WEB_EXTERNAL_URL: ${WEB_EXTERNAL_URL:-https://speed18.abc.vn/}
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-https://api.speed18.abc.vn/}
+      PHOENIX_HTTP_API_PORT: "8081"
+      PHOENIX_SECURE_COOKIES: "true"
+      RELEASE_HOSTNAME: api.firezone
+      RELEASE_NODE: api@api.firezone
+      RELEASE_COOKIE: ${SECRET_KEY_BASE}
+      ERLANG_CLUSTER_ADAPTER: "Elixir.Cluster.Strategy.Epmd"
+      ERLANG_CLUSTER_ADAPTER_CONFIG: '{"hosts":["api@api.firezone","web@web.firezone"]}'
+      OUTBOUND_EMAIL_ADAPTER: ${OUTBOUND_EMAIL_ADAPTER:-"Elixir.Swoosh.Adapters.SMTP"}
+      OUTBOUND_EMAIL_FROM: ${OUTBOUND_EMAIL_FROM:-"firezone-uat@abc.net"}
+      OUTBOUND_EMAIL_ADAPTER_OPTS: ${OUTBOUND_EMAIL_ADAPTER_OPTS:-'{"relay":"210.x.x.x"}'}
+      TZ: ${TZ}
+      LOG_LEVEL: "info"
+      MIX_ENV: "prod"
+      VAULT_ADDR: "http://vault:8200"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      firezone-network:
+        aliases:
+          - api.firezone
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.fz-api.rule=Host(`${API_DOMAIN}`)"
+      - "traefik.http.routers.fz-api.entrypoints=websecure"
+      - "traefik.http.routers.fz-api.tls.certresolver=myresolver"
+      - "traefik.http.services.fz-api.loadbalancer.server.port=8081"
+
+volumes:
+  postgres-data:
+  vault-data:
+  traefik-certificates:
+
+networks:
+  firezone-network:
+    driver: bridge
