@@ -23,10 +23,44 @@ export default function Gateway() {
   return (
     <Entries downloadLinks={downloadLinks} title="Gateway">
       <Unreleased>
+        <ChangeItem pull="11625">
+          Fails faster when the initial connection to the control plane cannot
+          be established, allowing faster restarts by the process manager.
+        </ChangeItem>
+        <ChangeItem pull="11584">
+          Improves connection reliability on systems where certain UDP socket
+          features are unavailable.
+        </ChangeItem>
+        <ChangeItem pull="11627">
+          Fixes an issue where reconnections would fail if the portal host is an
+          IP address.
+        </ChangeItem>
+        <ChangeItem pull="11626">
+          Fixes an issue where reconnecting to the portal would fail if the DNS
+          resolver list was empty due to a network reset or other edge case.
+        </ChangeItem>
+        <ChangeItem pull="11595">
+          Passes the authentication token in the x-authorization header instead
+          of in the URL, improving rate limiting for users behind shared IPs.
+        </ChangeItem>
+        <ChangeItem pull="11594">
+          Implements retry with exponential backoff on 429 (Too Many Requests)
+          responses from the portal.
+        </ChangeItem>
+      </Unreleased>
+      <Entry version="1.4.19" date={new Date("2025-12-23")}>
         <ChangeItem pull="10972">
           Fixes an issue where IPv6-only DNS resources could not be reached.
         </ChangeItem>
-      </Unreleased>
+        <ChangeItem pull="11115">
+          Fixes an issue where Firezone would not connect if an IPv6 interface
+          is present but not routable.
+        </ChangeItem>
+        <ChangeItem pull="11208">
+          Fixes an issue where the Gateway would not boot up if IPv6 was
+          disabled on the system.
+        </ChangeItem>
+      </Entry>
       <Entry version="1.4.18" date={new Date("2025-11-10")}>
         <ChangeItem pull="10620">
           Adds a `--log-format` CLI option to output logs as JSON.

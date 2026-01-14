@@ -4,6 +4,8 @@
 //! [Tunnel] is the main entry-point for this crate.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::print_stdout))]
+#![cfg_attr(test, allow(clippy::print_stderr))]
 
 use anyhow::{Context as _, ErrorExt as _, Result};
 use chrono::Utc;
@@ -101,7 +103,7 @@ impl<TRoleState> Tunnel<TRoleState> {
         self.io.set_tun(tun);
     }
 
-    pub fn rebind_dns(&mut self, sockets: Vec<SocketAddr>) -> Result<()> {
+    pub fn rebind_dns(&mut self, sockets: Vec<SocketAddr>) -> Result<(), TunnelError> {
         self.io.rebind_dns(sockets)
     }
 }
@@ -581,7 +583,7 @@ pub enum ClientEvent {
     },
     ConnectionIntent {
         resource: ResourceId,
-        connected_gateway_ids: BTreeSet<GatewayId>,
+        preferred_gateways: Vec<GatewayId>,
     },
     /// The list of resources has changed and UI clients may have to be updated.
     ResourcesChanged {
@@ -594,7 +596,7 @@ pub enum ClientEvent {
     Error(TunnelError),
 }
 
-#[derive(Clone, derive_more::Debug, PartialEq, Eq)]
+#[derive(Clone, derive_more::Debug, PartialEq, Eq, Hash)]
 pub struct TunConfig {
     pub ip: IpConfig,
     /// The map of DNS servers that connlib will use.
@@ -612,7 +614,7 @@ pub struct TunConfig {
     pub ipv6_routes: BTreeSet<Ipv6Network>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IpConfig {
     pub v4: Ipv4Addr,
     pub v6: Ipv6Addr,

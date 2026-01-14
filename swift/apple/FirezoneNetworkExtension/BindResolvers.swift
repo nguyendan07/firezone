@@ -3,7 +3,6 @@
 //  (c) 2024 Firezone, Inc.
 //  LICENSE: Apache-2.0
 //
-//
 // Reads system resolvers from libresolv, similar to reading /etc/resolv.conf but this also works on iOS
 
 import FirezoneKit
@@ -59,9 +58,13 @@ enum BindResolvers {
     // Convert CChar (Int8) to UInt8 for String(decoding:)
     if let nullIndex = hostBuffer.firstIndex(of: 0) {
       let bytes = hostBuffer[..<nullIndex].map { UInt8(bitPattern: $0) }
+      // False positive: String(decoding:as:) is non-failable
+      // swiftlint:disable:next optional_data_string_conversion
       return String(decoding: bytes, as: UTF8.self)
     } else {
       let bytes = hostBuffer.map { UInt8(bitPattern: $0) }
+      // False positive: String(decoding:as:) is non-failable
+      // swiftlint:disable:next optional_data_string_conversion
       return String(decoding: bytes, as: UTF8.self)
     }
   }

@@ -14,7 +14,11 @@ public final class Log {
       return Logger(subsystem: "dev.firezone.firezone", category: "app")
     case "dev.firezone.firezone.network-extension":
       return Logger(subsystem: "dev.firezone.firezone", category: "tunnel")
+    case nil:
+      return Logger(subsystem: "dev.firezone.firezone", category: "tests")
     default:
+      // In fatalError context - force unwrap is appropriate
+      // swiftlint:disable:next force_unwrapping
       fatalError("Unknown bundle id: \(Bundle.main.bundleIdentifier!)")
     }
   }()
@@ -26,7 +30,11 @@ public final class Log {
       folderURL = SharedAccess.appLogFolderURL
     case "dev.firezone.firezone.network-extension":
       folderURL = SharedAccess.tunnelLogFolderURL
+    case nil:
+      folderURL = nil
     default:
+      // In fatalError context - force unwrap is appropriate
+      // swiftlint:disable:next force_unwrapping
       fatalError("Unknown bundle id: \(Bundle.main.bundleIdentifier!)")
     }
     return LogWriter(folderURL: folderURL, logger: logger)
@@ -80,7 +88,7 @@ public final class Log {
           .totalFileSizeKey,
           .isRegularFileKey,
         ]
-      ) { url, resourceValues in
+      ) { _, resourceValues in
         // Extract non-Sendable values before passing to @Sendable closure
         guard resourceValues.isRegularFile == true else { return }
         let size = Int64(resourceValues.totalFileAllocatedSize ?? resourceValues.totalFileSize ?? 0)

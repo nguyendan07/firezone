@@ -22,7 +22,7 @@ pub struct ResourceDescriptionDns {
     pub name: String,
 
     pub address_description: Option<String>,
-    #[serde(rename = "gateway_groups")]
+    #[serde(rename = "gateway_groups", alias = "sites")]
     pub sites: Vec<Site>,
 
     /// The IP stack supported by this resource.
@@ -43,7 +43,7 @@ pub struct ResourceDescriptionCidr {
     pub name: String,
 
     pub address_description: Option<String>,
-    #[serde(rename = "gateway_groups")]
+    #[serde(rename = "gateway_groups", alias = "sites")]
     pub sites: Vec<Site>,
 }
 
@@ -62,7 +62,7 @@ pub struct ResourceDescriptionInternet {
     /// Resource's id.
     pub id: ResourceId,
     /// Sites for the internet resource
-    #[serde(rename = "gateway_groups")]
+    #[serde(rename = "gateway_groups", alias = "sites")]
     pub sites: Vec<Site>,
 }
 
@@ -97,7 +97,7 @@ pub struct FlowCreated {
     pub gateway_public_key: Key,
     pub gateway_ipv4: Ipv4Addr,
     pub gateway_ipv6: Ipv6Addr,
-    #[serde(rename = "gateway_group_id")]
+    #[serde(rename = "gateway_group_id", alias = "site_id")]
     pub site_id: SiteId,
     pub preshared_key: SecretKey,
     pub client_ice_credentials: IceCredentials,
@@ -156,7 +156,7 @@ pub enum IngressMessages {
     FlowCreationFailed(FlowCreationFailed),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct GatewaysIceCandidates {
     /// The list of gateway IDs these candidates will be broadcast to.
     pub gateway_ids: Vec<GatewayId>,
@@ -175,13 +175,14 @@ pub struct GatewayIceCandidates {
 }
 
 // These messages can be sent from a client to a control pane
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "event", content = "payload")]
 // enum_variant_names: These are the names in the portal!
 pub enum EgressMessages {
     CreateFlow {
         resource_id: ResourceId,
-        connected_gateway_ids: BTreeSet<GatewayId>,
+        #[serde(rename = "connected_gateway_ids")]
+        preferred_gateways: Vec<GatewayId>,
     },
     /// Candidates that can be used by the addressed gateways.
     BroadcastIceCandidates(GatewaysIceCandidates),
@@ -210,7 +211,7 @@ mod tests {
                 "name": "gitlab.mycorp.com",
                 "address": "gitlab.mycorp.com",
                 "address_description": "dns resource",
-                "gateway_groups": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}]
+                "sites": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}]
             },
             {
                 "id": "1106047c-cd5d-4151-b679-96b93da7383b",
@@ -244,7 +245,7 @@ mod tests {
                 "name": "gitlab.mycorp.com",
                 "address": "gitlab.mycorp.com",
                 "address_description": "dns resource",
-                "gateway_groups": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}]
+                "sites": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}]
             },
             {
                 "id": "1106047c-cd5d-4151-b679-96b93da7383b",
@@ -345,7 +346,7 @@ mod tests {
                         "id": "73037362-715d-4a83-a749-f18eadd970e7",
                         "name": "172.173.0.0/16",
                         "address_description": null,
-                        "gateway_groups": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}],
+                        "sites": [{"name": "test", "id": "bf56f32d-7b2c-4f5d-a784-788977d014a4"}],
                         "type": "cidr"
                     },
                     {
@@ -483,7 +484,7 @@ mod tests {
     fn serialize_create_flow_message() {
         let message = EgressMessages::CreateFlow {
             resource_id: "f16ecfa0-a94f-4bfd-a2ef-1cc1f2ef3da3".parse().unwrap(),
-            connected_gateway_ids: BTreeSet::new(),
+            preferred_gateways: Vec::new(),
         };
         let expected_json = r#"{"event":"create_flow","payload":{"resource_id":"f16ecfa0-a94f-4bfd-a2ef-1cc1f2ef3da3","connected_gateway_ids":[]}}"#;
         let actual_json = serde_json::to_string(&message).unwrap();

@@ -8,17 +8,29 @@
 import Foundation
 
 public struct Token: CustomStringConvertible {
+  #if DEBUG
+    private static let label = "Firezone token (debug)"
+    private static let account = "1 (debug)"
+    private static let description = "Firezone access token (debug)"
+  #else
+    private static let label = "Firezone token"
+    private static let account = "1"
+    private static let description = "Firezone access token"
+  #endif
+
   private static var query: [CFString: Any] {
     [
-      kSecAttrLabel: "Firezone token",
-      kSecAttrAccount: "1",
+      kSecAttrLabel: label,
+      kSecAttrAccount: account,
       kSecAttrService: BundleHelper.appGroupId,
-      kSecAttrDescription: "Firezone access token",
+      kSecAttrDescription: description,
     ]
   }
 
   private var data: Data
 
+  // TODO: refactor to avoid force unwrapping
+  // swiftlint:disable:next force_unwrapping
   public var description: String { String(data: data, encoding: .utf8)! }
 
   public init?(_ tokenString: String?) {

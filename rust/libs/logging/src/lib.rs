@@ -9,6 +9,7 @@ mod capturing_writer;
 mod display_btree_set;
 mod err_with_sources;
 mod event_message_contains_filter;
+pub mod windows_event_log;
 
 use std::sync::Arc;
 

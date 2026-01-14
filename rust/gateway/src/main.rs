@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use crate::eventloop::{Eventloop, PHOENIX_TOPIC};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, ErrorExt, Result, bail};
 use backoff::ExponentialBackoffBuilder;
 use bin_shared::{
     TunDeviceManager, device_id, http_health_check,
@@ -21,7 +21,7 @@ use telemetry::{
 use tunnel::GatewayTunnel;
 
 use phoenix_channel::PhoenixChannel;
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use std::{collections::BTreeSet, fmt};
 use std::{path::PathBuf, process::ExitCode};
 use std::{sync::Arc, time::Duration};
@@ -56,15 +56,18 @@ fn main() -> ExitCode {
         .build()
         .expect("Failed to create tokio runtime");
 
-    match runtime
-        .block_on(try_main(cli, &mut telemetry))
-        .context("Failed to start Gateway")
-    {
+    match runtime.block_on(try_main(cli, &mut telemetry)) {
         Ok(()) => {
             tracing::info!("Goodbye!");
             runtime.block_on(telemetry.stop());
 
             ExitCode::SUCCESS
+        }
+        Err(e) if e.any_is::<EventloopFailed>() => {
+            tracing::error!("{e:#}");
+            runtime.block_on(telemetry.stop_on_crash());
+
+            ExitCode::FAILURE
         }
         Err(e) => {
             tracing::info!("{e:#}");
@@ -176,7 +179,7 @@ async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
         opentelemetry::global::set_meter_provider(provider);
     }
 
-    let login = LoginUrl::gateway(cli.api_url, &token, firezone_id, cli.firezone_name)
+    let login = LoginUrl::gateway(cli.api_url, firezone_id, cli.firezone_name)
         .context("Failed to construct URL for logging into portal")?;
 
     let resolv_conf = resolv_conf::Config::parse(
@@ -195,8 +198,9 @@ async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
         nameservers,
     );
     let portal = PhoenixChannel::disconnected(
-        SecretBox::init_with(|| login),
-        get_user_agent(None, "gateway", env!("CARGO_PKG_VERSION")),
+        login,
+        token,
+        get_user_agent("gateway", env!("CARGO_PKG_VERSION")),
         PHOENIX_TOPIC,
         (),
         || {
@@ -205,8 +209,7 @@ async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
                 .build()
         },
         Arc::new(tcp_socket_factory),
-    )
-    .context("Failed to resolve portal URL")?;
+    );
 
     let mut tun_device_manager = TunDeviceManager::new(ip_packet::MAX_IP_SIZE)
         .context("Failed to create TUN device manager")?;
@@ -233,10 +236,15 @@ async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
 
     Eventloop::new(tunnel, portal, tun_device_manager, resolver)?
         .run()
-        .await?;
+        .await
+        .context(EventloopFailed)?;
 
     Ok(())
 }
+
+#[derive(thiserror::Error, Debug)]
+#[error("Eventloop failed")]
+struct EventloopFailed;
 
 fn tonic_otlp_exporter(
     endpoint: String,
