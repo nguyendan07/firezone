@@ -9,6 +9,12 @@ defmodule PortalWeb.OIDCControllerTest do
   alias PortalWeb.Cookie
   alias PortalWeb.Mocks
 
+  setup do
+    # Set up OIDC mock for all tests
+    Mocks.OIDC.stub_discovery_document()
+    :ok
+  end
+
   describe "sign_in/2" do
     test "returns 404 when account not found", %{conn: conn} do
       assert_raise Ecto.NoResultsError, fn ->
@@ -35,21 +41,21 @@ defmodule PortalWeb.OIDCControllerTest do
 
     test "redirects to IdP when account and provider are valid", %{conn: conn} do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
       conn = get(conn, "/#{account.id}/sign_in/oidc/#{provider.id}")
 
-      assert redirected_to(conn) =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirected_to(conn) =~ "/authorize"
       assert get_resp_cookie(conn, "oidc")
     end
 
     test "accepts account slug instead of id", %{conn: conn} do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
       conn = get(conn, "/#{account.slug}/sign_in/oidc/#{provider.id}")
 
-      assert redirected_to(conn) =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirected_to(conn) =~ "/authorize"
     end
 
     test "sets OIDC cookie with correct provider info", %{conn: conn} do
@@ -152,6 +158,40 @@ defmodule PortalWeb.OIDCControllerTest do
 
       assert flash(conn, :error) ==
                "This authentication method is not available for your sign-in context."
+    end
+
+    test "redirects with error when provider context doesn't allow headless-client access", %{
+      conn: conn,
+      account: account
+    } do
+      provider = oidc_provider_fixture(account: account, context: :portal_only)
+      cookie = build_oidc_cookie(account, provider, params: %{"as" => "headless-client"})
+
+      conn = perform_callback(conn, cookie)
+
+      assert redirected_to(conn) =~ "/#{account.slug}"
+
+      assert flash(conn, :error) ==
+               "This authentication method is not available for your sign-in context."
+    end
+
+    test "allows headless-client access when provider context is clients_only", %{
+      conn: conn,
+      account: account
+    } do
+      %{provider: provider} = setup_oidc_provider(account, context: :clients_only)
+      actor = admin_actor_fixture(account: account, email: "admin@example.com")
+
+      ctx = %{conn: conn, account: account, provider: provider}
+      setup_successful_auth(ctx, actor)
+
+      cookie =
+        build_oidc_cookie(account, provider, params: %{"as" => "headless-client"})
+
+      conn = perform_callback(conn, cookie)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "Copy token to clipboard"
     end
   end
 
@@ -302,22 +342,17 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "callback/2 token exchange errors" do
     setup do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
-      {:ok, account: account, provider: provider, bypass: bypass}
+      {:ok, account: account, provider: provider}
     end
 
     test "redirects with descriptive error when token exchange returns invalid_grant", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(400, JSON.encode!(%{"error" => "invalid_grant"}))
-      end)
+      Mocks.OIDC.set_token_error(400, %{"error" => "invalid_grant"})
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -331,14 +366,9 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when token exchange returns invalid_client", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(400, JSON.encode!(%{"error" => "invalid_client"}))
-      end)
+      Mocks.OIDC.set_token_error(400, %{"error" => "invalid_client"})
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -352,14 +382,9 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when token exchange returns 401", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(401, JSON.encode!(%{"error" => "unauthorized"}))
-      end)
+      Mocks.OIDC.set_token_error(401, %{"error" => "unauthorized"})
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -373,18 +398,9 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when token exchange returns 500", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      # Disable retry to avoid multiple requests
-      Application.put_env(:openid_connect, :retry, false)
-      on_exit(fn -> Application.delete_env(:openid_connect, :retry) end)
-
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(500, JSON.encode!(%{"error" => "server_error"}))
-      end)
+      Mocks.OIDC.set_token_error(500, %{"error" => "server_error"})
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -398,10 +414,13 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when JWT verification fails", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      expect_token_exchange(bypass, "invalid-jwt-token")
+      Mocks.OIDC.set_token_response(%{
+        "access_token" => "test-access-token",
+        "id_token" => "invalid-jwt-token",
+        "token_type" => "Bearer"
+      })
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -415,14 +434,10 @@ defmodule PortalWeb.OIDCControllerTest do
          %{
            conn: conn,
            account: account,
-           provider: provider,
-           bypass: bypass
+           provider: provider
          } do
-      # Disable Req retry for this test to avoid timeouts
-      Application.put_env(:openid_connect, :retry, false)
-      on_exit(fn -> Application.delete_env(:openid_connect, :retry) end)
-
-      Bypass.down(bypass)
+      # Replace stub with connection refused error
+      Mocks.OIDC.stub_connection_refused()
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -436,13 +451,28 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when token endpoint returns invalid JSON", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, "not valid json")
+      # Set up a stub that returns invalid JSON for token exchange
+      # Use suffix matching to support dynamic per-test endpoints
+      Req.Test.stub(PortalWeb.OIDC, fn conn ->
+        conn = PortalWeb.Mocks.OIDC.__fetch_conn_params__(conn)
+
+        cond do
+          String.ends_with?(conn.request_path, "/.well-known/openid-configuration") ->
+            Req.Test.json(conn, Mocks.OIDC.discovery_document())
+
+          String.ends_with?(conn.request_path, "/.well-known/jwks.json") ->
+            Req.Test.json(conn, %{"keys" => [Mocks.OIDC.jwks()]})
+
+          String.ends_with?(conn.request_path, "/oauth/token") ->
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(200, "not valid json")
+
+          true ->
+            Plug.Conn.send_resp(conn, 404, "")
+        end
       end)
 
       cookie = build_oidc_cookie(account, provider)
@@ -463,14 +493,9 @@ defmodule PortalWeb.OIDCControllerTest do
     test "redirects with descriptive error when token exchange returns generic 400 error", %{
       conn: conn,
       account: account,
-      provider: provider,
-      bypass: bypass
+      provider: provider
     } do
-      Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(400, JSON.encode!(%{"error" => "invalid_request"}))
-      end)
+      Mocks.OIDC.set_token_error(400, %{"error" => "invalid_request"})
 
       cookie = build_oidc_cookie(account, provider)
       conn = perform_callback(conn, cookie)
@@ -485,9 +510,9 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "callback/2 successful authentication" do
     setup do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
-      {:ok, account: account, provider: provider, bypass: bypass}
+      {:ok, account: account, provider: provider}
     end
 
     test "successful portal sign-in for admin user creates session and redirects", ctx do
@@ -508,6 +533,27 @@ defmodule PortalWeb.OIDCControllerTest do
       actor = actor_fixture(account: ctx.account, email: "user@example.com")
       setup_successful_auth(ctx, actor, sub: "regular-user-123")
       assert_client_sign_in_success(ctx)
+    end
+
+    test "successful headless-client sign-in for admin user creates token and renders token page",
+         ctx do
+      actor = admin_actor_fixture(account: ctx.account, email: "admin@example.com")
+      setup_successful_auth(ctx, actor)
+      assert_headless_client_sign_in_success(ctx)
+    end
+
+    test "successful headless-client sign-in for regular user creates token and renders token page",
+         ctx do
+      actor = actor_fixture(account: ctx.account, email: "user@example.com")
+      setup_successful_auth(ctx, actor, sub: "regular-user-123")
+      assert_headless_client_sign_in_success(ctx)
+    end
+
+    test "successful gui-client sign-in for admin user creates token and renders redirect page",
+         ctx do
+      actor = admin_actor_fixture(account: ctx.account, email: "admin@example.com")
+      setup_successful_auth(ctx, actor)
+      assert_gui_client_sign_in_success(ctx)
     end
 
     test "successful sign-in with unverified email logs info message", ctx do
@@ -645,6 +691,81 @@ defmodule PortalWeb.OIDCControllerTest do
       assert redirected_to(conn) == "/#{ctx.account.slug}"
       assert flash(conn, :error) == "This action requires admin privileges."
     end
+
+    test "rejects client sign-in when users_limit_exceeded is true", ctx do
+      actor = actor_fixture(account: ctx.account, email: "user@example.com")
+      setup_successful_auth(ctx, actor, sub: "regular-user-123")
+
+      update_account(ctx.account, %{users_limit_exceeded: true})
+
+      cookie = build_oidc_cookie(ctx.account, ctx.provider, params: client_params())
+      conn = perform_callback(ctx.conn, cookie)
+
+      assert redirected_to(conn) =~ "/#{ctx.account.slug}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "allows gui-client sign-in when seats_limit_exceeded is true (soft limit)", ctx do
+      actor = actor_fixture(account: ctx.account, email: "user@example.com")
+      setup_successful_auth(ctx, actor, sub: "regular-user-123")
+
+      update_account(ctx.account, %{seats_limit_exceeded: true})
+
+      cookie =
+        build_oidc_cookie(ctx.account, ctx.provider,
+          params: %{"as" => "gui-client", "nonce" => "client-nonce", "state" => "client-state"}
+        )
+
+      # Sign-in should still succeed since seats is a soft limit
+      conn = perform_callback(ctx.conn, cookie)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "rejects headless-client sign-in when users_limit_exceeded is true", ctx do
+      actor = actor_fixture(account: ctx.account, email: "user@example.com")
+      setup_successful_auth(ctx, actor, sub: "regular-user-123")
+
+      update_account(ctx.account, %{users_limit_exceeded: true})
+
+      cookie =
+        build_oidc_cookie(ctx.account, ctx.provider,
+          params: %{"as" => "headless-client", "state" => "client-state"}
+        )
+
+      conn = perform_callback(ctx.conn, cookie)
+
+      assert redirected_to(conn) =~ "/#{ctx.account.slug}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "allows client sign-in when only sites_limit_exceeded is true", ctx do
+      actor = actor_fixture(account: ctx.account, email: "user@example.com")
+      setup_successful_auth(ctx, actor, sub: "regular-user-123")
+
+      # Sites limit doesn't block client sign-in
+      update_account(ctx.account, %{sites_limit_exceeded: true})
+
+      cookie = build_oidc_cookie(ctx.account, ctx.provider, params: client_params())
+      conn = perform_callback(ctx.conn, cookie)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "allows portal sign-in when users_limit_exceeded is true", ctx do
+      actor = admin_actor_fixture(account: ctx.account, email: "admin@example.com")
+      setup_successful_auth(ctx, actor)
+
+      update_account(ctx.account, %{users_limit_exceeded: true})
+
+      cookie = build_oidc_cookie(ctx.account, ctx.provider)
+      conn = perform_callback(ctx.conn, cookie)
+
+      # Portal sign-in should still be allowed so admins can manage billing
+      assert redirected_to(conn) =~ "/#{ctx.account.slug}/sites"
+    end
   end
 
   describe "callback/2 with userinfo fetch failure" do
@@ -654,21 +775,19 @@ defmodule PortalWeb.OIDCControllerTest do
       on_exit(fn -> Application.delete_env(:openid_connect, :retry) end)
 
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
-      {:ok, account: account, provider: provider, bypass: bypass}
+      {:ok, account: account, provider: provider}
     end
 
     test "succeeds even when userinfo endpoint fails", ctx do
       actor = admin_actor_fixture(account: ctx.account, email: "admin@example.com")
 
       id_token = sign_id_token(ctx.provider, actor)
-      expect_token_exchange(ctx.bypass, id_token)
+      expect_token_exchange(id_token)
 
       # Userinfo endpoint returns error
-      Bypass.expect_once(ctx.bypass, "GET", "/userinfo", fn conn ->
-        Plug.Conn.resp(conn, 500, "Internal Server Error")
-      end)
+      Mocks.OIDC.set_userinfo_error(500, %{"error" => "server_error"})
 
       assert_portal_sign_in_success(ctx)
     end
@@ -677,9 +796,9 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "callback/2 identity errors" do
     setup do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
-      {:ok, account: account, provider: provider, bypass: bypass}
+      {:ok, account: account, provider: provider}
     end
 
     test "redirects with error when no matching actor exists", ctx do
@@ -694,9 +813,9 @@ defmodule PortalWeb.OIDCControllerTest do
           "exp" => token_exp()
         })
 
-      expect_token_exchange(ctx.bypass, id_token)
+      expect_token_exchange(id_token)
 
-      Mocks.OIDC.expect_userinfo(ctx.bypass, %{
+      Mocks.OIDC.set_userinfo_response(%{
         "sub" => "nonexistent-user-123",
         "email" => "nonexistent@example.com",
         "name" => "Test User"
@@ -720,9 +839,9 @@ defmodule PortalWeb.OIDCControllerTest do
           "exp" => token_exp()
         })
 
-      expect_token_exchange(ctx.bypass, id_token)
+      expect_token_exchange(id_token)
 
-      Mocks.OIDC.expect_userinfo(ctx.bypass, %{
+      Mocks.OIDC.set_userinfo_response(%{
         "sub" => "user-without-email-123",
         "name" => "User Without Email"
       })
@@ -783,10 +902,9 @@ defmodule PortalWeb.OIDCControllerTest do
             )
           )
 
-        expect_token_exchange(ctx.bypass, id_token)
+        expect_token_exchange(id_token)
 
-        Mocks.OIDC.expect_userinfo(
-          ctx.bypass,
+        Mocks.OIDC.set_userinfo_response(
           Map.merge(
             %{
               "sub" => "admin-user-123",
@@ -820,23 +938,28 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "sign_in/2 with Google provider" do
     test "redirects to IdP with prompt=select_account", %{conn: conn} do
       account = account_fixture()
-      bypass = Mocks.OIDC.discovery_document_server()
+      mock_endpoint = Mocks.OIDC.mock_endpoint()
 
-      # Override Google config to use bypass
+      # Override Google config to use Req.Test mock
       Portal.Config.put_env_override(:portal, Portal.Google.AuthProvider,
         client_id: "test-google-client-id",
         client_secret: "test-google-client-secret",
         response_type: "code",
         scope: "openid email profile",
-        discovery_document_uri: "http://localhost:#{bypass.port}/.well-known/openid-configuration"
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        req_opts: [retry: false, plug: {Req.Test, PortalWeb.OIDC}]
       )
 
-      provider = google_provider_fixture(bypass, account: account)
+      provider =
+        google_provider_fixture(
+          account: account,
+          issuer: "#{mock_endpoint}/"
+        )
 
       conn = get(conn, "/#{account.id}/sign_in/google/#{provider.id}")
 
       redirect_url = redirected_to(conn)
-      assert redirect_url =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirect_url =~ "#{mock_endpoint}/authorize"
       assert redirect_url =~ "prompt=select_account"
     end
   end
@@ -844,23 +967,28 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "sign_in/2 with Entra provider" do
     test "redirects to IdP with prompt=select_account", %{conn: conn} do
       account = account_fixture()
-      bypass = Mocks.OIDC.discovery_document_server()
+      mock_endpoint = Mocks.OIDC.mock_endpoint()
 
-      # Override Entra config to use bypass
+      # Override Entra config to use Req.Test mock
       Portal.Config.put_env_override(:portal, Portal.Entra.AuthProvider,
         client_id: "test-entra-client-id",
         client_secret: "test-entra-client-secret",
         response_type: "code",
         scope: "openid email profile",
-        discovery_document_uri: "http://localhost:#{bypass.port}/.well-known/openid-configuration"
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        req_opts: [retry: false, plug: {Req.Test, PortalWeb.OIDC}]
       )
 
-      provider = entra_provider_fixture(bypass, account: account)
+      provider =
+        entra_provider_fixture(
+          account: account,
+          issuer: "#{mock_endpoint}/"
+        )
 
       conn = get(conn, "/#{account.id}/sign_in/entra/#{provider.id}")
 
       redirect_url = redirected_to(conn)
-      assert redirect_url =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirect_url =~ "#{mock_endpoint}/authorize"
       assert redirect_url =~ "prompt=select_account"
     end
   end
@@ -868,21 +996,27 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "sign_in/2 with Okta provider" do
     test "redirects to IdP with prompt=select_account", %{conn: conn} do
       account = account_fixture()
-      bypass = Mocks.OIDC.discovery_document_server()
+      mock_endpoint = Mocks.OIDC.mock_endpoint()
 
-      # Override Okta config to use bypass (HTTP instead of HTTPS)
+      # Override Okta config to use Req.Test mock
       Portal.Config.put_env_override(:portal, Portal.Okta.AuthProvider,
         response_type: "code",
         scope: "openid email profile",
-        discovery_document_uri: "http://localhost:#{bypass.port}/.well-known/openid-configuration"
+        discovery_document_uri: Mocks.OIDC.discovery_document_uri(),
+        req_opts: [retry: false, plug: {Req.Test, PortalWeb.OIDC}]
       )
 
-      provider = okta_provider_fixture(bypass, account: account)
+      provider =
+        okta_provider_fixture(
+          account: account,
+          okta_domain: "mock.oidc.test",
+          issuer: "#{mock_endpoint}/"
+        )
 
       conn = get(conn, "/#{account.id}/sign_in/okta/#{provider.id}")
 
       redirect_url = redirected_to(conn)
-      assert redirect_url =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirect_url =~ "#{mock_endpoint}/authorize"
       assert redirect_url =~ "prompt=select_account"
     end
   end
@@ -905,7 +1039,7 @@ defmodule PortalWeb.OIDCControllerTest do
   describe "sign_in/2 with client context" do
     test "redirects to IdP with client params", %{conn: conn} do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
       conn =
         get(conn, "/#{account.id}/sign_in/oidc/#{provider.id}", %{
@@ -914,13 +1048,13 @@ defmodule PortalWeb.OIDCControllerTest do
           "nonce" => "client-nonce"
         })
 
-      assert redirected_to(conn) =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirected_to(conn) =~ "/authorize"
       assert conn.resp_cookies["oidc"]
     end
 
     test "preserves redirect_to param for client auth", %{conn: conn} do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
+      %{provider: provider} = setup_oidc_provider(account)
 
       conn =
         get(conn, "/#{account.id}/sign_in/oidc/#{provider.id}", %{
@@ -928,7 +1062,36 @@ defmodule PortalWeb.OIDCControllerTest do
           "redirect_to" => "/some/path"
         })
 
-      assert redirected_to(conn) =~ "http://localhost:#{bypass.port}/authorize"
+      assert redirected_to(conn) =~ "/authorize"
+      assert conn.resp_cookies["oidc"]
+    end
+
+    test "redirects to IdP with headless-client params", %{conn: conn} do
+      account = account_fixture()
+      %{provider: provider} = setup_oidc_provider(account)
+
+      conn =
+        get(conn, "/#{account.id}/sign_in/oidc/#{provider.id}", %{
+          "as" => "headless-client",
+          "state" => "headless-state"
+        })
+
+      assert redirected_to(conn) =~ "/authorize"
+      assert conn.resp_cookies["oidc"]
+    end
+
+    test "redirects to IdP with gui-client params", %{conn: conn} do
+      account = account_fixture()
+      %{provider: provider} = setup_oidc_provider(account)
+
+      conn =
+        get(conn, "/#{account.id}/sign_in/oidc/#{provider.id}", %{
+          "as" => "gui-client",
+          "state" => "gui-state",
+          "nonce" => "gui-nonce"
+        })
+
+      assert redirected_to(conn) =~ "/authorize"
       assert conn.resp_cookies["oidc"]
     end
   end
@@ -937,6 +1100,10 @@ defmodule PortalWeb.OIDCControllerTest do
     setup do
       # Disable Req retry for these tests to avoid timeouts
       Application.put_env(:openid_connect, :retry, false)
+
+      # Clear the discovery document cache before each test in this block
+      # so the library will attempt to fetch the document again
+      OpenIDConnect.Document.Cache.clear()
 
       on_exit(fn ->
         Application.delete_env(:openid_connect, :retry)
@@ -950,10 +1117,10 @@ defmodule PortalWeb.OIDCControllerTest do
            conn: conn
          } do
       account = account_fixture()
-      %{bypass: bypass, provider: provider} = setup_oidc_provider(account)
 
-      # Bring down the bypass server to simulate connection refused
-      Bypass.down(bypass)
+      # Stub connection refused error for discovery document
+      Mocks.OIDC.stub_connection_refused()
+      %{provider: provider} = setup_oidc_provider(account)
 
       log =
         capture_log(fn ->
@@ -972,15 +1139,10 @@ defmodule PortalWeb.OIDCControllerTest do
       conn: conn
     } do
       account = account_fixture()
-      bypass = Bypass.open()
 
-      Bypass.stub(bypass, "GET", "/.well-known/openid-configuration", fn conn ->
-        conn
-        |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.resp(200, "not valid json")
-      end)
-
-      provider = oidc_provider_fixture(bypass, account: account)
+      # Stub invalid JSON response for discovery document
+      Mocks.OIDC.stub_invalid_json()
+      %{provider: provider} = setup_oidc_provider(account)
 
       log =
         capture_log(fn ->
@@ -997,13 +1159,10 @@ defmodule PortalWeb.OIDCControllerTest do
 
     test "redirects with descriptive error when discovery document returns 404", %{conn: conn} do
       account = account_fixture()
-      bypass = Bypass.open()
 
-      Bypass.stub(bypass, "GET", "/.well-known/openid-configuration", fn conn ->
-        Plug.Conn.resp(conn, 404, "Not Found")
-      end)
-
-      provider = oidc_provider_fixture(bypass, account: account)
+      # Stub 404 error for discovery document
+      Mocks.OIDC.stub_discovery_error(404, "Not Found")
+      %{provider: provider} = setup_oidc_provider(account)
 
       log =
         capture_log(fn ->
@@ -1020,13 +1179,10 @@ defmodule PortalWeb.OIDCControllerTest do
 
     test "redirects with descriptive error when discovery document returns 500", %{conn: conn} do
       account = account_fixture()
-      bypass = Bypass.open()
 
-      Bypass.stub(bypass, "GET", "/.well-known/openid-configuration", fn conn ->
-        Plug.Conn.resp(conn, 500, "Internal Server Error")
-      end)
-
-      provider = oidc_provider_fixture(bypass, account: account)
+      # Stub 500 error for discovery document
+      Mocks.OIDC.stub_discovery_error(500, "Internal Server Error")
+      %{provider: provider} = setup_oidc_provider(account)
 
       log =
         capture_log(fn ->
@@ -1046,12 +1202,10 @@ defmodule PortalWeb.OIDCControllerTest do
   # Helper Functions
   # ============================================================================
 
-  # Sets up an OIDC provider with a mock discovery server.
+  # Sets up an OIDC provider with the Req.Test mock.
   defp setup_oidc_provider(account, opts \\ []) do
-    bypass = Mocks.OIDC.discovery_document_server()
-    provider = oidc_provider_fixture(bypass, Keyword.put(opts, :account, account))
-
-    %{bypass: bypass, provider: provider}
+    provider = oidc_provider_fixture(:mock, Keyword.put(opts, :account, account))
+    %{provider: provider}
   end
 
   # Builds an OIDC cookie for testing callbacks.
@@ -1089,8 +1243,8 @@ defmodule PortalWeb.OIDCControllerTest do
   # Sets up mocks for a successful authentication flow.
   defp setup_successful_auth(ctx, actor, opts \\ []) do
     id_token = sign_id_token(ctx.provider, actor, opts)
-    expect_token_exchange(ctx.bypass, id_token)
-    expect_userinfo(ctx.bypass, actor, opts)
+    expect_token_exchange(id_token)
+    expect_userinfo(actor, opts)
   end
 
   # Signs a JWT id_token for testing.
@@ -1126,23 +1280,17 @@ defmodule PortalWeb.OIDCControllerTest do
     end
   end
 
-  # Sets up the token exchange mock.
-  defp expect_token_exchange(bypass, id_token) do
-    Bypass.expect_once(bypass, "POST", "/oauth/token", fn conn ->
-      Plug.Conn.resp(
-        conn,
-        200,
-        JSON.encode!(%{
-          "access_token" => "test-access-token",
-          "id_token" => id_token,
-          "token_type" => "Bearer"
-        })
-      )
-    end)
+  # Sets up the token exchange mock response.
+  defp expect_token_exchange(id_token) do
+    Mocks.OIDC.set_token_response(%{
+      "access_token" => "test-access-token",
+      "id_token" => id_token,
+      "token_type" => "Bearer"
+    })
   end
 
-  # Sets up the userinfo endpoint mock.
-  defp expect_userinfo(bypass, actor, opts) do
+  # Sets up the userinfo endpoint mock response.
+  defp expect_userinfo(actor, opts) do
     sub = Keyword.get(opts, :sub, "admin-user-123")
     email_verified = Keyword.get(opts, :email_verified, true)
 
@@ -1158,7 +1306,7 @@ defmodule PortalWeb.OIDCControllerTest do
       |> maybe_add_claim("preferred_username", opts)
       |> maybe_add_claim("nickname", opts)
 
-    Mocks.OIDC.expect_userinfo(bypass, userinfo)
+    Mocks.OIDC.set_userinfo_response(userinfo)
   end
 
   defp token_exp do
@@ -1192,6 +1340,39 @@ defmodule PortalWeb.OIDCControllerTest do
     assert conn.status == 200
     assert conn.resp_body =~ "client_redirect"
     assert conn.resp_cookies["client_auth"]
+
+    conn
+  end
+
+  # Performs gui-client sign-in and asserts success.
+  defp assert_gui_client_sign_in_success(ctx) do
+    cookie =
+      build_oidc_cookie(ctx.account, ctx.provider,
+        params: %{"as" => "gui-client", "nonce" => "client-nonce", "state" => "client-state"}
+      )
+
+    conn = perform_callback(ctx.conn, cookie)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "client_redirect"
+    assert conn.resp_cookies["client_auth"]
+
+    conn
+  end
+
+  # Performs headless-client sign-in and asserts success.
+  defp assert_headless_client_sign_in_success(ctx) do
+    cookie =
+      build_oidc_cookie(ctx.account, ctx.provider,
+        params: %{"as" => "headless-client", "state" => "client-state"}
+      )
+
+    conn = perform_callback(ctx.conn, cookie)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "Copy token to clipboard"
+    # Headless client should NOT set client_auth cookie
+    refute conn.resp_cookies["client_auth"]
 
     conn
   end

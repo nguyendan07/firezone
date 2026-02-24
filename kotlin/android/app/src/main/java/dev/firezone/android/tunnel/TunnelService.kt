@@ -17,7 +17,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
-import androidx.lifecycle.MutableLiveData
 import com.google.android.gms.tasks.Tasks
 import com.google.firebase.installations.FirebaseInstallations
 import com.squareup.moshi.Moshi
@@ -28,14 +27,20 @@ import dev.firezone.android.core.data.ResourceState
 import dev.firezone.android.core.data.isEnabled
 import dev.firezone.android.tunnel.model.Cidr
 import dev.firezone.android.tunnel.model.Resource
+import dev.firezone.android.tunnel.model.ResourceType
 import dev.firezone.android.tunnel.model.Site
+import dev.firezone.android.tunnel.model.StatusEnum
 import dev.firezone.android.tunnel.model.isInternetResource
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.channels.produce
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
@@ -45,10 +50,14 @@ import uniffi.connlib.Event
 import uniffi.connlib.ProtectSocket
 import uniffi.connlib.Session
 import uniffi.connlib.SessionInterface
+import uniffi.connlib.enforceLogSizeCap
+import uniffi.connlib.logCleanupDefaultIntervalSecs
+import uniffi.connlib.logCleanupDefaultMaxSizeMb
 import uniffi.connlib.use
 import java.nio.file.Files
 import java.nio.file.Paths
 import javax.inject.Inject
+import kotlin.coroutines.cancellation.CancellationException
 
 @AndroidEntryPoint
 @OptIn(ExperimentalStdlibApi::class)
@@ -78,6 +87,8 @@ class TunnelService : VpnService() {
     // the VPN from the system settings or MDM disconnects us.
     private var disconnectCallback: DisconnectMonitor? = null
 
+    private var logCleanupJob: Job? = null
+
     var startedByUser: Boolean = false
     private var commandChannel: Channel<TunnelCommand>? = null
     private val serviceScope = CoroutineScope(SupervisorJob())
@@ -86,18 +97,18 @@ class TunnelService : VpnService() {
         get() = _tunnelResources
         set(value) {
             _tunnelResources = value
-            updateResourcesLiveData(value)
+            updateResourcesStateFlow(value)
         }
     var tunnelState: State
         get() = _tunnelState
         set(value) {
             _tunnelState = value
-            updateServiceStateLiveData(value)
+            updateServiceStateFlow(value)
         }
 
     // Used to update the UI when the SessionActivity is bound to this service
-    private var serviceStateLiveData: MutableLiveData<State>? = null
-    private var resourcesLiveData: MutableLiveData<List<Resource>>? = null
+    private var serviceStateMutableStateFlow: MutableStateFlow<State?>? = null
+    private var resourcesMutableStateFlow: MutableStateFlow<List<Resource>>? = null
 
     // For binding the SessionActivity view to this service
     private val binder = LocalBinder()
@@ -265,7 +276,8 @@ class TunnelService : VpnService() {
 
         if (!token.isNullOrBlank()) {
             tunnelState = State.CONNECTING
-            updateStatusNotification(TunnelStatusNotification.Connecting)
+            // Dismiss any previous disconnected notifications
+            TunnelNotification.dismissDisconnectedNotification(this)
 
             val firebaseInstallationId =
                 runCatching { Tasks.await(FirebaseInstallations.getInstance().id) }
@@ -284,6 +296,8 @@ class TunnelService : VpnService() {
 
             commandChannel = Channel<TunnelCommand>(Channel.UNLIMITED)
 
+            val context = this
+
             serviceScope.launch {
                 try {
                     Session
@@ -301,13 +315,15 @@ class TunnelService : VpnService() {
                         ).use { session ->
                             startNetworkMonitoring()
                             startDisconnectMonitoring()
+                            startLogCleanup()
 
                             eventLoop(session, commandChannel!!)
 
                             Log.i(TAG, "Event-loop finished")
 
                             if (startedByUser) {
-                                updateStatusNotification(TunnelStatusNotification.SignedOut)
+                                // Show dismissable disconnected notification
+                                TunnelNotification.showDisconnectedNotification(context)
                             }
                         }
                 } catch (e: ConnlibException) {
@@ -320,6 +336,10 @@ class TunnelService : VpnService() {
 
                     stopNetworkMonitoring()
                     stopDisconnectMonitoring()
+
+                    // Stop the foreground notification
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopLogCleanup()
                     stopSelf()
                 }
             }
@@ -385,26 +405,59 @@ class TunnelService : VpnService() {
         }
     }
 
-    fun setServiceStateLiveData(liveData: MutableLiveData<State>) {
-        serviceStateLiveData = liveData
+    private fun startLogCleanup() {
+        logCleanupJob =
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    val logDir = getLogDir()
+                    val maxSizeMb = logCleanupDefaultMaxSizeMb()
+                    val intervalMs = logCleanupDefaultIntervalSecs().toLong() * 1000
+                    while (isActive) {
+                        try {
+                            val bytesDeleted = enforceLogSizeCap(listOf(logDir), maxSizeMb)
+                            if (bytesDeleted > 0u) {
+                                Log.d(TAG, "Log cleanup deleted $bytesDeleted bytes")
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Log cleanup failed", e)
+                        }
+                        delay(intervalMs)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Log cleanup could not start", e)
+                }
+            }
+    }
+
+    private fun stopLogCleanup() {
+        logCleanupJob?.cancel()
+        logCleanupJob = null
+    }
+
+    fun setServiceStateMutableStateFlow(stateFlow: MutableStateFlow<State?>) {
+        serviceStateMutableStateFlow = stateFlow
 
         // Update the newly bound SessionActivity with our current state
-        serviceStateLiveData?.postValue(tunnelState)
+        serviceStateMutableStateFlow?.value = tunnelState
     }
 
-    fun setResourcesLiveData(liveData: MutableLiveData<List<Resource>>) {
-        resourcesLiveData = liveData
+    fun setResourcesMutableStateFlow(stateFlow: MutableStateFlow<List<Resource>>) {
+        resourcesMutableStateFlow = stateFlow
 
         // Update the newly bound SessionActivity with our current resources
-        resourcesLiveData?.postValue(tunnelResources)
+        resourcesMutableStateFlow?.value = tunnelResources
     }
 
-    private fun updateServiceStateLiveData(state: State) {
-        serviceStateLiveData?.postValue(state)
+    private fun updateServiceStateFlow(state: State) {
+        serviceStateMutableStateFlow?.value = state
     }
 
-    private fun updateResourcesLiveData(resources: List<Resource>) {
-        resourcesLiveData?.postValue(resources)
+    private fun updateResourcesStateFlow(resources: List<Resource>) {
+        resourcesMutableStateFlow?.value = resources
     }
 
     private fun deviceId(): String {
@@ -429,9 +482,9 @@ class TunnelService : VpnService() {
         return logDir
     }
 
-    fun updateStatusNotification(statusType: TunnelStatusNotification.StatusType) {
-        val notification = TunnelStatusNotification.update(this, statusType).build()
-        startForeground(TunnelStatusNotification.ID, notification)
+    fun startConnectedNotification() {
+        val notification = TunnelNotification.createConnectedNotification(this)
+        startForeground(TunnelNotification.CONNECTED_NOTIFICATION_ID, notification)
     }
 
     private fun getDeviceName(): String {
@@ -465,6 +518,19 @@ class TunnelService : VpnService() {
         data object Reset : TunnelCommand()
     }
 
+    private fun resourceById(resourceId: String): Pair<Resource, Site>? {
+        val resource = _tunnelResources.find { it.id == resourceId } ?: return null
+        val site = resource.sites?.firstOrNull() ?: return null
+        return Pair(resource, site)
+    }
+
+    private fun showErrorNotification(
+        title: String,
+        message: String,
+    ) {
+        TunnelNotification.showErrorNotification(this, title, message)
+    }
+
     private suspend fun eventLoop(
         session: SessionInterface,
         commandChannel: Channel<TunnelCommand>,
@@ -487,9 +553,11 @@ class TunnelService : VpnService() {
                                 session.disconnect()
                                 // Sending disconnect will close the event-stream which will exit this loop
                             }
+
                             is TunnelCommand.SetInternetResourceState -> {
                                 session.setInternetResourceState(command.active)
                             }
+
                             is TunnelCommand.SetDns -> {
                                 session.setDns(command.dnsServers)
                             }
@@ -548,6 +616,24 @@ class TunnelService : VpnService() {
                                     running = false
                                 }
 
+                                is Event.GatewayVersionMismatch -> {
+                                    val (resource, site) = resourceById(event.resourceId) ?: return@use
+
+                                    showErrorNotification(
+                                        "Failed to connect to '${resource.name}'",
+                                        "Your Firezone Client is incompatible with all Gateways in the site '${site.name}'. Please update your Client to the latest version and contact your administrator if the issue persists.",
+                                    )
+                                }
+
+                                is Event.AllGatewaysOffline -> {
+                                    val (resource, site) = resourceById(event.resourceId) ?: return@use
+
+                                    showErrorNotification(
+                                        "Failed to connect to '${resource.name}'",
+                                        "All Gateways in the site '${site.name}' are offline. Contact your administrator to resolve this issue.",
+                                    )
+                                }
+
                                 null -> {
                                     Log.i(TAG, "Event channel closed")
                                     running = false
@@ -567,51 +653,46 @@ class TunnelService : VpnService() {
     private fun convertResource(resource: uniffi.connlib.Resource): Resource =
         when (resource) {
             is uniffi.connlib.Resource.Dns -> {
-                Resource(
-                    type = dev.firezone.android.tunnel.model.ResourceType.DNS,
-                    id = resource.resource.id,
-                    address = resource.resource.address,
-                    addressDescription = resource.resource.addressDescription,
-                    sites = resource.resource.sites.map { convertSite(it) },
-                    name = resource.resource.name,
-                    status = convertResourceStatus(resource.resource.status),
-                )
+                resource.resource.let { r ->
+                    Resource(
+                        ResourceType.DNS,
+                        r.id,
+                        r.address,
+                        r.addressDescription,
+                        r.sites.map { it.toModel() },
+                        r.name,
+                        r.status.toModel(),
+                    )
+                }
             }
+
             is uniffi.connlib.Resource.Cidr -> {
-                Resource(
-                    type = dev.firezone.android.tunnel.model.ResourceType.CIDR,
-                    id = resource.resource.id,
-                    address = resource.resource.address,
-                    addressDescription = resource.resource.addressDescription,
-                    sites = resource.resource.sites.map { convertSite(it) },
-                    name = resource.resource.name,
-                    status = convertResourceStatus(resource.resource.status),
-                )
+                resource.resource.let { r ->
+                    Resource(
+                        ResourceType.CIDR,
+                        r.id,
+                        r.address,
+                        r.addressDescription,
+                        r.sites.map { it.toModel() },
+                        r.name,
+                        r.status.toModel(),
+                    )
+                }
             }
+
             is uniffi.connlib.Resource.Internet -> {
-                Resource(
-                    type = dev.firezone.android.tunnel.model.ResourceType.Internet,
-                    id = resource.resource.id,
-                    address = null,
-                    addressDescription = null,
-                    sites = resource.resource.sites.map { convertSite(it) },
-                    name = resource.resource.name,
-                    status = convertResourceStatus(resource.resource.status),
-                )
+                resource.resource.let { r ->
+                    Resource(
+                        ResourceType.Internet,
+                        r.id,
+                        null,
+                        null,
+                        r.sites.map { it.toModel() },
+                        r.name,
+                        r.status.toModel(),
+                    )
+                }
             }
-        }
-
-    private fun convertSite(site: uniffi.connlib.Site): dev.firezone.android.tunnel.model.Site =
-        dev.firezone.android.tunnel.model.Site(
-            id = site.id,
-            name = site.name,
-        )
-
-    private fun convertResourceStatus(status: uniffi.connlib.ResourceStatus): dev.firezone.android.tunnel.model.StatusEnum =
-        when (status) {
-            uniffi.connlib.ResourceStatus.UNKNOWN -> dev.firezone.android.tunnel.model.StatusEnum.UNKNOWN
-            uniffi.connlib.ResourceStatus.ONLINE -> dev.firezone.android.tunnel.model.StatusEnum.ONLINE
-            uniffi.connlib.ResourceStatus.OFFLINE -> dev.firezone.android.tunnel.model.StatusEnum.OFFLINE
         }
 
     companion object {
@@ -647,3 +728,14 @@ class TunnelService : VpnService() {
         }
     }
 }
+
+// UniFFI → Model type conversions
+
+private fun uniffi.connlib.Site.toModel() = Site(id = id, name = name)
+
+private fun uniffi.connlib.ResourceStatus.toModel() =
+    when (this) {
+        uniffi.connlib.ResourceStatus.UNKNOWN -> StatusEnum.UNKNOWN
+        uniffi.connlib.ResourceStatus.ONLINE -> StatusEnum.ONLINE
+        uniffi.connlib.ResourceStatus.OFFLINE -> StatusEnum.OFFLINE
+    }

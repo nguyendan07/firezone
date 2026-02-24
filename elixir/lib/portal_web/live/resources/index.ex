@@ -1,11 +1,11 @@
 defmodule PortalWeb.Resources.Index do
   use PortalWeb, :live_view
   alias Portal.{Changes.Change, PubSub, Resource}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      :ok = PubSub.Account.subscribe(socket.assigns.account.id)
+      :ok = PubSub.Changes.subscribe(socket.assigns.account.id)
     end
 
     socket =
@@ -13,7 +13,7 @@ defmodule PortalWeb.Resources.Index do
       |> assign(stale: false)
       |> assign(page_title: "Resources")
       |> assign_live_table("resources",
-        query_module: DB,
+        query_module: Database,
         sortable_fields: [
           {:resources, :name},
           {:resources, :address}
@@ -26,7 +26,7 @@ defmodule PortalWeb.Resources.Index do
 
   def handle_params(%{"resources_filter" => %{"site_id" => site_id}} = params, uri, socket) do
     socket = handle_live_tables_params(socket, params, uri)
-    filter_site = DB.get_site(site_id, socket.assigns.subject)
+    filter_site = Database.get_site(site_id, socket.assigns.subject)
     {:noreply, assign(socket, filter_site: filter_site)}
   end
 
@@ -39,8 +39,9 @@ defmodule PortalWeb.Resources.Index do
     list_opts = Keyword.put(list_opts, :preload, [:site])
 
     with {:ok, resources, metadata} <-
-           DB.list_resources(socket.assigns.subject, list_opts) do
-      resource_policy_counts = DB.count_policies_for_resources(resources, socket.assigns.subject)
+           Database.list_resources(socket.assigns.subject, list_opts) do
+      resource_policy_counts =
+        Database.count_policies_for_resources(resources, socket.assigns.subject)
 
       {:ok,
        assign(socket,
@@ -183,7 +184,7 @@ defmodule PortalWeb.Resources.Index do
     {:noreply, socket}
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Portal.Repo.Query
     alias Portal.{Safe, Resource, Policy, Site}
@@ -191,14 +192,14 @@ defmodule PortalWeb.Resources.Index do
     def get_site(id, subject) do
       from(s in Site, as: :sites)
       |> where([sites: s], s.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def list_resources(subject, opts \\ []) do
       from(resources in Resource, as: :resources)
       |> where([resources: r], r.type != :internet)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -210,7 +211,7 @@ defmodule PortalWeb.Resources.Index do
       |> where([policies: p], is_nil(p.disabled_at))
       |> group_by([policies: p], p.resource_id)
       |> select([policies: p], {p.resource_id, count(p.id)})
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
       |> case do
         {:error, _} -> %{}

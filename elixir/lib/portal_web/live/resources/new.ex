@@ -1,11 +1,11 @@
 defmodule PortalWeb.Resources.New do
   use PortalWeb, :live_view
   import PortalWeb.Resources.Components
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(params, _session, socket) do
-    sites = DB.all_sites(socket.assigns.subject)
-    changeset = DB.new_resource(socket.assigns.account)
+    sites = Database.all_sites(socket.assigns.subject)
+    changeset = Database.new_resource(socket.assigns.account)
 
     socket =
       assign(
@@ -50,8 +50,8 @@ defmodule PortalWeb.Resources.New do
                   />
                   <label for="resource-type--dns" class={~w[
                     inline-flex items-center justify-between w-full
-                    p-5 text-gray-500 bg-white border border-gray-200
-                    rounded cursor-pointer peer-checked:border-accent-500
+                    p-5 text-neutral-500 bg-white border border-neutral-200
+                    rounded-sm cursor-pointer peer-checked:border-accent-500
                     peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100
                   ]}>
                     <div class="block">
@@ -75,8 +75,8 @@ defmodule PortalWeb.Resources.New do
                   />
                   <label for="resource-type--ip" class={~w[
                     inline-flex items-center justify-between w-full
-                    p-5 text-gray-500 bg-white border border-gray-200
-                    rounded cursor-pointer peer-checked:border-accent-600
+                    p-5 text-neutral-500 bg-white border border-neutral-200
+                    rounded-sm cursor-pointer peer-checked:border-accent-600
                     peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100
                   ]}>
                     <div class="block">
@@ -100,8 +100,8 @@ defmodule PortalWeb.Resources.New do
                   />
                   <label for="resource-type--cidr" class={~w[
                     inline-flex items-center justify-between w-full
-                    p-5 text-gray-500 bg-white border border-gray-200
-                    rounded cursor-pointer peer-checked:border-accent-500
+                    p-5 text-neutral-500 bg-white border border-neutral-200
+                    rounded-sm cursor-pointer peer-checked:border-accent-500
                     peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100
                   ]}>
                     <div class="block">
@@ -226,7 +226,7 @@ defmodule PortalWeb.Resources.New do
       |> maybe_put_site_id(socket.assigns.params)
 
     changeset =
-      DB.new_resource(socket.assigns.account, attrs)
+      Database.new_resource(socket.assigns.account, attrs)
       |> Map.put(:action, :validate)
 
     socket =
@@ -246,7 +246,7 @@ defmodule PortalWeb.Resources.New do
       |> map_filters_form_attrs(socket.assigns.account)
       |> maybe_put_site_id(socket.assigns.params)
 
-    case DB.create_resource(attrs, socket.assigns.subject) do
+    case Database.create_resource(attrs, socket.assigns.subject) do
       {:ok, resource} ->
         socket = put_flash(socket, :success, "Resource #{resource.name} created successfully")
 
@@ -289,7 +289,7 @@ defmodule PortalWeb.Resources.New do
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Ecto.Changeset
     alias Portal.{Safe, Resource}
@@ -297,7 +297,7 @@ defmodule PortalWeb.Resources.New do
     def all_sites(subject) do
       from(g in Portal.Site, as: :sites)
       |> where([sites: s], s.managed_by != :system)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 

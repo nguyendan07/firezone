@@ -12,7 +12,7 @@ pub(crate) use crate::gateway::unroutable_packet::RoutingError;
 use crate::gateway::client_on_gateway::TranslateOutboundResult;
 use crate::gateway::flow_tracker::FlowTracker;
 use crate::messages::gateway::{Client, ResourceDescription, Subject};
-use crate::messages::{Answer, IceCredentials, ResolveRequest};
+use crate::messages::{IceCredentials, ResolveRequest};
 use crate::peer_store::PeerStore;
 use crate::{FailedToDecapsulate, GatewayEvent, IpConfig, p2p_control, packet_kind};
 use anyhow::{Context, ErrorExt, Result};
@@ -22,7 +22,7 @@ use connlib_model::{ClientId, IceCandidate, RelayId, ResourceId};
 use dns_types::DomainName;
 use ip_packet::{FzP2pControlSlice, IpPacket};
 use secrecy::ExposeSecret as _;
-use snownet::{Credentials, NoTurnServers, RelaySocket, ServerNode, Transmit};
+use snownet::{IceConfig, IceRole, NoTurnServers, Node, RelaySocket, Transmit};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::iter;
 use std::net::{IpAddr, SocketAddr};
@@ -35,12 +35,10 @@ const EXPIRE_RESOURCES_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A SANS-IO implementation of a gateway's functionality.
 ///
-/// Internally, this composes a [`snownet::ServerNode`] with firezone's policy engine around resources.
+/// Internally, this composes a [`snownet::Node`] with firezone's policy engine around resources.
 pub struct GatewayState {
-    /// The [`snownet::ClientNode`].
-    ///
     /// Manages wireguard tunnels to clients.
-    node: ServerNode<ClientId, RelayId>,
+    node: Node<ClientId, RelayId>,
     /// All clients we are connected to and the associated, connection-specific state.
     peers: PeerStore<ClientId, ClientOnGateway>,
 
@@ -73,14 +71,14 @@ impl DnsResourceNatEntry {
 }
 
 impl GatewayState {
-    pub(crate) fn new(seed: [u8; 32], now: Instant, unix_ts: Duration) -> Self {
+    pub(crate) fn new(flow_logs: bool, seed: [u8; 32], now: Instant, unix_ts: Duration) -> Self {
         Self {
             peers: Default::default(),
-            node: ServerNode::new(seed, now, unix_ts),
+            node: Node::new(seed, now, unix_ts),
             next_expiry_resources_check: Default::default(),
             buffered_events: VecDeque::default(),
             buffered_transmits: VecDeque::default(),
-            flow_tracker: FlowTracker::new(now),
+            flow_tracker: FlowTracker::new(flow_logs, now),
             tun_ip_config: None,
         }
     }
@@ -170,11 +168,15 @@ impl GatewayState {
             return Ok(None);
         };
 
+        if packet.destination().is_multicast() {
+            return Ok(None);
+        }
+
         flow_tracker::inbound_wg::record_decrypted_packet(&packet);
 
         let peer = self
             .peers
-            .get_mut(&cid)
+            .peer_by_id_mut(&cid)
             .with_context(|| format!("No peer for connection {cid}"))?;
 
         flow_tracker::inbound_wg::record_client(cid, peer.client_flow_properties());
@@ -266,7 +268,7 @@ impl GatewayState {
 
     #[tracing::instrument(level = "debug", skip_all, fields(%rid, %cid))]
     pub fn remove_access(&mut self, cid: &ClientId, rid: &ResourceId, now: Instant) {
-        let Some(peer) = self.peers.get_mut(cid) else {
+        let Some(peer) = self.peers.peer_by_id_mut(cid) else {
             return;
         };
 
@@ -286,23 +288,6 @@ impl GatewayState {
         }
     }
 
-    /// Accept a connection request from a client.
-    #[expect(deprecated, reason = "Will be deleted together with deprecated API")]
-    pub fn accept(
-        &mut self,
-        client_id: ClientId,
-        offer: snownet::Offer,
-        client: PublicKey,
-        now: Instant,
-    ) -> Result<Answer, NoTurnServers> {
-        let answer = self.node.accept_connection(client_id, offer, client, now)?;
-
-        Ok(Answer {
-            username: answer.credentials.username,
-            password: answer.credentials.password,
-        })
-    }
-
     #[tracing::instrument(level = "debug", skip_all, fields(cid = %client.id))]
     pub fn authorize_flow(
         &mut self,
@@ -318,14 +303,11 @@ impl GatewayState {
             client.id,
             client.public_key.into(),
             x25519::StaticSecret::from(client.preshared_key.expose_secret().0),
-            Credentials {
-                username: gateway_ice.username,
-                password: gateway_ice.password,
-            },
-            Credentials {
-                username: client_ice.username,
-                password: client_ice.password,
-            },
+            gateway_ice.into(),
+            client_ice.into(),
+            IceRole::Controlled,
+            IceConfig::server_default(),
+            IceConfig::server_idle(),
             now,
         )?;
 
@@ -371,10 +353,9 @@ impl GatewayState {
     ) -> anyhow::Result<()> {
         let gateway_tun = self.tun_ip_config.context("TUN device not configured")?;
 
-        let peer = self
-            .peers
-            .entry(client)
-            .or_insert_with(|| ClientOnGateway::new(client, client_tun, gateway_tun, client_props));
+        let peer = self.peers.upsert(client, || {
+            ClientOnGateway::new(client, client_tun, gateway_tun, client_props)
+        });
 
         peer.add_resource(resource.clone(), expires_at);
 
@@ -387,9 +368,6 @@ impl GatewayState {
             )?;
         }
 
-        self.peers.add_ip(&client, &client_tun.v4.into());
-        self.peers.add_ip(&client, &client_tun.v6.into());
-
         Ok(())
     }
 
@@ -400,7 +378,7 @@ impl GatewayState {
         expires_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         self.peers
-            .get_mut(&client)
+            .peer_by_id_mut(&client)
             .context("No peer state")?
             .update_resource_expiry(resource, expires_at);
 
@@ -418,7 +396,7 @@ impl GatewayState {
         let nat_status = resolve_result
             .and_then(|addresses| {
                 self.peers
-                    .get_mut(&req.client)
+                    .peer_by_id_mut(&req.client)
                     .context("Unknown peer")?
                     .setup_nat(
                         req.domain.clone(),
@@ -665,7 +643,7 @@ impl GatewayState {
         authorizations: BTreeMap<ClientId, BTreeSet<ResourceId>>,
     ) {
         for (client, resources) in authorizations {
-            let Some(client) = self.peers.get_mut(&client) else {
+            let Some(client) = self.peers.peer_by_id_mut(&client) else {
                 continue;
             };
 
@@ -716,7 +694,7 @@ fn handle_assigned_ips_event(
 fn encrypt_packet(
     packet: IpPacket,
     cid: ClientId,
-    node: &mut ServerNode<ClientId, RelayId>,
+    node: &mut Node<ClientId, RelayId>,
     now: Instant,
 ) -> Result<Option<Transmit>> {
     let transmit = node

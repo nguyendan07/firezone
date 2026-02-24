@@ -9,7 +9,7 @@ defmodule PortalWeb.Settings.DirectorySync do
     PubSub
   }
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   import Ecto.Changeset
 
@@ -31,11 +31,15 @@ defmodule PortalWeb.Settings.DirectorySync do
     Okta.Directory => @common_fields ++ ~w[okta_domain client_id private_key_jwk kid]a
   }
 
+  # Fields set programmatically (not via HTML form inputs) that must be
+  # preserved across validate events so they aren't lost on each keystroke.
+  @programmatic_fields ~w[is_verified private_key_jwk kid tenant_id domain]a
+
   def mount(_params, _session, socket) do
     socket = assign(socket, page_title: "Directory Sync")
 
     if connected?(socket) do
-      :ok = PubSub.Account.subscribe(socket.assigns.subject.account.id)
+      :ok = PubSub.Changes.subscribe(socket.assigns.subject.account.id)
     end
 
     {:ok, init(socket, new: true)}
@@ -43,7 +47,7 @@ defmodule PortalWeb.Settings.DirectorySync do
 
   defp init(socket, opts \\ []) do
     new = Keyword.get(opts, :new, false)
-    directories = DB.list_all_directories(socket.assigns.subject)
+    directories = Database.list_all_directories(socket.assigns.subject)
 
     if new do
       socket
@@ -80,7 +84,7 @@ defmodule PortalWeb.Settings.DirectorySync do
       )
       when type in @types do
     schema = Map.get(@modules, type)
-    directory = DB.get_directory!(schema, id, socket.assigns.subject)
+    directory = Database.get_directory!(schema, id, socket.assigns.subject)
     changeset = changeset(directory, %{})
 
     # Extract public key if this is an Okta directory with a keypair
@@ -120,12 +124,20 @@ defmodule PortalWeb.Settings.DirectorySync do
   end
 
   def handle_event("validate", %{"directory" => attrs}, socket) do
-    # Preserve is_verified from the current form state
-    current = apply_changes(socket.assigns.form.source)
-    attrs = Map.put(attrs, "is_verified", current.is_verified)
+    changeset = socket.assigns.form.source
+    attrs = preserve_programmatic_fields(changeset, attrs)
+
+    # EDIT: .data (original directory) so changes are relative to DB values (UPDATE semantics).
+    # NEW: apply_changes() to capture all current values (INSERT semantics).
+    base =
+      if socket.assigns.live_action == :edit do
+        changeset.data
+      else
+        apply_changes(changeset)
+      end
 
     changeset =
-      current
+      base
       |> changeset(attrs)
       |> clear_verification_if_trigger_fields_changed()
       |> Map.put(:action, :validate)
@@ -137,7 +149,7 @@ defmodule PortalWeb.Settings.DirectorySync do
     # Generate the keypair
     keypair = JWK.generate_jwk_and_jwks()
 
-    # Update the changeset with the prevate key JWK and kid
+    # Update the changeset with the private key JWK and kid
     changeset =
       socket.assigns.form.source
       |> apply_changes()
@@ -162,19 +174,29 @@ defmodule PortalWeb.Settings.DirectorySync do
   end
 
   def handle_event("reset_verification", _params, socket) do
-    changeset =
-      socket.assigns.form.source
-      |> delete_change(:is_verified)
-      |> delete_change(:domain)
-      |> delete_change(:tenant_id)
-      |> delete_change(:okta_domain)
-      |> apply_changes()
-      |> changeset(%{
-        "is_verified" => false,
-        "domain" => nil,
-        "tenant_id" => nil,
-        "okta_domain" => nil
-      })
+    # For EDIT: Use .data (original directory) so changes are tracked relative to DB values.
+    # For NEW: Use apply_changes to preserve programmatically set fields (like Okta's keypair).
+    changeset = socket.assigns.form.source
+
+    base =
+      if socket.assigns.live_action == :edit do
+        changeset.data
+      else
+        apply_changes(changeset)
+      end
+
+    # Start with current changes, drop verification fields, add verification resets.
+    # This preserves programmatic fields (like Okta's keypair) and form field changes.
+    attrs =
+      changeset.changes
+      |> Map.drop([:is_verified, :domain, :tenant_id, :okta_domain])
+      |> Map.put(:is_verified, false)
+      |> Map.put(:domain, nil)
+      |> Map.put(:tenant_id, nil)
+      |> Map.put(:okta_domain, nil)
+      |> Map.new(fn {k, v} -> {to_string(k), v} end)
+
+    changeset = changeset(base, attrs)
 
     {:noreply, assign(socket, verification_error: nil, form: to_form(changeset))}
   end
@@ -186,7 +208,7 @@ defmodule PortalWeb.Settings.DirectorySync do
   def handle_event("delete_directory", %{"id" => id}, socket) do
     directory = socket.assigns.directories |> Enum.find(fn d -> d.id == id end)
 
-    case DB.delete_directory(directory, socket.assigns.subject) do
+    case Database.delete_directory(directory, socket.assigns.subject) do
       {:ok, _directory} ->
         {:noreply,
          socket
@@ -243,7 +265,7 @@ defmodule PortalWeb.Settings.DirectorySync do
           end
         end
 
-      case DB.update_directory(changeset, socket.assigns.subject) do
+      case Database.update_directory(changeset, socket.assigns.subject) do
         {:ok, _directory} ->
           action = if new_disabled_state, do: "disabled", else: "enabled"
 
@@ -270,7 +292,12 @@ defmodule PortalWeb.Settings.DirectorySync do
 
     case Oban.insert(sync_module.new(%{"directory_id" => id})) do
       {:ok, _job} ->
-        {:noreply, put_flash(socket, :success, "Directory sync has been queued successfully.")}
+        socket =
+          socket
+          |> init()
+          |> put_flash(:success, "Directory sync has been queued successfully.")
+
+        {:noreply, socket}
 
       {:error, reason} ->
         Logger.info("Failed to enqueue #{type} sync job", id: id, reason: inspect(reason))
@@ -290,16 +317,16 @@ defmodule PortalWeb.Settings.DirectorySync do
     if stored_token && Plug.Crypto.secure_compare(stored_token, state_token) do
       send(pid, :success)
 
-      # Verification was already done in verification.ex before broadcasting
-      attrs = %{
-        "is_verified" => true,
-        "tenant_id" => tenant_id
-      }
+      # For EDIT: Use .data (original directory) so changes are tracked relative to DB values.
+      # For NEW: Entra has no programmatically set fields, so .data works here too.
+      changeset = socket.assigns.form.source
 
-      changeset =
-        socket.assigns.form.source
-        |> apply_changes()
-        |> changeset(attrs)
+      attrs =
+        changeset.changes
+        |> Map.put(:is_verified, true)
+        |> Map.put(:tenant_id, tenant_id)
+
+      changeset = changeset(changeset.data, attrs)
 
       {:noreply, assign(socket, form: to_form(changeset), verification_error: nil)}
     else
@@ -358,6 +385,7 @@ defmodule PortalWeb.Settings.DirectorySync do
                   directory={directory}
                   subject={@subject}
                   is_legacy={directory.is_legacy}
+                  most_recent_job={directory.most_recent_job}
                 />
               <% end %>
             </div>
@@ -371,46 +399,46 @@ defmodule PortalWeb.Settings.DirectorySync do
         <:content>
           <div class="relative">
             <!-- Blurred preview content -->
-            <div class="blur-sm pointer-events-none select-none opacity-60">
+            <div class="blur-xs pointer-events-none select-none opacity-60">
               <div class="flex flex-wrap gap-4">
-                <div class="flex flex-col bg-neutral-50 rounded-lg p-4" style="width: 28rem;">
+                <div class="flex flex-col bg-neutral-50 rounded-md p-4" style="width: 28rem;">
                   <div class="flex items-center justify-between mb-3">
                     <div class="flex items-center flex-1 min-w-0">
-                      <.provider_icon type="google" class="w-7 h-7 mr-2 flex-shrink-0" />
+                      <.provider_icon type="google" class="w-7 h-7 mr-2 shrink-0" />
                       <div class="flex flex-col min-w-0">
                         <span class="font-medium text-xl truncate">Google Workspace</span>
                         <span class="text-xs text-neutral-500 font-mono">Example directory</span>
                       </div>
                     </div>
                   </div>
-                  <div class="mt-auto bg-white rounded-lg p-3 space-y-3 text-sm text-neutral-600">
+                  <div class="mt-auto bg-white rounded-md p-3 space-y-3 text-sm text-neutral-600">
                     <div class="flex items-center gap-2">
-                      <.icon name="hero-user-group" class="w-5 h-5 flex-shrink-0" />
+                      <.icon name="hero-user-group" class="w-5 h-5 shrink-0" />
                       <span class="font-medium">42 users synced</span>
                     </div>
                     <div class="flex items-center gap-2">
-                      <.icon name="hero-arrow-path" class="w-5 h-5 flex-shrink-0" />
+                      <.icon name="hero-arrow-path" class="w-5 h-5 shrink-0" />
                       <span class="font-medium">Auto-syncs every hour</span>
                     </div>
                   </div>
                 </div>
-                <div class="flex flex-col bg-neutral-50 rounded-lg p-4" style="width: 28rem;">
+                <div class="flex flex-col bg-neutral-50 rounded-md p-4" style="width: 28rem;">
                   <div class="flex items-center justify-between mb-3">
                     <div class="flex items-center flex-1 min-w-0">
-                      <.provider_icon type="entra" class="w-7 h-7 mr-2 flex-shrink-0" />
+                      <.provider_icon type="entra" class="w-7 h-7 mr-2 shrink-0" />
                       <div class="flex flex-col min-w-0">
                         <span class="font-medium text-xl truncate">Microsoft Entra</span>
                         <span class="text-xs text-neutral-500 font-mono">Example directory</span>
                       </div>
                     </div>
                   </div>
-                  <div class="mt-auto bg-white rounded-lg p-3 space-y-3 text-sm text-neutral-600">
+                  <div class="mt-auto bg-white rounded-md p-3 space-y-3 text-sm text-neutral-600">
                     <div class="flex items-center gap-2">
-                      <.icon name="hero-user-group" class="w-5 h-5 flex-shrink-0" />
+                      <.icon name="hero-user-group" class="w-5 h-5 shrink-0" />
                       <span class="font-medium">128 users synced</span>
                     </div>
                     <div class="flex items-center gap-2">
-                      <.icon name="hero-arrow-path" class="w-5 h-5 flex-shrink-0" />
+                      <.icon name="hero-arrow-path" class="w-5 h-5 shrink-0" />
                       <span class="font-medium">Auto-syncs every hour</span>
                     </div>
                   </div>
@@ -419,7 +447,7 @@ defmodule PortalWeb.Settings.DirectorySync do
             </div>
             <!-- Marketing overlay -->
             <div class="absolute inset-0 flex items-center justify-center">
-              <div class="bg-white rounded-xl shadow-lg p-6 max-w-md text-center border border-neutral-200">
+              <div class="bg-white rounded-lg shadow-md p-6 max-w-md text-center border border-neutral-200">
                 <div class="mb-4">
                   <.icon name="hero-arrow-path" class="w-10 h-10 text-accent-500 mx-auto" />
                 </div>
@@ -431,15 +459,15 @@ defmodule PortalWeb.Settings.DirectorySync do
                 </p>
                 <ul class="text-left text-base text-neutral-700 mb-4 space-y-2">
                   <li class="flex items-center gap-2">
-                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 flex-shrink-0" />
+                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 shrink-0" />
                     Sync from Google, Entra, or Okta
                   </li>
                   <li class="flex items-center gap-2">
-                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 flex-shrink-0" />
+                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 shrink-0" />
                     Automatic hourly synchronization
                   </li>
                   <li class="flex items-center gap-2">
-                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 flex-shrink-0" />
+                    <.icon name="hero-check-circle" class="w-5 h-5 text-green-500 shrink-0" />
                     Instant deprovisioning
                   </li>
                 </ul>
@@ -574,6 +602,7 @@ defmodule PortalWeb.Settings.DirectorySync do
   attr :directory, :any, required: true
   attr :subject, :any, required: true
   attr :is_legacy, :boolean, default: false
+  attr :most_recent_job, :map, default: nil
 
   defp directory_card(assigns) do
     # Determine if toggle should be disabled (when directory is disabled and account lacks feature)
@@ -581,10 +610,10 @@ defmodule PortalWeb.Settings.DirectorySync do
     assigns = assign(assigns, :toggle_disabled, toggle_disabled)
 
     ~H"""
-    <div class="flex flex-col bg-neutral-50 rounded-lg p-4" style="width: 28rem;">
+    <div class="flex flex-col bg-neutral-50 rounded-md p-4" style="width: 28rem;">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center flex-1 min-w-0">
-          <.provider_icon type={@type} class="w-7 h-7 mr-2 flex-shrink-0" />
+          <.provider_icon type={@type} class="w-7 h-7 mr-2 shrink-0" />
           <div class="flex flex-col min-w-0">
             <div class="flex items-center gap-2">
               <span class="font-medium text-xl truncate" title={@directory.name}>
@@ -631,7 +660,7 @@ defmodule PortalWeb.Settings.DirectorySync do
             <:target>
               <button
                 type="button"
-                class="p-1 text-neutral-500 hover:text-neutral-700 rounded"
+                class="p-1 text-neutral-500 hover:text-neutral-700 rounded-sm"
               >
                 <.icon name="hero-ellipsis-horizontal" class="text-neutral-800 w-5 h-5" />
               </button>
@@ -640,7 +669,7 @@ defmodule PortalWeb.Settings.DirectorySync do
               <div class="flex flex-col py-1">
                 <.link
                   patch={~p"/#{@account}/settings/directory_sync/#{@type}/#{@directory.id}/edit"}
-                  class="px-4 py-2 text-sm text-neutral-800 rounded-lg hover:bg-neutral-100 flex items-center gap-2"
+                  class="px-4 py-2 text-sm text-neutral-800 rounded-md hover:bg-neutral-100 flex items-center gap-2"
                 >
                   <.icon name="hero-pencil" class="w-4 h-4" /> Edit
                 </.link>
@@ -648,7 +677,7 @@ defmodule PortalWeb.Settings.DirectorySync do
                   id={"delete-directory-#{@directory.id}"}
                   on_confirm="delete_directory"
                   on_confirm_id={@directory.id}
-                  class="w-full px-4 py-2 text-sm text-red-600 rounded-lg flex items-center gap-2 text-left border-0 bg-transparent"
+                  class="w-full px-4 py-2 text-sm text-red-600 rounded-md flex items-center gap-2 text-left border-0 bg-transparent"
                 >
                   <.icon name="hero-trash" class="w-4 h-4" /> Delete
                   <:dialog_title>Delete Directory</:dialog_title>
@@ -664,7 +693,7 @@ defmodule PortalWeb.Settings.DirectorySync do
         </div>
       </div>
 
-      <div class="mt-auto bg-white rounded-lg p-3 space-y-3 text-sm text-neutral-600">
+      <div class="mt-auto bg-white rounded-md p-3 space-y-3 text-sm text-neutral-600">
         <%= if @directory.is_disabled and @directory.disabled_reason == "Sync error" do %>
           <.flash kind={:error_inline}>
             <p class="font-semibold">Sync has been disabled due to an error</p>
@@ -682,11 +711,22 @@ defmodule PortalWeb.Settings.DirectorySync do
             </p>
           </.flash>
         <% else %>
+          <%= if not @directory.is_disabled and @directory.errored_at do %>
+            <.flash kind={:warning_inline}>
+              <p class="font-semibold">Sync encountered a temporary error</p>
+              <%= if @directory.error_message do %>
+                <p class="mt-1 text-sm">{@directory.error_message}</p>
+              <% end %>
+              <p class="mt-2 text-sm">
+                Sync will automatically retry. If issues persist for 24 hours, directory sync will be disabled.
+              </p>
+            </.flash>
+          <% end %>
           <%= if @directory.is_disabled do %>
             <div class="flex items-center gap-2">
               <.icon
                 name="hero-no-symbol"
-                class="w-5 h-5 flex-shrink-0 text-red-600"
+                class="w-5 h-5 shrink-0 text-red-600"
                 title="Disabled"
               />
               <span class="font-medium text-red-600">
@@ -700,7 +740,7 @@ defmodule PortalWeb.Settings.DirectorySync do
         <% end %>
 
         <div class="flex items-center gap-2">
-          <.icon name="hero-identification" class="w-5 h-5 flex-shrink-0" title="Tenant" />
+          <.icon name="hero-identification" class="w-5 h-5 shrink-0" title="Tenant" />
           <span class="font-medium">
             {directory_identifier(@type, @directory)}
           </span>
@@ -708,7 +748,7 @@ defmodule PortalWeb.Settings.DirectorySync do
 
         <%= if @type == "entra" do %>
           <div class="flex items-center gap-2">
-            <.icon name="hero-user-group" class="w-5 h-5 flex-shrink-0" title="Group Sync Mode" />
+            <.icon name="hero-user-group" class="w-5 h-5 shrink-0" title="Group Sync Mode" />
             <span class="font-medium">
               <%= if @directory.sync_all_groups do %>
                 All groups
@@ -724,7 +764,7 @@ defmodule PortalWeb.Settings.DirectorySync do
             navigate={~p"/#{@account}/actors?actors_filter[directory_id]=#{@directory.id}"}
             class="flex items-center gap-2"
           >
-            <.icon name="hero-user" class="w-5 h-5 flex-shrink-0" title="Actors" />
+            <.icon name="hero-user" class="w-5 h-5 shrink-0" title="Actors" />
             <span class={["font-medium", link_style()]}>
               {@directory.actors_count} {ngettext("actor", "actors", @directory.actors_count)}
             </span>
@@ -733,90 +773,100 @@ defmodule PortalWeb.Settings.DirectorySync do
             navigate={~p"/#{@account}/groups?groups_filter[directory_id]=#{@directory.id}"}
             class="flex items-center gap-2"
           >
-            <.icon name="hero-user-group" class="w-5 h-5 flex-shrink-0" title="Groups" />
+            <.icon name="hero-user-group" class="w-5 h-5 shrink-0" title="Groups" />
             <span class={["font-medium", link_style()]}>
               {@directory.groups_count} {ngettext("group", "groups", @directory.groups_count)}
             </span>
           </.link>
         <% end %>
 
-        <%= if @directory.has_active_job do %>
-          <div class="flex items-center justify-between gap-2">
-            <div class="flex items-center gap-2">
-              <.icon
-                name="hero-arrow-path"
-                class="w-5 h-5 flex-shrink-0 text-accent-600 animate-spin"
-                title="Sync in Progress"
-              />
-              <span class="font-medium text-accent-600">
-                Sync in progress...
-              </span>
-            </div>
-            <%!-- Invisible spacer to match button height and prevent vertical jump --%>
-            <div class="h-6"></div>
-          </div>
-        <% else %>
-          <%= if @directory.synced_at do %>
-            <div class="flex items-center justify-between gap-2">
-              <div class="flex items-center gap-2">
-                <.icon name="hero-arrow-path" class="w-5 h-5 flex-shrink-0" title="Last Synced" />
-                <span class="font-medium">
-                  synced <.relative_datetime datetime={@directory.synced_at} />
-                </span>
-              </div>
-              <.button
-                size="xs"
-                style="primary"
-                phx-click="sync_directory"
-                phx-value-id={@directory.id}
-                phx-value-type={@type}
-                disabled={@directory.is_disabled}
-              >
-                Sync Now
-              </.button>
-            </div>
-          <% else %>
-            <div class="flex items-center justify-between gap-2">
-              <div class="flex items-center gap-2">
-                <.icon
-                  name="hero-arrow-path"
-                  class="w-5 h-5 flex-shrink-0 text-neutral-400"
-                  title="Never Synced"
-                />
-                <span class="font-medium text-neutral-400">
-                  Never synced
-                </span>
-              </div>
-              <.button
-                size="xs"
-                style="primary"
-                phx-click="sync_directory"
-                phx-value-id={@directory.id}
-                phx-value-type={@type}
-                disabled={@directory.is_disabled}
-              >
-                Sync Now
-              </.button>
-            </div>
-          <% end %>
-        <% end %>
-
         <div class="flex items-center gap-2">
-          <.icon name="hero-clock" class="w-5 h-5 flex-shrink-0" title="Updated" />
+          <.icon name="hero-clock" class="w-5 h-5 shrink-0" title="Updated" />
           <span class="font-medium">
             updated <.relative_datetime datetime={@directory.updated_at} />
           </span>
+        </div>
+
+        <div class="flex items-center justify-between gap-2">
+          <div class="flex items-center gap-2">
+            <%= case @most_recent_job do %>
+              <% %{state: "executing"} = job -> %>
+                <.icon
+                  name="hero-arrow-path"
+                  class="w-5 h-5 shrink-0 text-accent-600 animate-spin"
+                  title="Syncing"
+                />
+                <span class="font-medium text-accent-600">
+                  syncing ({format_duration(job.elapsed_seconds)} elapsed)
+                </span>
+              <% %{state: state} when state in ["available", "scheduled"] -> %>
+                <.icon
+                  name="hero-clock"
+                  class="w-5 h-5 shrink-0 text-neutral-400"
+                  title="Queued"
+                />
+                <span class="font-medium text-neutral-500">
+                  sync queued
+                </span>
+              <% %{state: "completed"} = job -> %>
+                <.icon name="hero-arrow-path" class="w-5 h-5 shrink-0" title="Last Synced" />
+                <span class="font-medium">
+                  synced <.relative_datetime datetime={job.completed_at} />
+                  in {format_duration(job.elapsed_seconds)}
+                </span>
+              <% _ -> %>
+                <%= if @directory.synced_at do %>
+                  <.icon name="hero-arrow-path" class="w-5 h-5 shrink-0" title="Last Synced" />
+                  <span class="font-medium">
+                    synced <.relative_datetime datetime={@directory.synced_at} />
+                  </span>
+                <% else %>
+                  <.icon
+                    name="hero-arrow-path"
+                    class="w-5 h-5 shrink-0 text-neutral-400"
+                    title="Never Synced"
+                  />
+                  <span class="font-medium text-neutral-400">
+                    Never synced
+                  </span>
+                <% end %>
+            <% end %>
+          </div>
+          <.button
+            size="xs"
+            style="primary"
+            phx-click="sync_directory"
+            phx-value-id={@directory.id}
+            phx-value-type={@type}
+            disabled={@directory.is_disabled or @directory.has_active_job}
+          >
+            Sync Now
+          </.button>
         </div>
       </div>
     </div>
     """
   end
 
+  defp format_duration(nil), do: "-"
+  defp format_duration(seconds) when seconds < 60, do: "#{seconds}s"
+
+  defp format_duration(seconds) do
+    minutes = div(seconds, 60)
+    remaining_seconds = rem(seconds, 60)
+
+    if remaining_seconds > 0 do
+      "#{minutes}m #{remaining_seconds}s"
+    else
+      "#{minutes}m"
+    end
+  end
+
   attr :directory, :any, required: true
   attr :subject, :any, required: true
 
   defp deletion_stats(assigns) do
-    stats = DB.count_deletion_stats(assigns.directory, assigns.subject)
+    stats = Database.count_deletion_stats(assigns.directory, assigns.subject)
     total = stats.actors + stats.identities + stats.groups + stats.policies
     assigns = assign(assigns, stats: stats, total: total)
 
@@ -889,10 +939,11 @@ defmodule PortalWeb.Settings.DirectorySync do
           <label class="block text-sm font-medium text-neutral-700 mb-3">
             Group sync mode
           </label>
+          <% sync_all_groups = get_field(@form.source, :sync_all_groups) %>
           <div class="grid gap-4 md:grid-cols-2">
             <label class={[
-              "flex flex-col p-4 border-2 rounded-lg cursor-pointer transition-all",
-              if(@form[:sync_all_groups].value == false,
+              "flex flex-col p-4 border-2 rounded-md cursor-pointer transition-all",
+              if(sync_all_groups == false,
                 do: "border-accent-500 bg-accent-50",
                 else: "border-neutral-200 hover:border-neutral-300"
               )
@@ -901,7 +952,7 @@ defmodule PortalWeb.Settings.DirectorySync do
                 type="radio"
                 name={@form[:sync_all_groups].name}
                 value="false"
-                checked={@form[:sync_all_groups].value == false}
+                checked={sync_all_groups == false}
                 class="sr-only"
               />
               <div class="mb-2">
@@ -918,8 +969,8 @@ defmodule PortalWeb.Settings.DirectorySync do
             </label>
 
             <label class={[
-              "flex flex-col p-4 border-2 rounded-lg cursor-pointer transition-all",
-              if(@form[:sync_all_groups].value == true,
+              "flex flex-col p-4 border-2 rounded-md cursor-pointer transition-all",
+              if(sync_all_groups == true,
                 do: "border-accent-500 bg-accent-50",
                 else: "border-neutral-200 hover:border-neutral-300"
               )
@@ -928,7 +979,7 @@ defmodule PortalWeb.Settings.DirectorySync do
                 type="radio"
                 name={@form[:sync_all_groups].name}
                 value="true"
-                checked={@form[:sync_all_groups].value == true}
+                checked={sync_all_groups == true}
                 class="sr-only"
               />
               <div class="mb-2">
@@ -988,7 +1039,7 @@ defmodule PortalWeb.Settings.DirectorySync do
           </p>
         </div>
 
-        <div :if={@type == "okta"} class="p-4 border-2 border-neutral-200 bg-neutral-50 rounded-lg">
+        <div :if={@type == "okta"} class="p-4 border-2 border-neutral-200 bg-neutral-50 rounded-md">
           <div class="flex items-center justify-between mb-4">
             <div class="flex-1">
               <h3 class="text-base font-semibold text-neutral-900">Public Key (JWK)</h3>
@@ -1015,7 +1066,7 @@ defmodule PortalWeb.Settings.DirectorySync do
               <div id={"okta-public-jwk-wrapper-#{kid}"} phx-hook="FormatJSON">
                 <.code_block
                   id="okta-public-jwk"
-                  class="text-xs rounded-lg [&_code]:h-72 [&_code]:overflow-y-auto [&_code]:whitespace-pre-wrap [&_code]:break-all [&_code]:p-2"
+                  class="text-xs rounded-md [&_code]:h-72 [&_code]:overflow-y-auto [&_code]:whitespace-pre-wrap [&_code]:break-all [&_code]:p-2"
                 >
                   {JSON.encode!(@public_jwk)}
                 </.code_block>
@@ -1033,7 +1084,7 @@ defmodule PortalWeb.Settings.DirectorySync do
 
         <div
           :if={@type in ["google", "entra", "okta"]}
-          class="p-4 border-2 border-accent-200 bg-accent-50 rounded-lg"
+          class="p-4 border-2 border-accent-200 bg-accent-50 rounded-md"
         >
           <.flash :if={@verification_error} kind={:error}>
             {@verification_error}
@@ -1093,7 +1144,7 @@ defmodule PortalWeb.Settings.DirectorySync do
     ~H"""
     <div
       :if={verified?(@form)}
-      class="flex items-center text-green-700 bg-green-100 px-4 py-2 rounded-md"
+      class="flex items-center text-green-700 bg-green-100 px-4 py-2 rounded-sm"
     >
       <.icon name="hero-check-circle" class="h-5 w-5 mr-2" />
       <span class="font-medium">Verified</span>
@@ -1189,9 +1240,9 @@ defmodule PortalWeb.Settings.DirectorySync do
 
   defp select_type_classes do
     ~w[
-      component bg-white rounded-lg p-4 flex items-center cursor-pointer
+      component bg-white rounded-md p-4 flex items-center cursor-pointer
       border-2 transition-all duration-150
-      border-neutral-200 hover:border-accent-300 hover:bg-neutral-50 hover:shadow-sm
+      border-neutral-200 hover:border-accent-300 hover:bg-neutral-50 hover:shadow-xs
     ]
   end
 
@@ -1238,7 +1289,7 @@ defmodule PortalWeb.Settings.DirectorySync do
     changeset = put_directory_assoc(changeset, socket)
 
     changeset
-    |> DB.insert_directory(socket.assigns.subject)
+    |> Database.insert_directory(socket.assigns.subject)
     |> handle_submit(socket)
   end
 
@@ -1268,7 +1319,7 @@ defmodule PortalWeb.Settings.DirectorySync do
       end
 
     changeset
-    |> DB.update_directory(socket.assigns.subject)
+    |> Database.update_directory(socket.assigns.subject)
     |> handle_submit(socket)
   end
 
@@ -1299,22 +1350,33 @@ defmodule PortalWeb.Settings.DirectorySync do
     config = Portal.Config.fetch_env!(:portal, Google.APIClient)
     key = config[:service_account_key] |> JSON.decode!()
 
-    with {:ok, %Req.Response{status: 200, body: %{"access_token" => access_token}}} <-
-           Google.APIClient.get_access_token(impersonation_email, key),
-         {:ok, %Req.Response{status: 200, body: body}} <-
-           Google.APIClient.get_customer(access_token),
-         :ok <- Google.APIClient.test_connection(access_token, body["customerDomain"]) do
-      changeset =
-        changeset
-        |> apply_changes()
-        |> changeset(%{
-          "domain" => body["customerDomain"],
-          "is_verified" => true
-        })
+    result =
+      with {:ok, %Req.Response{status: 200, body: %{"access_token" => access_token}}} <-
+             Google.APIClient.get_access_token(impersonation_email, key),
+           {:ok, %Req.Response{status: 200, body: body}} <-
+             Google.APIClient.get_customer(access_token),
+           :ok <- Google.APIClient.test_connection(access_token, body["customerDomain"]) do
+        {:ok, body["customerDomain"]}
+      end
 
-      {:noreply,
-       assign(socket, form: to_form(changeset), verification_error: nil, verifying: false)}
-    else
+    case result do
+      {:ok, domain} when is_binary(domain) ->
+        # Merge existing changes with new verification data and re-run validation
+        # This preserves form changes (like name, impersonation_email) while adding domain
+        attrs =
+          changeset.changes
+          |> Map.put(:domain, domain)
+          |> Map.put(:is_verified, true)
+          |> Map.new(fn {k, v} -> {to_string(k), v} end)
+
+        changeset =
+          changeset
+          |> apply_changes()
+          |> changeset(attrs)
+
+        {:noreply,
+         assign(socket, form: to_form(changeset), verification_error: nil, verifying: false)}
+
       error ->
         msg = parse_google_verification_error(error)
         {:noreply, assign(socket, verification_error: msg, verifying: false)}
@@ -1372,16 +1434,19 @@ defmodule PortalWeb.Settings.DirectorySync do
 
     client = Okta.APIClient.new(okta_domain, client_id, private_key_jwk, kid)
 
-    with {:ok, access_token} <- Okta.APIClient.fetch_access_token(client),
-         :ok <- Okta.APIClient.test_connection(client, access_token) do
-      changeset =
-        changeset
-        |> apply_changes()
-        |> changeset(%{"is_verified" => true})
+    result =
+      with {:ok, access_token} <- Okta.APIClient.fetch_access_token(client),
+           :ok <- Okta.APIClient.test_connection(client, access_token) do
+        :ok
+      end
 
-      {:noreply,
-       assign(socket, form: to_form(changeset), verification_error: nil, verifying: false)}
-    else
+    case result do
+      :ok ->
+        changeset = put_change(changeset, :is_verified, true)
+
+        {:noreply,
+         assign(socket, form: to_form(changeset), verification_error: nil, verifying: false)}
+
       error ->
         msg = parse_okta_verification_error(error)
         {:noreply, assign(socket, verification_error: msg, verifying: false)}
@@ -1403,6 +1468,15 @@ defmodule PortalWeb.Settings.DirectorySync do
 
     cast(struct, attrs, Map.get(@fields, schema))
     |> schema.changeset()
+  end
+
+  defp preserve_programmatic_fields(changeset, attrs) do
+    Enum.reduce(@programmatic_fields, attrs, fn field, acc ->
+      case Map.fetch(changeset.changes, field) do
+        {:ok, value} -> Map.put(acc, to_string(field), value)
+        :error -> acc
+      end
+    end)
   end
 
   defp parse_google_verification_error({:ok, %Req.Response{status: 400, body: body}}) do
@@ -1449,6 +1523,16 @@ defmodule PortalWeb.Settings.DirectorySync do
     "Google service is currently unavailable (HTTP #{status}). Please try again later."
   end
 
+  defp parse_google_verification_error({:error, %Req.TransportError{reason: reason}}) do
+    Logger.info("Transport error while verifying Google directory", error: inspect(reason))
+
+    "Transport error while attempting to connect to Google.  We're looking into this"
+  end
+
+  defp parse_google_verification_error({:error, reason}) when is_exception(reason) do
+    "Failed to verify directory access: #{Exception.message(reason)}"
+  end
+
   defp parse_google_verification_error({:error, reason}) do
     "Failed to verify directory access: #{inspect(reason)}"
   end
@@ -1459,53 +1543,13 @@ defmodule PortalWeb.Settings.DirectorySync do
     "Unknown error during verification. Please try again. If the problem persists, contact support."
   end
 
-  defp parse_okta_verification_error({:error, %Req.Response{status: 400, body: body}}) do
-    error_code = body["errorCode"]
-    error_summary = body["errorSummary"]
-
-    cond do
-      error_code == "E0000021" ->
-        "Bad request to Okta PortalAPI. Please verify your Okta domain and API configuration."
-
-      error_code == "E0000001" ->
-        "API validation failed: #{error_summary || "Invalid request parameters"}"
-
-      error_code == "E0000003" ->
-        "The request body was invalid. Please check your configuration."
-
-      error_code == "invalid_client" ->
-        "Invalid client application. Please verify your Client ID is correct."
-
-      error_summary ->
-        "Configuration error: #{error_summary}"
-
-      true ->
-        "HTTP 400 Bad Request. Please verify your Okta domain and Client ID."
-    end
+  # Standard HTTP errors - delegate to ErrorCodes
+  defp parse_okta_verification_error({:error, %Req.Response{status: status, body: body}})
+       when is_map(body) and map_size(body) > 0 do
+    Portal.Okta.ErrorCodes.format_error(status, body)
   end
 
-  defp parse_okta_verification_error({:error, %Req.Response{status: 401, body: body}}) do
-    error_code = body["errorCode"]
-    error_summary = body["errorSummary"]
-
-    cond do
-      error_code == "E0000011" ->
-        "Invalid token. Please ensure your Client ID and private key are correct and the JWT is properly signed."
-
-      error_code == "E0000061" ->
-        "Access denied. The client application is not authorized to use this PortalAPI."
-
-      error_code == "invalid_client" ->
-        "Client authentication failed. Please verify your Client ID and ensure the public key is registered in Okta."
-
-      error_summary ->
-        "Authentication failed: #{error_summary}"
-
-      true ->
-        "HTTP 401 Unauthorized. Please check your Client ID and ensure the public key matches your private key."
-    end
-  end
-
+  # Special case: 403 with empty body has error in WWW-Authenticate header
   defp parse_okta_verification_error(
          {:error, %Req.Response{status: 403, body: "", headers: headers}}
        ) do
@@ -1514,50 +1558,31 @@ defmodule PortalWeb.Settings.DirectorySync do
     |> parse_www_authenticate_error()
   end
 
-  defp parse_okta_verification_error({:error, %Req.Response{status: 403, body: body}}) do
-    error_code = body["errorCode"]
-    error_summary = body["errorSummary"]
-
-    cond do
-      error_code == "E0000006" ->
-        "Access denied. You do not have permission to perform this action. Ensure the API service app has the required scopes."
-
-      error_code == "E0000022" ->
-        "API access denied. The feature may not be available for your Okta organization."
-
-      error_summary ->
-        "Permission denied: #{error_summary}"
-
-      true ->
-        "HTTP 403 Forbidden. Ensure the application has okta.users.read and okta.groups.read scopes granted."
-    end
+  defp parse_okta_verification_error({:error, %Req.Response{status: status}}) do
+    Portal.Okta.ErrorCodes.format_error(status, nil)
   end
 
-  defp parse_okta_verification_error({:error, %Req.Response{status: 404, body: body}}) do
-    error_code = body["errorCode"]
-    error_summary = body["errorSummary"]
-
-    cond do
-      error_code == "E0000007" ->
-        "Resource not found. The API endpoint or resource doesn't exist. Please verify your Okta domain."
-
-      error_summary ->
-        "Not found: #{error_summary}"
-
-      true ->
-        "HTTP 404 Not Found. Please verify your Okta domain (e.g., your-domain.okta.com) is correct."
-    end
+  defp parse_okta_verification_error({:error, :empty, resource})
+       when resource in [:apps, :users, :groups] do
+    Portal.Okta.ErrorCodes.empty_resource_message(resource)
   end
 
-  defp parse_okta_verification_error({:error, %Req.Response{status: status}})
-       when status >= 500 do
-    "Okta service is currently unavailable (HTTP #{status}). Please try again later."
+  defp parse_okta_verification_error({:error, %Req.TransportError{} = error}) do
+    Logger.info(Portal.DirectorySync.ErrorHandler.format_transport_error(error))
+    "Transport error while contacting Okta API.  Please try again"
+  end
+
+  defp parse_okta_verification_error({:error, reason}) when is_exception(reason) do
+    "Failed to verify directory access: #{Exception.message(reason)}"
+  end
+
+  defp parse_okta_verification_error({:error, reason}) do
+    "Failed to verify directory access: #{inspect(reason)}"
   end
 
   defp parse_okta_verification_error(error) do
     Logger.error("Unknown Okta verification error", error: inspect(error))
-
-    "Unknown error during verification. Please try again. If the problem persists, contact support."
+    "Unknown error during verification. Please try again."
   end
 
   defp directory_identifier("google", directory) do
@@ -1587,7 +1612,7 @@ defmodule PortalWeb.Settings.DirectorySync do
   end
 
   defp parse_www_authenticate_error(%{"error" => "insufficient_scope"}) do
-    "The access token provided does not contain the required scopes."
+    "The access token does not contain the required scopes."
   end
 
   defp parse_www_authenticate_error(%{"error_description" => description})
@@ -1611,15 +1636,15 @@ defmodule PortalWeb.Settings.DirectorySync do
     {String.trim(key), clean_value}
   end
 
-  defmodule DB do
+  defmodule Database do
     alias Portal.{Entra, Google, Okta, Safe}
     import Ecto.Query
 
     def list_all_directories(subject) do
       [
-        Entra.Directory |> Safe.scoped(subject) |> Safe.all(),
-        Google.Directory |> Safe.scoped(subject) |> Safe.all(),
-        Okta.Directory |> Safe.scoped(subject) |> Safe.all()
+        Entra.Directory |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Google.Directory |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Okta.Directory |> Safe.scoped(subject, :replica) |> Safe.all()
       ]
       |> List.flatten()
       |> enrich_with_job_status()
@@ -1628,8 +1653,8 @@ defmodule PortalWeb.Settings.DirectorySync do
 
     def get_directory!(schema, id, subject) do
       from(d in schema, where: d.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def insert_directory(changeset, subject) do
@@ -1648,8 +1673,8 @@ defmodule PortalWeb.Settings.DirectorySync do
       # Delete the parent Portal.Directory, which will CASCADE delete the child
       parent =
         from(d in Portal.Directory, where: d.id == ^directory.id)
-        |> Safe.scoped(subject)
-        |> Safe.one!()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
 
       parent |> Safe.scoped(subject) |> Safe.delete()
     end
@@ -1661,21 +1686,21 @@ defmodule PortalWeb.Settings.DirectorySync do
         from(a in Portal.Actor,
           where: a.created_by_directory_id == ^directory_id
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       identities_count =
         from(ei in Portal.ExternalIdentity,
           where: ei.directory_id == ^directory_id
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       groups_count =
         from(g in Portal.Group,
           where: g.directory_id == ^directory_id
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       policies_count =
@@ -1684,7 +1709,7 @@ defmodule PortalWeb.Settings.DirectorySync do
           on: p.group_id == g.id and p.account_id == g.account_id,
           where: g.directory_id == ^directory_id
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       %{
@@ -1702,7 +1727,7 @@ defmodule PortalWeb.Settings.DirectorySync do
       schema = directory.__struct__
 
       from(d in schema, where: d.id == ^directory.id)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.one()
     end
 
@@ -1717,22 +1742,56 @@ defmodule PortalWeb.Settings.DirectorySync do
         from(j in Oban.Job,
           where: j.worker in ["Portal.Entra.Sync", "Portal.Google.Sync", "Portal.Okta.Sync"],
           where: j.state in ["available", "executing", "scheduled"],
-          where: fragment("?->>'directory_id'", j.args) in ^directory_ids
+          where: fragment("?->>'directory_id'", j.args) in ^directory_ids,
+          order_by: [desc: j.inserted_at]
         )
-        |> Safe.unscoped()
+        |> Safe.unscoped(:replica)
         |> Safe.all()
-        |> Enum.map(fn job ->
-          directory_id = job.args["directory_id"]
-          {directory_id, job.id}
-        end)
+        |> Enum.map(fn job -> {job.args["directory_id"], job} end)
         |> Map.new()
 
-      # Add has_active_job and is_legacy fields to each directory
+      # Query for most recent completed job per directory
+      completed_jobs =
+        from(j in Oban.Job,
+          where: j.worker in ["Portal.Entra.Sync", "Portal.Google.Sync", "Portal.Okta.Sync"],
+          where: j.state in ["completed", "discarded", "cancelled", "retryable"],
+          where: fragment("?->>'directory_id'", j.args) in ^directory_ids,
+          order_by: [desc: j.completed_at]
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+        |> Enum.uniq_by(& &1.args["directory_id"])
+        |> Enum.map(fn job -> {job.args["directory_id"], job} end)
+        |> Map.new()
+
+      # Add has_active_job, is_legacy, and most_recent_job fields
+      # most_recent_job is the active job if one exists, otherwise the last completed job
       Enum.map(directories, fn dir ->
+        active_job = Map.get(active_jobs, dir.id)
+        completed_job = Map.get(completed_jobs, dir.id)
+        most_recent_job = active_job || completed_job
+
         dir
-        |> Map.put(:has_active_job, Map.has_key?(active_jobs, dir.id))
+        |> Map.put(:has_active_job, active_job != nil)
         |> Map.put(:is_legacy, Map.get(dir, :legacy_service_account_key) != nil)
+        |> Map.put(:most_recent_job, job_to_map(most_recent_job))
       end)
+    end
+
+    defp job_to_map(nil), do: nil
+
+    defp job_to_map(job) do
+      now = DateTime.utc_now()
+      seconds = DateTime.diff(job.completed_at || now, job.inserted_at, :second)
+
+      %{
+        directory_id: job.args["directory_id"],
+        state: job.state,
+        completed_at: job.completed_at,
+        inserted_at: job.inserted_at,
+        elapsed_seconds: seconds,
+        errors: job.errors
+      }
     end
 
     defp enrich_with_sync_stats(directories, subject) do
@@ -1745,7 +1804,7 @@ defmodule PortalWeb.Settings.DirectorySync do
           group_by: ei.directory_id,
           select: {ei.directory_id, count(ei.actor_id, :distinct)}
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> Map.new()
 
@@ -1756,7 +1815,7 @@ defmodule PortalWeb.Settings.DirectorySync do
           group_by: g.directory_id,
           select: {g.directory_id, count(g.id)}
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> Map.new()
 

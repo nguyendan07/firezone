@@ -1,8 +1,10 @@
 defmodule PortalAPI.Gateway.ChannelTest do
   use PortalAPI.ChannelCase, async: true
   alias Portal.Changes
-  alias Portal.PubSub
+  alias Portal.{Channels, PubSub}
   import Portal.Cache.Cacheable, only: [to_cache: 1]
+
+  @test_user_agent "macOS/14.0 apple-client/1.3.0"
 
   import Portal.AccountFixtures
   import Portal.ActorFixtures
@@ -19,18 +21,41 @@ defmodule PortalAPI.Gateway.ChannelTest do
   import Portal.TokenFixtures
 
   defp join_channel(gateway, site, token) do
+    session = build_gateway_session(gateway, token)
+
     {:ok, _reply, socket} =
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
         site: site,
+        session: session,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
       })
       |> subscribe_and_join(PortalAPI.Gateway.Channel, "gateway")
 
     socket
+  end
+
+  defp build_gateway_session(gateway, token) do
+    %Portal.GatewaySession{
+      gateway_id: gateway.id,
+      account_id: gateway.account_id,
+      gateway_token_id: token.id,
+      public_key: gateway.latest_session && gateway.latest_session.public_key,
+      user_agent: "Firezone-Gateway/1.3.0",
+      remote_ip: gateway.latest_session && gateway.latest_session.remote_ip,
+      remote_ip_location_region:
+        gateway.latest_session && gateway.latest_session.remote_ip_location_region,
+      remote_ip_location_city:
+        gateway.latest_session && gateway.latest_session.remote_ip_location_city,
+      remote_ip_location_lat:
+        gateway.latest_session && gateway.latest_session.remote_ip_location_lat,
+      remote_ip_location_lon:
+        gateway.latest_session && gateway.latest_session.remote_ip_location_lon,
+      version: (gateway.latest_session && gateway.latest_session.version) || "1.3.0"
+    }
   end
 
   setup do
@@ -177,6 +202,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       channel_pid = self()
       socket_ref = make_ref()
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       ice_credentials = %{
         client: %{username: "A", password: "B"},
@@ -185,15 +211,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: expired_policy_authorization.id,
            authorization_expires_at: expired_expiration,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -258,6 +291,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       channel_pid = self()
       socket_ref = make_ref()
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       ice_credentials = %{
         client: %{username: "A", password: "B"},
@@ -266,15 +300,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: expired_policy_authorization.id,
            authorization_expires_at: expired_expiration,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -282,15 +323,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: unexpired_policy_authorization.id,
            authorization_expires_at: unexpired_expiration,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -336,7 +384,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
     } do
       _socket = join_channel(gateway, site, token)
 
-      :ok = PubSub.Account.subscribe(account.id)
+      :ok = PubSub.Changes.subscribe(account.id)
 
       old_data = %{
         "id" => account.id,
@@ -405,7 +453,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       Process.flag(:trap_exit, true)
 
-      :ok = PubSub.Account.subscribe(account.id)
+      :ok = PubSub.Changes.subscribe(account.id)
 
       data = %{
         "id" => gateway.id,
@@ -453,9 +501,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -524,9 +574,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -569,7 +621,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       in_one_hour = DateTime.utc_now() |> DateTime.add(1, :hour)
       in_one_day = DateTime.utc_now() |> DateTime.add(1, :day)
 
-      :ok = PubSub.Account.subscribe(account.id)
+      :ok = PubSub.Changes.subscribe(account.id)
 
       policy_authorization1 =
         policy_authorization_fixture(
@@ -597,9 +649,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization1.id,
            authorization_expires_at: policy_authorization1.expires_at,
@@ -611,9 +665,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization2.id,
            authorization_expires_at: policy_authorization2.expires_at,
@@ -668,14 +724,17 @@ defmodule PortalAPI.Gateway.ChannelTest do
       subject: subject,
       group: group
     } do
+      :ok = Portal.Presence.Relays.connect(relay)
+
       socket = join_channel(gateway, site, token)
+
+      # Consume init and any relays_presence messages from join + relay connect
+      assert_push "init", _init_payload
 
       channel_pid = self()
       socket_ref = make_ref()
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       client_payload = "RTC_SD_or_DNS_Q"
-
-      :ok = Portal.Presence.Relays.connect(relay)
 
       policy_authorization =
         policy_authorization_fixture(
@@ -702,9 +761,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -791,9 +852,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
       # Build up policy authorization cache
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -805,9 +868,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: other_client,
+           client_id: other_client.id,
+           client_ipv4: other_client.ipv4_address.address,
+           client_ipv6: other_client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: other_policy_authorization1.id,
            authorization_expires_at: expires_at,
@@ -819,9 +884,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(other_resource),
            policy_authorization_id: other_policy_authorization2.id,
            authorization_expires_at: expires_at,
@@ -862,6 +929,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       Changes.Hooks.PolicyAuthorizations.on_delete(100, data)
 
+      # Synchronize with the channel to ensure the change is fully processed
+      # before asserting the push. The channel may make DB queries in
+      # reauthorize_policy_authorization which can be slow under CI load.
+      :sys.get_state(socket.channel_pid)
+
       assert_push "reject_access", %{
         client_id: client_id,
         resource_id: resource_id
@@ -883,6 +955,8 @@ defmodule PortalAPI.Gateway.ChannelTest do
       }
 
       Changes.Hooks.PolicyAuthorizations.on_delete(200, data)
+
+      :sys.get_state(socket.channel_pid)
 
       assert_push "reject_access", %{
         client_id: client_id,
@@ -925,9 +999,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -988,13 +1064,15 @@ defmodule PortalAPI.Gateway.ChannelTest do
           group: group
         )
 
-      :ok = PubSub.Account.subscribe(account.id)
+      :ok = PubSub.Changes.subscribe(account.id)
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -1070,9 +1148,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:allow_access, gateway.id}, {channel_pid, socket_ref},
+        {:allow_access, {channel_pid, socket_ref},
          %{
-           client: client,
+           client_id: client.id,
+           client_ipv4: client.ipv4_address.address,
+           client_ipv6: client.ipv6_address.address,
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
@@ -1170,12 +1250,15 @@ defmodule PortalAPI.Gateway.ChannelTest do
       site: site,
       token: token
     } do
-      # Create a new socket with the gateway set to an old version (< 1.2.0)
+      # Create a new socket with the session set to an old version (< 1.2.0)
+      session = %{build_gateway_session(gateway, token) | version: "1.1.0"}
+
       {:ok, _, _socket} =
         PortalAPI.Gateway.Socket
         |> socket("gateway:#{gateway.id}", %{
           token_id: token.id,
-          gateway: Map.put(gateway, :last_seen_version, "1.1.0"),
+          gateway: gateway,
+          session: session,
           site: site,
           opentelemetry_ctx: OpenTelemetry.Ctx.new(),
           opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -1227,7 +1310,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       # Update the channel process state to use an old gateway version (< 1.2.0)
       :sys.replace_state(socket.channel_pid, fn state ->
-        put_in(state.assigns.gateway.last_seen_version, "1.1.0")
+        put_in(state.assigns.session.version, "1.1.0")
       end)
 
       # Create a DNS resource with an address that can't be adapted
@@ -1269,7 +1352,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       # Update the channel process state to use an old gateway version (< 1.2.0)
       :sys.replace_state(socket.channel_pid, fn state ->
-        put_in(state.assigns.gateway.last_seen_version, "1.1.0")
+        put_in(state.assigns.session.version, "1.1.0")
       end)
 
       # Create a DNS resource with an address that needs adaptation for old versions
@@ -1323,10 +1406,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
       relay2 = relay_fixture(%{lat: 38.0, lon: -121.0})
       :ok = Portal.Presence.Relays.connect(relay2)
 
+      session = build_gateway_session(gateway, token)
+
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
+        session: session,
         site: site,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -1369,10 +1455,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
     } do
       relay = relay_fixture(%{lat: 37.0, lon: -120.0})
 
+      session = build_gateway_session(gateway, token)
+
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
+        session: session,
         site: site,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -1426,6 +1515,31 @@ defmodule PortalAPI.Gateway.ChannelTest do
                   100
     end
 
+    test "relay credentials are stable across reconnects", %{
+      gateway: gateway,
+      site: site,
+      token: token
+    } do
+      relay = relay_fixture(%{lat: 37.0, lon: -120.0})
+      :ok = Portal.Presence.Relays.connect(relay)
+
+      Process.flag(:trap_exit, true)
+
+      socket1 = join_channel(gateway, site, token)
+      assert_push "init", %{relays: relays1}
+
+      Process.exit(socket1.channel_pid, :shutdown)
+      assert_receive {:EXIT, _, :shutdown}
+
+      socket2 = join_channel(gateway, site, token)
+      assert_push "init", %{relays: relays2}
+
+      Process.exit(socket2.channel_pid, :shutdown)
+      assert_receive {:EXIT, _, :shutdown}
+
+      assert relays1 == relays2
+    end
+
     test "pushes ice_candidates message", %{
       client: client,
       gateway: gateway,
@@ -1438,7 +1552,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:ice_candidates, gateway.id}, client.id, candidates}
+        {:ice_candidates, client.id, candidates}
       )
 
       assert_push "ice_candidates", payload
@@ -1461,7 +1575,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:invalidate_ice_candidates, gateway.id}, client.id, candidates}
+        {:invalidate_ice_candidates, client.id, candidates}
       )
 
       assert_push "invalidate_ice_candidates", payload
@@ -1499,19 +1613,24 @@ defmodule PortalAPI.Gateway.ChannelTest do
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       preshared_key = "PSK"
       client_payload = "RTC_SD"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       :ok = Portal.Presence.Relays.connect(relay)
 
       send(
         socket.channel_pid,
-        {{:request_connection, gateway.id}, {channel_pid, socket_ref},
+        {:request_connection, {channel_pid, socket_ref},
          %{
-           client: client,
+           client:
+             PortalAPI.Gateway.Views.Client.render_legacy(
+               client,
+               public_key,
+               client_payload,
+               preshared_key
+             ),
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
-           authorization_expires_at: expires_at,
-           client_payload: client_payload,
-           client_preshared_key: preshared_key
+           authorization_expires_at: expires_at
          }}
       )
 
@@ -1534,7 +1653,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
                  ipv6: client.ipv6_address.address,
                  persistent_keepalive: 25,
                  preshared_key: preshared_key,
-                 public_key: client.public_key
+                 public_key: public_key
                },
                payload: client_payload
              }
@@ -1563,6 +1682,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       client_payload = "RTC_SD_or_DNS_Q"
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       :ok = Portal.Presence.Relays.connect(relay)
 
@@ -1579,14 +1699,18 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:request_connection, gateway.id}, {channel_pid, socket_ref},
+        {:request_connection, {channel_pid, socket_ref},
          %{
-           client: client,
+           client:
+             PortalAPI.Gateway.Views.Client.render_legacy(
+               client,
+               public_key,
+               client_payload,
+               preshared_key
+             ),
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
-           authorization_expires_at: expires_at,
-           client_payload: client_payload,
-           client_preshared_key: preshared_key
+           authorization_expires_at: expires_at
          }}
       )
 
@@ -1641,6 +1765,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       socket_ref = make_ref()
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       ice_credentials = %{
         client: %{username: "A", password: "B"},
@@ -1649,15 +1774,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -1678,8 +1810,8 @@ defmodule PortalAPI.Gateway.ChannelTest do
                ipv4: client.ipv4_address.address,
                ipv6: client.ipv6_address.address,
                preshared_key: preshared_key,
-               public_key: client.public_key,
-               version: client.last_seen_version,
+               public_key: public_key,
+               version: "1.3.0",
                device_serial: client.device_serial,
                device_uuid: client.device_uuid,
                identifier_for_vendor: client.identifier_for_vendor,
@@ -1703,75 +1835,6 @@ defmodule PortalAPI.Gateway.ChannelTest do
                DateTime.truncate(expires_at, :second)
     end
 
-    test "authorize_flow preloads client addresses when not already loaded", %{
-      client: client,
-      account: account,
-      actor: actor,
-      gateway: gateway,
-      resource: resource,
-      site: site,
-      token: token,
-      subject: subject,
-      group: group
-    } do
-      socket = join_channel(gateway, site, token)
-
-      policy_authorization =
-        policy_authorization_fixture(
-          account: account,
-          actor: actor,
-          client: client,
-          resource: resource,
-          group: group
-        )
-
-      channel_pid = self()
-      socket_ref = make_ref()
-      expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
-      preshared_key = "PSK"
-
-      ice_credentials = %{
-        client: %{username: "A", password: "B"},
-        gateway: %{username: "C", password: "D"}
-      }
-
-      # Simulate a client received via PubSub without preloaded addresses
-      # by explicitly setting the associations to NotLoaded
-      client_without_preloads = %{
-        client
-        | ipv4_address: %Ecto.Association.NotLoaded{
-            __field__: :ipv4_address,
-            __owner__: Portal.Client,
-            __cardinality__: :one
-          },
-          ipv6_address: %Ecto.Association.NotLoaded{
-            __field__: :ipv6_address,
-            __owner__: Portal.Client,
-            __cardinality__: :one
-          }
-      }
-
-      send(
-        socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
-         %{
-           client: client_without_preloads,
-           resource: to_cache(resource),
-           policy_authorization_id: policy_authorization.id,
-           authorization_expires_at: expires_at,
-           ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
-         }}
-      )
-
-      # Should successfully push authorize_flow with the addresses loaded
-      assert_push "authorize_flow", payload
-
-      assert payload.client.ipv4 == client.ipv4_address.address
-      assert payload.client.ipv6 == client.ipv6_address.address
-    end
-
     test "authorize_flow tracks policy authorization and sends reject_access when policy authorization is deleted",
          %{
            account: account,
@@ -1790,6 +1853,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       socket_ref = make_ref()
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
 
       ice_credentials = %{
         client: %{username: "A", password: "B"},
@@ -1809,15 +1873,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -1850,6 +1921,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
   describe "handle_in/3" do
     test "for unknown messages it doesn't crash", %{gateway: gateway, site: site, token: token} do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       ref = push(socket, "unknown_message", %{})
       assert_reply ref, :error, %{reason: :unknown_message}
@@ -1867,6 +1939,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       group: group
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       policy_authorization =
         policy_authorization_fixture(
@@ -1881,9 +1954,10 @@ defmodule PortalAPI.Gateway.ChannelTest do
       socket_ref = make_ref()
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       preshared_key = "PSK"
+      public_key = Portal.ClientFixtures.generate_public_key()
       site_id = gateway.site_id
       gateway_id = gateway.id
-      gateway_public_key = gateway.public_key
+      gateway_public_key = gateway.latest_session.public_key
       gateway_ipv4 = gateway.ipv4_address.address
       gateway_ipv6 = gateway.ipv6_address.address
       rid_bytes = Ecto.UUID.dump!(resource.id)
@@ -1895,15 +1969,22 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       send(
         socket.channel_pid,
-        {{:authorize_policy, gateway.id}, {channel_pid, socket_ref},
+        {:authorize_policy, {channel_pid, socket_ref},
          %{
-           client: client,
-           resource: to_cache(resource),
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               client,
+               public_key,
+               preshared_key,
+               @test_user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(to_cache(resource)),
+           resource_id: to_cache(resource).id,
            policy_authorization_id: policy_authorization.id,
            authorization_expires_at: expires_at,
            ice_credentials: ice_credentials,
-           preshared_key: preshared_key,
-           subject: subject
+           preshared_key: preshared_key
          }}
       )
 
@@ -1932,6 +2013,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       push_ref =
         push(socket, "flow_authorized", %{
@@ -1953,6 +2035,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       group: group
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       policy_authorization =
         policy_authorization_fixture(
@@ -1967,21 +2050,26 @@ defmodule PortalAPI.Gateway.ChannelTest do
       socket_ref = make_ref()
       expires_at = DateTime.utc_now() |> DateTime.add(30, :second)
       preshared_key = "PSK"
-      gateway_public_key = gateway.public_key
+      public_key = Portal.ClientFixtures.generate_public_key()
+      gateway_public_key = gateway.latest_session.public_key
       payload = "RTC_SD"
 
       :ok = Portal.Presence.Relays.connect(relay)
 
       send(
         socket.channel_pid,
-        {{:request_connection, gateway.id}, {channel_pid, socket_ref},
+        {:request_connection, {channel_pid, socket_ref},
          %{
-           client: client,
+           client:
+             PortalAPI.Gateway.Views.Client.render_legacy(
+               client,
+               public_key,
+               payload,
+               preshared_key
+             ),
            resource: to_cache(resource),
            policy_authorization_id: policy_authorization.id,
-           authorization_expires_at: expires_at,
-           client_payload: payload,
-           client_preshared_key: preshared_key
+           authorization_expires_at: expires_at
          }}
       )
 
@@ -1999,7 +2087,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       assert client_id == client.id
       assert peer.ipv4 == client.ipv4_address.address
       assert peer.ipv6 == client.ipv6_address.address
-      assert peer.public_key == client.public_key
+      assert peer.public_key == public_key
       assert peer.persistent_keepalive == 25
       assert peer.preshared_key == preshared_key
       assert re.id == resource.id
@@ -2022,6 +2110,7 @@ defmodule PortalAPI.Gateway.ChannelTest do
       token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       push_ref =
         push(socket, "connection_ready", %{
@@ -2035,14 +2124,12 @@ defmodule PortalAPI.Gateway.ChannelTest do
     test "broadcast ice candidates does nothing when gateways list is empty", %{
       gateway: gateway,
       site: site,
-      token: token,
-      account: account
+      token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       candidates = ["foo", "bar"]
-
-      :ok = PubSub.Account.subscribe(account.id)
 
       attrs = %{
         "candidates" => candidates,
@@ -2056,12 +2143,11 @@ defmodule PortalAPI.Gateway.ChannelTest do
     test "broadcasts :ice_candidates message to the target gateway", %{
       client: client,
       gateway: gateway,
-      subject: subject,
       site: site,
-      token: token,
-      account: account
+      token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       candidates = ["foo", "bar"]
 
@@ -2070,38 +2156,25 @@ defmodule PortalAPI.Gateway.ChannelTest do
         "client_ids" => [client.id]
       }
 
-      client_actor = service_account_fixture(account: account)
-
-      client_token =
-        client_token_fixture(
-          account: account,
-          actor: client_actor
-        )
-
-      :ok = Portal.Presence.Clients.connect(client, client_token.id)
-      PubSub.subscribe(Portal.Sockets.socket_id(subject.credential.id))
-      :ok = PubSub.Account.subscribe(gateway.account_id)
+      :ok = Channels.register_client(client.id)
 
       push(socket, "broadcast_ice_candidates", attrs)
 
-      assert_receive {{:ice_candidates, client_id}, gateway_id, ^candidates},
+      assert_receive {:ice_candidates, gateway_id, ^candidates},
                      200
 
-      assert client_id == client.id
       assert gateway.id == gateway_id
     end
 
     test "broadcast_invalidated_ice_candidates does nothing when gateways list is empty", %{
       gateway: gateway,
       site: site,
-      token: token,
-      account: account
+      token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       candidates = ["foo", "bar"]
-
-      :ok = PubSub.Account.subscribe(account.id)
 
       attrs = %{
         "candidates" => candidates,
@@ -2109,18 +2182,17 @@ defmodule PortalAPI.Gateway.ChannelTest do
       }
 
       push(socket, "broadcast_invalidated_ice_candidates", attrs)
-      refute_receive {{:invalidate_ice_candidates, _client_id}, _gateway_id, _candidates}
+      refute_receive {:invalidate_ice_candidates, _gateway_id, _candidates}
     end
 
     test "broadcasts :invalidate_ice_candidates message to all gateways", %{
       client: client,
       gateway: gateway,
-      subject: subject,
       site: site,
-      token: token,
-      account: account
+      token: token
     } do
       socket = join_channel(gateway, site, token)
+      assert_push "init", %{relays: _}
 
       candidates = ["foo", "bar"]
 
@@ -2129,24 +2201,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
         "client_ids" => [client.id]
       }
 
-      :ok = PubSub.Account.subscribe(gateway.account_id)
-      client_actor = service_account_fixture(account: account)
-
-      client_token =
-        client_token_fixture(
-          account: account,
-          actor: client_actor
-        )
-
-      :ok = Portal.Presence.Clients.connect(client, client_token.id)
-      PubSub.subscribe(Portal.Sockets.socket_id(subject.credential.id))
+      :ok = Channels.register_client(client.id)
 
       push(socket, "broadcast_invalidated_ice_candidates", attrs)
 
-      assert_receive {{:invalidate_ice_candidates, client_id}, gateway_id, ^candidates},
+      assert_receive {:invalidate_ice_candidates, gateway_id, ^candidates},
                      200
 
-      assert client_id == client.id
       assert gateway.id == gateway_id
     end
   end
@@ -2162,10 +2223,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       :ok = Portal.Presence.Relays.connect(relay1)
 
+      session = build_gateway_session(gateway, token)
+
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
+        session: session,
         site: site,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -2199,10 +2263,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       :ok = Portal.Presence.Relays.connect(relay1)
 
+      session = build_gateway_session(gateway, token)
+
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
+        session: session,
         site: site,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -2249,10 +2316,13 @@ defmodule PortalAPI.Gateway.ChannelTest do
 
       :ok = Portal.Presence.Relays.connect(relay1)
 
+      session = build_gateway_session(gateway, token)
+
       PortalAPI.Gateway.Socket
       |> socket("gateway:#{gateway.id}", %{
         token_id: token.id,
         gateway: gateway,
+        session: session,
         site: site,
         opentelemetry_ctx: OpenTelemetry.Ctx.new(),
         opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
@@ -2274,6 +2344,67 @@ defmodule PortalAPI.Gateway.ChannelTest do
                   100
 
       assert relay_id == relay1.id
+    end
+
+    test "disconnected_ids only contains relays that are truly offline", %{
+      gateway: gateway,
+      site: site,
+      token: token
+    } do
+      # This test validates that disconnected_ids only contains relays that are
+      # no longer in presence (truly offline), not relays that happen to not be
+      # selected by load balancing.
+      #
+      # The fix uses a single presence snapshot for both:
+      # 1. Determining which cached relays are now offline (disconnected_ids)
+      # 2. Selecting the best relays to send to the gateway (connected)
+      #
+      # This ensures a relay can never appear in both lists due to CRDT
+      # eventual consistency during rapid disconnect/reconnect cycles.
+
+      relay = relay_fixture(%{lat: 37.0, lon: -120.0})
+
+      :ok = Portal.Presence.Relays.connect(relay)
+
+      session = build_gateway_session(gateway, token)
+
+      PortalAPI.Gateway.Socket
+      |> socket("gateway:#{gateway.id}", %{
+        token_id: token.id,
+        gateway: gateway,
+        session: session,
+        site: site,
+        opentelemetry_ctx: OpenTelemetry.Ctx.new(),
+        opentelemetry_span_ctx: OpenTelemetry.Tracer.start_span("test")
+      })
+      |> subscribe_and_join(PortalAPI.Gateway.Channel, "gateway")
+
+      assert_push "init", %{relays: [_, _]}
+
+      # Disconnect and immediately reconnect - without the fix, this could cause
+      # the relay to appear in both connected and disconnected_ids
+      Portal.Presence.Relays.disconnect(relay)
+      :ok = Portal.Presence.Relays.connect(relay)
+
+      # If we receive any relays_presence message, verify the invariant:
+      # a relay should NEVER appear in both connected and disconnected_ids
+      receive do
+        %Phoenix.Socket.Message{event: "relays_presence", payload: payload} ->
+          connected_ids = MapSet.new(payload.connected, & &1.id)
+          disconnected_ids = MapSet.new(payload.disconnected_ids)
+
+          intersection = MapSet.intersection(connected_ids, disconnected_ids)
+
+          assert MapSet.size(intersection) == 0,
+                 "Relay IDs #{inspect(MapSet.to_list(intersection))} appear in both " <>
+                   "connected and disconnected_ids - disconnected_ids should only " <>
+                   "contain relays that are truly offline"
+      after
+        100 ->
+          # No message received is also acceptable - relay reconnected before
+          # the presence check ran, so no update was needed
+          :ok
+      end
     end
 
     test "selects closest relays by distance when gateway has location", %{

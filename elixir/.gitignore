@@ -47,6 +47,9 @@ npm-debug.log
 # Dialyxir output
 /priv/plts/
 
+# MaxMind DB files
+/priv/geoip/
+
 # Test screenshots
 /screenshots/
 
@@ -55,3 +58,6 @@ npm-debug.log
 
 # ElixirLS
 .elixir_ls/
+
+# Generated DB structure file
+priv/repo/structure.sql

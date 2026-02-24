@@ -2,10 +2,9 @@ defmodule PortalAPI.GatewayController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
   alias PortalAPI.Pagination
-  alias __MODULE__.DB
+  alias PortalAPI.Error
+  alias __MODULE__.Database
   alias Portal.Presence
-
-  action_fallback PortalAPI.FallbackController
 
   tags ["Gateways"]
 
@@ -25,7 +24,7 @@ defmodule PortalAPI.GatewayController do
       ok: {"Gateway Response", "application/json", PortalAPI.Schemas.Gateway.ListResponse}
     ]
 
-  # List Gateways
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def index(conn, params) do
     list_opts =
       params
@@ -39,8 +38,10 @@ defmodule PortalAPI.GatewayController do
         list_opts
       end
 
-    with {:ok, gateways, metadata} <- DB.list_gateways(conn.assigns.subject, list_opts) do
+    with {:ok, gateways, metadata} <- Database.list_gateways(conn.assigns.subject, list_opts) do
       render(conn, :index, gateways: gateways, metadata: metadata)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -64,11 +65,13 @@ defmodule PortalAPI.GatewayController do
       ok: {"Gateway Response", "application/json", PortalAPI.Schemas.Gateway.Response}
     ]
 
-  # Show a specific Gateway
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    with {:ok, gateway} <- DB.fetch_gateway(id, conn.assigns.subject) do
+    with {:ok, gateway} <- Database.fetch_gateway(id, conn.assigns.subject) do
       gateway = Presence.Gateways.preload_gateways_presence([gateway]) |> List.first()
       render(conn, :show, gateway: gateway)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -92,17 +95,19 @@ defmodule PortalAPI.GatewayController do
       ok: {"Gateway Response", "application/json", PortalAPI.Schemas.Gateway.Response}
     ]
 
-  # Delete a Gateway
+  @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete(conn, %{"id" => id}) do
     subject = conn.assigns.subject
 
-    with {:ok, gateway} <- DB.fetch_gateway(id, subject),
-         {:ok, gateway} <- DB.delete_gateway(gateway, subject) do
+    with {:ok, gateway} <- Database.fetch_gateway(id, subject),
+         {:ok, gateway} <- Database.delete_gateway(gateway, subject) do
       render(conn, :show, gateway: gateway)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Gateway
@@ -110,7 +115,7 @@ defmodule PortalAPI.GatewayController do
 
     def list_gateways(subject, opts \\ []) do
       from(g in Gateway, as: :gateways)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -148,7 +153,7 @@ defmodule PortalAPI.GatewayController do
         from(g in Gateway, as: :gateways)
         |> where([gateways: g], g.id == ^id)
         |> preload([:ipv4_address, :ipv6_address])
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do

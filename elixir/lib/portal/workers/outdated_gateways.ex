@@ -12,7 +12,7 @@ defmodule Portal.Workers.OutdatedGateways do
   require Logger
   require OpenTelemetry.Tracer
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   alias Portal.{Gateway, Mailer}
 
   @impl Oban.Worker
@@ -24,9 +24,9 @@ defmodule Portal.Workers.OutdatedGateways do
   defp run_check do
     latest_version = Portal.ComponentVersions.gateway_version()
 
-    DB.all_accounts_pending_notification!()
+    Database.all_accounts_pending_notification!()
     |> Enum.each(fn account ->
-      incompatible_client_count = DB.count_incompatible_for(account, latest_version)
+      incompatible_client_count = Database.count_incompatible_for(account, latest_version)
 
       all_online_gateways_for_account(account)
       |> Enum.filter(&Gateway.gateway_outdated?/1)
@@ -36,11 +36,11 @@ defmodule Portal.Workers.OutdatedGateways do
 
   defp all_online_gateways_for_account(account) do
     gateways_by_id =
-      DB.all_gateways_for_account!(account)
+      Database.all_gateways_for_account!(account)
       |> Enum.group_by(& &1.id)
 
-    DB.all_sites_for_account!(account)
-    |> Enum.flat_map(&DB.all_online_gateway_ids_by_site_id!(&1.id))
+    Database.all_sites_for_account!(account)
+    |> Enum.flat_map(&Database.all_online_gateway_ids_by_site_id!(&1.id))
     |> Enum.flat_map(&Map.get(gateways_by_id, &1))
   end
 
@@ -49,7 +49,7 @@ defmodule Portal.Workers.OutdatedGateways do
   end
 
   defp send_notifications(gateways, account, incompatible_client_count) do
-    DB.all_admins_for_account!(account)
+    Database.all_admins_for_account!(account)
     |> Enum.each(&send_email(account, gateways, incompatible_client_count, &1.email))
 
     changeset =
@@ -63,7 +63,7 @@ defmodule Portal.Workers.OutdatedGateways do
         }
       })
 
-    DB.update_account(changeset)
+    Database.update_account(changeset)
   end
 
   defp send_email(account, gateways, incompatible_client_count, email) do
@@ -101,10 +101,11 @@ defmodule Portal.Workers.OutdatedGateways do
     )
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Client
+    alias Portal.ClientSession
 
     def all_accounts_pending_notification! do
       from(a in Portal.Account,
@@ -119,7 +120,7 @@ defmodule Portal.Workers.OutdatedGateways do
               a.config
             )
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
 
@@ -128,7 +129,7 @@ defmodule Portal.Workers.OutdatedGateways do
       |> where([actors: a], is_nil(a.disabled_at))
       |> where([actors: a], a.account_id == ^account.id)
       |> where([actors: a], a.type == :account_admin_user)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
 
@@ -143,35 +144,72 @@ defmodule Portal.Workers.OutdatedGateways do
 
       from(c in Client, as: :clients)
       |> where([clients: c], c.account_id == ^account.id)
-      |> where([clients: c], c.last_seen_at > ago(1, "week"))
-      |> where(
+      |> join(
+        :inner_lateral,
         [clients: c],
-        fragment("split_part(?, '.', 1)::int", c.last_seen_version) < ^g_major or
-          (fragment("split_part(?, '.', 1)::int", c.last_seen_version) == ^g_major and
-             fragment("split_part(?, '.', 2)::int", c.last_seen_version) <= ^(g_minor - 2))
+        s in subquery(
+          from(s in ClientSession,
+            where: s.client_id == parent_as(:clients).id,
+            where: s.account_id == parent_as(:clients).account_id,
+            order_by: [desc: s.inserted_at],
+            limit: 1
+          )
+        ),
+        on: true,
+        as: :latest_session
+      )
+      |> where([latest_session: s], s.inserted_at > ago(1, "week"))
+      |> where(
+        [latest_session: s],
+        fragment("split_part(?, '.', 1)::int", s.version) < ^g_major or
+          (fragment("split_part(?, '.', 1)::int", s.version) == ^g_major and
+             fragment("split_part(?, '.', 2)::int", s.version) <= ^(g_minor - 2))
       )
       |> join(:inner, [clients: c], a in Portal.Actor,
         on: c.actor_id == a.id and c.account_id == a.account_id,
         as: :actor
       )
       |> where([actor: a], is_nil(a.disabled_at))
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
     def all_gateways_for_account!(account) do
-      from(g in Portal.Gateway,
-        where: g.account_id == ^account.id
-      )
-      |> Safe.unscoped()
-      |> Safe.all()
+      gateways =
+        from(g in Portal.Gateway,
+          where: g.account_id == ^account.id
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+
+      preload_latest_sessions(gateways)
+    end
+
+    defp preload_latest_sessions(gateways) do
+      account_ids = gateways |> Enum.map(& &1.account_id) |> Enum.uniq()
+      gateway_ids = Enum.map(gateways, & &1.id)
+
+      sessions_by_gateway_id =
+        from(s in Portal.GatewaySession,
+          where: s.account_id in ^account_ids,
+          where: s.gateway_id in ^gateway_ids,
+          distinct: s.gateway_id,
+          order_by: [asc: s.gateway_id, desc: s.inserted_at]
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+        |> Map.new(&{&1.gateway_id, &1})
+
+      Enum.map(gateways, fn gateway ->
+        %{gateway | latest_session: Map.get(sessions_by_gateway_id, gateway.id)}
+      end)
     end
 
     def all_sites_for_account!(account) do
       from(g in Portal.Site,
         where: g.account_id == ^account.id
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
 

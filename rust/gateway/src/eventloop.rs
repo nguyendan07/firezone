@@ -1,12 +1,9 @@
-use anyhow::{Context as _, ErrorExt as _, Result};
+use anyhow::{Context as _, ErrorExt, Result};
 use bin_shared::{TunDeviceManager, signals};
-use boringtun::x25519::PublicKey;
-#[cfg(not(target_os = "windows"))]
-use dns_lookup::{AddrInfoHints, AddrInfoIter, LookupError};
 use dns_types::DomainName;
 use telemetry::{Telemetry, analytics};
 
-use futures::{FutureExt as _, TryFutureExt};
+use futures::TryFutureExt;
 use hickory_resolver::TokioResolver;
 use phoenix_channel::{PhoenixChannel, PublicKeyParam};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,15 +16,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use std::{io, iter, mem};
 use tokio::sync::mpsc;
+use tunnel::messages::RelaysPresence;
 use tunnel::messages::gateway::{
-    AccessAuthorizationExpiryUpdated, AllowAccess, Authorization, ClientIceCandidates,
-    ClientsIceCandidates, ConnectionReady, EgressMessages, IngressMessages, InitGateway,
-    RejectAccess, RequestConnection,
+    AccessAuthorizationExpiryUpdated, Authorization, ClientIceCandidates, ClientsIceCandidates,
+    EgressMessages, IngressMessages, InitGateway, RejectAccess,
 };
-use tunnel::messages::{ConnectionAccepted, GatewayResponse, RelaysPresence};
 use tunnel::{
-    DnsResourceNatEntry, GatewayEvent, GatewayTunnel, IPV4_TUNNEL, IPV6_TUNNEL, IpConfig,
-    ResolveDnsRequest, TunnelError,
+    GatewayEvent, GatewayTunnel, IPV4_TUNNEL, IPV6_TUNNEL, IpConfig, ResolveDnsRequest, TunnelError,
 };
 
 use crate::RELEASE;
@@ -37,34 +32,18 @@ pub const PHOENIX_TOPIC: &str = "gateway";
 /// How long we allow a DNS resolution via hickory.
 const DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Cache DNS responses for 30 seconds.
-const DNS_TTL: Duration = Duration::from_secs(30);
-
-// DNS resolution happens as part of every connection setup.
-// For a connection to succeed, DNS resolution must be less than `snownet`'s handshake timeout.
-static_assertions::const_assert!(
-    DNS_RESOLUTION_TIMEOUT.as_secs() < snownet::HANDSHAKE_TIMEOUT.as_secs()
-);
-
-#[derive(Debug)]
-enum ResolveTrigger {
-    RequestConnection(RequestConnection), // Deprecated
-    AllowAccess(AllowAccess),             // Deprecated
-    SetupNat(ResolveDnsRequest),
-}
-
 pub struct Eventloop {
     // Tunnel is `Option` because we need to take ownership on shutdown.
     tunnel: Option<GatewayTunnel>,
     tun_device_manager: TunDeviceManager,
     resolver: TokioResolver,
 
-    resolve_tasks:
-        futures_bounded::FuturesTupleSet<Result<Vec<IpAddr>, Arc<anyhow::Error>>, ResolveTrigger>,
+    resolve_tasks: futures_bounded::FuturesTupleSet<
+        Result<Vec<IpAddr>, Arc<anyhow::Error>>,
+        ResolveDnsRequest,
+    >,
     portal_event_rx: mpsc::Receiver<Result<IngressMessages, phoenix_channel::Error>>,
     portal_cmd_tx: mpsc::Sender<PortalCommand>,
-
-    dns_cache: moka::future::Cache<DomainName, Vec<IpAddr>>,
 
     sigint: signals::Terminate,
 
@@ -104,13 +83,6 @@ impl Eventloop {
                 1000,
             ),
             logged_permission_denied: false,
-            dns_cache: moka::future::Cache::builder()
-                .name("DNS queries")
-                .time_to_live(DNS_TTL)
-                .eviction_listener(|domain, ips, cause| {
-                    tracing::debug!(%domain, ?ips, ?cause, "DNS cache entry evicted");
-                })
-                .build(),
             portal_event_rx,
             portal_cmd_tx,
             sigint: signals::Terminate::new()?,
@@ -122,7 +94,7 @@ enum CombinedEvent {
     SigIntTerm,
     Tunnel(GatewayEvent),
     Portal(Option<Result<IngressMessages, phoenix_channel::Error>>),
-    DomainResolved((Result<Vec<IpAddr>, Arc<anyhow::Error>>, ResolveTrigger)),
+    DomainResolved((Result<Vec<IpAddr>, Arc<anyhow::Error>>, ResolveDnsRequest)),
 }
 
 impl Eventloop {
@@ -161,17 +133,7 @@ impl Eventloop {
                 "phoenix channel task stopped unexpectedly",
             )),
             CombinedEvent::Portal(Some(Err(e))) => Err(e).context("Failed to login to portal"),
-            CombinedEvent::DomainResolved((result, ResolveTrigger::RequestConnection(req))) => {
-                self.accept_connection(result, req).await?;
-
-                Ok(ControlFlow::Continue(()))
-            }
-            CombinedEvent::DomainResolved((result, ResolveTrigger::AllowAccess(req))) => {
-                self.allow_access(result, req);
-
-                Ok(ControlFlow::Continue(()))
-            }
-            CombinedEvent::DomainResolved((result, ResolveTrigger::SetupNat(req))) => {
+            CombinedEvent::DomainResolved((result, req)) => {
                 let Some(tunnel) = self.tunnel.as_mut() else {
                     tracing::debug!("Ignoring DNS resolution result during shutdown");
 
@@ -270,10 +232,7 @@ impl Eventloop {
             tunnel::GatewayEvent::ResolveDns(setup_nat) => {
                 if self
                     .resolve_tasks
-                    .try_push(
-                        self.resolve(setup_nat.domain().clone()),
-                        ResolveTrigger::SetupNat(setup_nat),
-                    )
+                    .try_push(self.resolve(setup_nat.domain().clone()), setup_nat)
                     .is_err()
                 {
                     tracing::warn!("Too many dns resolution requests, dropping existing one");
@@ -314,14 +273,15 @@ impl Eventloop {
                 continue;
             }
 
-            if e.any_is::<ip_packet::ImpossibleTranslation>() {
-                // Some IP packets cannot be translated and should be dropped "silently".
-                // Do so by ignoring the error here.
+            if let Some(e) = e.any_downcast_ref::<tunnel::UnroutablePacket>() {
+                tracing::debug!(src = %e.source(), dst = %e.destination(), proto = %e.proto(), "{e:#}");
                 continue;
             }
 
-            if let Some(e) = e.any_downcast_ref::<tunnel::UnroutablePacket>() {
-                tracing::debug!(src = %e.source(), dst = %e.destination(), proto = %e.proto(), "{e:#}");
+            // Newer clients already filter out fragmented IP packets but older ones may still send them.
+            // We can't handle those so log on DEBUG to reduce Sentry noise.
+            if e.any_is::<tunnel::FailedToDecapsulate>() && e.any_is::<ip_packet::Fragmented>() {
+                tracing::debug!("{e:#}");
                 continue;
             }
 
@@ -370,35 +330,6 @@ impl Eventloop {
                         reference: msg.reference,
                     }))
                     .await?;
-            }
-            IngressMessages::RequestConnection(req) => {
-                let Some(domain) = req.client.payload.domain.as_ref().map(|r| r.name.clone())
-                else {
-                    self.accept_connection(Ok(vec![]), req).await?;
-                    return Ok(());
-                };
-
-                if self
-                    .resolve_tasks
-                    .try_push(self.resolve(domain), ResolveTrigger::RequestConnection(req))
-                    .is_err()
-                {
-                    tracing::warn!("Too many connections requests, dropping existing one");
-                };
-            }
-            IngressMessages::AllowAccess(req) => {
-                let Some(domain) = req.payload.as_ref().map(|r| r.name.clone()) else {
-                    self.allow_access(Ok(vec![]), req);
-                    return Ok(());
-                };
-
-                if self
-                    .resolve_tasks
-                    .try_push(self.resolve(domain), ResolveTrigger::AllowAccess(req))
-                    .is_err()
-                {
-                    tracing::warn!("Too many allow access requests, dropping existing one");
-                };
             }
             IngressMessages::IceCandidates(ClientIceCandidates {
                 client_id,
@@ -493,8 +424,14 @@ impl Eventloop {
 
                 tracing::debug!(stack = %tun_ip_stack, "Initialized TUN device");
 
+                let routes = match tun_ip_stack {
+                    bin_shared::TunIpStack::V4Only => vec![IPV4_TUNNEL.into()],
+                    bin_shared::TunIpStack::V6Only => vec![IPV6_TUNNEL.into()],
+                    bin_shared::TunIpStack::Dual => vec![IPV4_TUNNEL.into(), IPV6_TUNNEL.into()],
+                };
+
                 self.tun_device_manager
-                    .set_routes(vec![IPV4_TUNNEL], vec![IPV6_TUNNEL])
+                    .set_routes(routes)
                     .await
                     .context("Failed to set TUN routes")?;
 
@@ -548,163 +485,40 @@ impl Eventloop {
         Ok(())
     }
 
-    pub async fn accept_connection(
-        &mut self,
-        result: Result<Vec<IpAddr>, Arc<anyhow::Error>>,
-        req: RequestConnection,
-    ) -> Result<()> {
-        let Some(tunnel) = self.tunnel.as_mut() else {
-            tracing::debug!(?req, "Ignoring incoming connection during shutdown");
-
-            return Ok(());
-        };
-
-        let addresses = match result {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                tracing::debug!(cid = %req.client.id, reference = %req.reference, "DNS resolution failed as part of connection request: {e:#}");
-
-                return Ok(()); // Fail the connection so the client runs into a timeout.
-            }
-        };
-
-        let answer = match tunnel.state_mut().accept(
-            req.client.id,
-            req.client
-                .payload
-                .ice_parameters
-                .into_snownet_offer(req.client.peer.preshared_key),
-            PublicKey::from(req.client.peer.public_key.0),
-            Instant::now(),
-        ) {
-            Ok(a) => a,
-            Err(snownet::NoTurnServers {}) => {
-                tracing::debug!("Failed to accept new connection: No TURN servers available");
-
-                // Re-connecting to the portal means we will receive another `init` and thus new TURN servers.
-                self.portal_cmd_tx
-                    .send(PortalCommand::Connect(PublicKeyParam(
-                        tunnel.public_key().to_bytes(),
-                    )))
-                    .await?;
-
-                return Ok(());
-            }
-        };
-
-        if let Err(e) = tunnel.state_mut().allow_access(
-            req.client.id,
-            IpConfig {
-                v4: req.client.peer.ipv4,
-                v6: req.client.peer.ipv6,
-            },
-            Default::default(), // Additional client properties are not supported for 1.3.x Clients and will just be empty.
-            req.expires_at,
-            req.resource,
-            req.client
-                .payload
-                .domain
-                .map(|r| DnsResourceNatEntry::new(r, addresses)),
-        ) {
-            let cid = req.client.id;
-
-            tunnel.state_mut().cleanup_connection(&cid, Instant::now());
-            tracing::debug!(%cid, "Connection request failed: {e:#}");
-
-            return Ok(());
-        }
-
-        self.portal_cmd_tx
-            .send(PortalCommand::Send(EgressMessages::ConnectionReady(
-                ConnectionReady {
-                    reference: req.reference,
-                    gateway_payload: GatewayResponse::ConnectionAccepted(ConnectionAccepted {
-                        ice_parameters: answer,
-                    }),
-                },
-            )))
-            .await?;
-
-        Ok(())
-    }
-
-    pub fn allow_access(
-        &mut self,
-        result: Result<Vec<IpAddr>, Arc<anyhow::Error>>,
-        req: AllowAccess,
-    ) {
-        let Some(tunnel) = self.tunnel.as_mut() else {
-            return;
-        };
-
-        // "allow access" doesn't have a response so we can't tell the client that things failed.
-        // It is legacy code so don't bother ...
-        let addresses = match result {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                tracing::debug!(cid = %req.client_id, reference = %req.reference, "DNS resolution failed as part of allow access request: {e:#}");
-
-                vec![]
-            }
-        };
-
-        if let Err(e) = tunnel.state_mut().allow_access(
-            req.client_id,
-            IpConfig {
-                v4: req.client_ipv4,
-                v6: req.client_ipv6,
-            },
-            Default::default(), // Additional client properties are not supported for 1.3.x Clients and will just be empty.
-            req.expires_at,
-            req.resource,
-            req.payload.map(|r| DnsResourceNatEntry::new(r, addresses)),
-        ) {
-            tracing::warn!(cid = %req.client_id, "Allow access request failed: {e:#}");
-        };
-    }
-
     fn resolve(
         &self,
         domain: DomainName,
     ) -> impl Future<Output = Result<Vec<IpAddr>, Arc<anyhow::Error>>> + use<> {
-        if telemetry::feature_flags::gateway_userspace_dns_a_aaaa_records() {
-            let resolver = self.resolver.clone();
+        let resolver = self.resolver.clone();
 
-            async move {
-                let ipv4_lookup = resolver
-                    .ipv4_lookup(domain.to_string())
-                    .map_ok(|ipv4| ipv4.into_iter().map(|r| IpAddr::V4(r.0)));
-                let ipv6_lookup = resolver
-                    .ipv6_lookup(domain.to_string())
-                    .map_ok(|ipv6| ipv6.into_iter().map(|r| IpAddr::V6(r.0)));
+        async move {
+            let ipv4_lookup = resolver
+                .ipv4_lookup(domain.to_string())
+                .map_ok(|ipv4| ipv4.into_iter().map(|r| IpAddr::V4(r.0)));
+            let ipv6_lookup = resolver
+                .ipv6_lookup(domain.to_string())
+                .map_ok(|ipv6| ipv6.into_iter().map(|r| IpAddr::V6(r.0)));
 
-                let ips = match futures::future::join(ipv4_lookup, ipv6_lookup).await {
-                    (Ok(ipv4), Ok(ipv6)) => iter::empty().chain(ipv4).chain(ipv6).collect(),
-                    (Ok(ipv4), Err(e)) => {
-                        tracing::debug!(%domain, "AAAA lookup failed: {e}");
+            let ips = match futures::future::join(ipv4_lookup, ipv6_lookup).await {
+                (Ok(ipv4), Ok(ipv6)) => iter::empty().chain(ipv4).chain(ipv6).collect(),
+                (Ok(ipv4), Err(e)) => {
+                    tracing::debug!(%domain, "AAAA lookup failed: {e}");
 
-                        ipv4.collect()
-                    }
-                    (Err(e), Ok(ipv6)) => {
-                        tracing::debug!(%domain, "A lookup failed: {e}");
+                    ipv4.collect()
+                }
+                (Err(e), Ok(ipv6)) => {
+                    tracing::debug!(%domain, "A lookup failed: {e}");
 
-                        ipv6.collect()
-                    }
-                    (Err(e1), Err(e2)) => {
-                        tracing::debug!(%domain, "A and AAAA lookup failed: [{e1}; {e2}]");
+                    ipv6.collect()
+                }
+                (Err(e1), Err(e2)) => {
+                    tracing::debug!(%domain, "A and AAAA lookup failed: [{e1}; {e2}]");
 
-                        vec![]
-                    }
-                };
+                    vec![]
+                }
+            };
 
-                Ok(ips)
-            }
-            .boxed()
-        } else {
-            let do_resolve = resolve(domain.clone());
-            let cache = self.dns_cache.clone();
-
-            async move { cache.try_get_with(domain, do_resolve).await }.boxed()
+            Ok(ips)
         }
     }
 }
@@ -772,13 +586,19 @@ async fn phoenix_channel_event_loop(
             Either::Left((Ok(phoenix_channel::Event::NoAddresses), _)) => {
                 update_portal_host_ips(&mut portal, &resolver).await
             }
+            Either::Left((Ok(phoenix_channel::Event::Connected), _)) => {}
             Either::Left((Err(e), _)) => {
                 let _ = event_tx.send(Err(e)).await; // We don't care about the result because we are exiting anyway.
 
                 break;
             }
             Either::Right((Some(PortalCommand::Send(msg)), _)) => {
-                portal.send(PHOENIX_TOPIC, msg);
+                match portal.send(PHOENIX_TOPIC, msg) {
+                    Ok(()) => {}
+                    Err(phoenix_channel::NotConnected(msg)) => {
+                        tracing::debug!(?msg, "Failed to send message to portal: Not connected")
+                    }
+                }
             }
             Either::Right((Some(PortalCommand::Connect(param)), _)) => {
                 portal.connect(param);
@@ -811,60 +631,6 @@ async fn update_portal_host_ips(
     };
 
     portal.update_ips(ips);
-}
-
-async fn resolve(domain: DomainName) -> Result<Vec<IpAddr>> {
-    tracing::debug!(%domain, "Resolving DNS");
-
-    let dname = domain.to_string();
-
-    let addresses = tokio::task::spawn_blocking(move || resolve_addresses(&dname))
-        .await
-        .context("DNS resolution task failed")?
-        .context("DNS resolution failed")?;
-
-    Ok(addresses)
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_addresses(_: &str) -> std::io::Result<Vec<IpAddr>> {
-    unimplemented!()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn resolve_addresses(addr: &str) -> std::io::Result<Vec<IpAddr>> {
-    use libc::{AF_INET, AF_INET6};
-    let addr_v4: std::io::Result<Vec<_>> = resolve_address_family(addr, AF_INET)
-        .map_err(|e| e.into())
-        .and_then(|a| a.collect());
-    let addr_v6: std::io::Result<Vec<_>> = resolve_address_family(addr, AF_INET6)
-        .map_err(|e| e.into())
-        .and_then(|a| a.collect());
-    match (addr_v4, addr_v6) {
-        (Ok(v4), Ok(v6)) => Ok(v6
-            .iter()
-            .map(|a| a.sockaddr.ip())
-            .chain(v4.iter().map(|a| a.sockaddr.ip()))
-            .collect()),
-        (Ok(v4), Err(_)) => Ok(v4.iter().map(|a| a.sockaddr.ip()).collect()),
-        (Err(_), Ok(v6)) => Ok(v6.iter().map(|a| a.sockaddr.ip()).collect()),
-        (Err(e), Err(_)) => Err(e),
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn resolve_address_family(addr: &str, family: i32) -> Result<AddrInfoIter, LookupError> {
-    use libc::SOCK_STREAM;
-
-    dns_lookup::getaddrinfo(
-        Some(addr),
-        None,
-        Some(AddrInfoHints {
-            socktype: SOCK_STREAM,
-            address: family,
-            ..Default::default()
-        }),
-    )
 }
 
 fn is_unreachable(e: &io::Error) -> bool {

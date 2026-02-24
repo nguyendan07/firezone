@@ -1,7 +1,7 @@
 defmodule Portal.Changes.Hooks.Clients do
   @behaviour Portal.Changes.Hooks
   alias Portal.{Changes.Change, PubSub}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   import Portal.SchemaHelpers
 
   @impl true
@@ -17,10 +17,10 @@ defmodule Portal.Changes.Hooks.Clients do
     # This is a special case - we need to delete associated policy_authorizations when unverifying a client since
     # it could affect connectivity if any policies are based on the verified status.
     if not is_nil(old_client.verified_at) and is_nil(client.verified_at) do
-      DB.delete_policy_authorizations_for_client(client)
+      Database.delete_policy_authorizations_for_client(client)
     end
 
-    PubSub.Account.broadcast(client.account_id, change)
+    PubSub.Changes.broadcast(client.account_id, change)
   end
 
   @impl true
@@ -28,10 +28,10 @@ defmodule Portal.Changes.Hooks.Clients do
     client = struct_from_params(Portal.Client, old_data)
     change = %Change{lsn: lsn, op: :delete, old_struct: client}
 
-    PubSub.Account.broadcast(client.account_id, change)
+    PubSub.Changes.broadcast(client.account_id, change)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Safe, PolicyAuthorization}
 

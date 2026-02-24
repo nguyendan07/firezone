@@ -170,6 +170,42 @@ defmodule Portal.Okta.APIClientTest do
       assert {:error, %Req.Response{status: 403}} =
                APIClient.test_connection(client, "test_token")
     end
+
+    test "returns error when apps endpoint returns empty list", %{client: client} do
+      Req.Test.stub(APIClient, fn conn ->
+        case conn.request_path do
+          "/api/v1/apps" -> Req.Test.json(conn, [])
+          "/api/v1/users" -> Req.Test.json(conn, [%{"id" => "user1"}])
+          "/api/v1/groups" -> Req.Test.json(conn, [%{"id" => "group1"}])
+        end
+      end)
+
+      assert {:error, :empty, :apps} = APIClient.test_connection(client, "test_token")
+    end
+
+    test "returns error when users endpoint returns empty list", %{client: client} do
+      Req.Test.stub(APIClient, fn conn ->
+        case conn.request_path do
+          "/api/v1/apps" -> Req.Test.json(conn, [%{"id" => "app1"}])
+          "/api/v1/users" -> Req.Test.json(conn, [])
+          "/api/v1/groups" -> Req.Test.json(conn, [%{"id" => "group1"}])
+        end
+      end)
+
+      assert {:error, :empty, :users} = APIClient.test_connection(client, "test_token")
+    end
+
+    test "returns error when groups endpoint returns empty list", %{client: client} do
+      Req.Test.stub(APIClient, fn conn ->
+        case conn.request_path do
+          "/api/v1/apps" -> Req.Test.json(conn, [%{"id" => "app1"}])
+          "/api/v1/users" -> Req.Test.json(conn, [%{"id" => "user1"}])
+          "/api/v1/groups" -> Req.Test.json(conn, [])
+        end
+      end)
+
+      assert {:error, :empty, :groups} = APIClient.test_connection(client, "test_token")
+    end
   end
 
   describe "introspect_token/2" do
@@ -221,7 +257,7 @@ defmodule Portal.Okta.APIClientTest do
         Plug.Conn.send_resp(conn, 401, JSON.encode!(%{"error" => "unauthorized"}))
       end)
 
-      assert {:error, "Authentication Error"} = APIClient.list_apps(client, "test_token")
+      assert {:error, %Req.Response{status: 401}} = APIClient.list_apps(client, "test_token")
     end
   end
 
@@ -393,7 +429,19 @@ defmodule Portal.Okta.APIClientTest do
         APIClient.stream_groups(client, "test_token")
         |> Enum.to_list()
 
-      assert [{:error, "Authentication Error"}] = results
+      assert [{:error, %Req.Response{status: 401}}] = results
+    end
+
+    test "handles authorization errors in stream", %{client: client} do
+      Req.Test.stub(APIClient, fn conn ->
+        Plug.Conn.send_resp(conn, 403, JSON.encode!(%{"error" => "forbidden"}))
+      end)
+
+      results =
+        APIClient.stream_groups(client, "test_token")
+        |> Enum.to_list()
+
+      assert [{:error, %Req.Response{status: 403}}] = results
     end
 
     test "handles server errors in stream", %{client: client} do
@@ -405,8 +453,82 @@ defmodule Portal.Okta.APIClientTest do
         APIClient.stream_groups(client, "test_token")
         |> Enum.to_list()
 
-      assert [{:error, reason}] = results
-      assert reason =~ "Unexpected response with status 500"
+      assert [{:error, %Req.Response{status: 500}}] = results
+    end
+  end
+
+  describe "retry behavior" do
+    test "retries on 500 for GET requests and succeeds", %{client: client} do
+      # Enable retry for this test
+      Portal.Config.put_env_override(Portal.Okta.APIClient,
+        req_opts: [
+          plug: {Req.Test, Portal.Okta.APIClient},
+          retry_delay: fn _n -> 1 end,
+          max_retries: 1
+        ]
+      )
+
+      {:ok, agent} = Agent.start_link(fn -> 0 end)
+
+      Req.Test.stub(APIClient, fn conn ->
+        call_count = Agent.get_and_update(agent, fn count -> {count, count + 1} end)
+
+        case call_count do
+          0 ->
+            # First call fails with 500
+            Plug.Conn.send_resp(conn, 500, JSON.encode!(%{"error" => "server_error"}))
+
+          _ ->
+            # Second call succeeds
+            Req.Test.json(conn, [%{"id" => "group1", "name" => "Test Group"}])
+        end
+      end)
+
+      results =
+        APIClient.stream_groups(client, "test_token")
+        |> Enum.to_list()
+
+      assert [{:ok, %{"id" => "group1"}}] = results
+      # Verify retry happened
+      assert Agent.get(agent, & &1) == 2
+    end
+
+    test "retries on 429 rate limit with delay from headers", %{client: client} do
+      # Enable retry for this test - no retry_delay since custom retry returns {:delay, ms}
+      Portal.Config.put_env_override(Portal.Okta.APIClient,
+        req_opts: [
+          plug: {Req.Test, Portal.Okta.APIClient},
+          max_retries: 1
+        ]
+      )
+
+      {:ok, agent} = Agent.start_link(fn -> 0 end)
+      # Set reset time to now so the delay is 0
+      reset_time = System.system_time(:second)
+
+      Req.Test.stub(APIClient, fn conn ->
+        call_count = Agent.get_and_update(agent, fn count -> {count, count + 1} end)
+
+        case call_count do
+          0 ->
+            # First call gets rate limited
+            conn
+            |> Plug.Conn.put_resp_header("x-rate-limit-reset", Integer.to_string(reset_time))
+            |> Plug.Conn.send_resp(429, JSON.encode!(%{"error" => "rate_limit"}))
+
+          _ ->
+            # Second call succeeds
+            Req.Test.json(conn, [%{"id" => "group1", "name" => "Test Group"}])
+        end
+      end)
+
+      results =
+        APIClient.stream_groups(client, "test_token")
+        |> Enum.to_list()
+
+      assert [{:ok, %{"id" => "group1"}}] = results
+      # Verify retry happened
+      assert Agent.get(agent, & &1) == 2
     end
   end
 end

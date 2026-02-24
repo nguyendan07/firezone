@@ -50,9 +50,50 @@ defmodule Portal.Config.Definitions do
   """
   defconfig(:background_jobs_enabled, :boolean, default: false)
 
+  @doc """
+  Region identifier used to target direct_broadcast! to web/api nodes.
+
+  In a multi-region deployment, this ensures change events are only sent to
+  web and api nodes in the same region. Maps to the `REGION` env var.
+  """
+  defconfig(:region, :string, default: "")
+
+  @doc """
+  Role of this node in the deployment.
+
+  Used to conditionally enable node-specific services.
+  """
+  defconfig(:node_type, :string, default: "portal")
+
+  @doc """
+  Enable or disable the Changes (CDC) replication consumer for this app instance.
+  """
+  defconfig(:changes_replication_enabled, :boolean, default: false)
+
+  @doc """
+  Enable or disable the ChangeLogs replication consumer for this app instance.
+  """
+  defconfig(:change_logs_replication_enabled, :boolean, default: false)
+
   ##############################################
   ## Web Server
   ##############################################
+
+  @doc """
+  Additional origins allowed for WebSocket connections.
+
+  By default, origins are derived from `WEB_EXTERNAL_URL`. Use this setting to allow
+  WebSocket connections from additional origins, for example when the application is
+  accessed via multiple domains or a CDN.
+
+  Accepts a comma-separated list of origins (e.g. `https://app.example.com,https://cdn.example.com`).
+  """
+  defconfig(:websocket_additional_origins, {:array, ",", :string},
+    default: [],
+    changeset: fn changeset, key ->
+      Portal.Changeset.validate_uri(changeset, key)
+    end
+  )
 
   @doc """
   The external URL the UI will be accessible at.
@@ -181,6 +222,14 @@ defmodule Portal.Config.Definitions do
   defconfig(:database_host, :string, default: "postgres")
 
   @doc """
+  PostgreSQL replica host for read-only queries.
+  Falls back to DATABASE_HOST if not set.
+  """
+  defconfig(:database_host_replica, :string,
+    default: fn -> System.get_env("DATABASE_HOST", "postgres") end
+  )
+
+  @doc """
   PostgreSQL socket directory (takes precedence over hostname).
   """
   defconfig(:database_socket_dir, :string, default: nil)
@@ -221,6 +270,23 @@ defmodule Portal.Config.Definitions do
   How often to check for queries that exceeded 2 * `database_queue_target` milliseconds
   """
   defconfig(:database_queue_interval, :integer, default: 1000)
+
+  @doc """
+  Socket options for database connections.
+
+  These options are passed to the underlying TCP socket. The most important option is
+  `keepalive: true` which enables TCP keepalive probes to detect dead connections.
+
+  Without keepalive, connections can become "zombies" when the database server becomes
+  unavailable (e.g., during Azure platform maintenance), causing queries to hang until
+  the checkout timeout is reached.
+
+  Accepts a JSON object with socket options (e.g. `{"keepalive": true}`).
+  """
+  defconfig(:database_socket_options, :map,
+    default: %{},
+    dump: &Dumper.keyword/1
+  )
 
   @doc """
   Name of the replication slot used by Firezone.
@@ -269,32 +335,6 @@ defmodule Portal.Config.Definitions do
   )
 
   ##############################################
-  ## Platform
-  ##############################################
-
-  @doc """
-  Cloud platform on which the Firezone runs on which is used to unlock
-  platform-specific features (logging, tracing, monitoring, clustering).
-  """
-  defconfig(
-    :platform_adapter,
-    Ecto.ParameterizedType.init(Ecto.Enum,
-      values: [
-        Elixir.Portal.GoogleCloudPlatform
-      ]
-    ),
-    default: nil
-  )
-
-  @doc """
-  Config for the platform adapter.
-  """
-  defconfig(:platform_adapter_config, :map,
-    default: [],
-    dump: &Dumper.keyword/1
-  )
-
-  ##############################################
   ## Erlang Cluster
   ##############################################
 
@@ -310,7 +350,6 @@ defmodule Portal.Config.Definitions do
         Elixir.Cluster.Strategy.Gossip,
         Elixir.Cluster.Strategy.Kubernetes,
         Elixir.Cluster.Strategy.DNSPoll,
-        Elixir.Portal.Cluster.GoogleComputeLabelsStrategy,
         Elixir.Portal.Cluster.PostgresStrategy
       ]
     ),
@@ -341,7 +380,6 @@ defmodule Portal.Config.Definitions do
         Elixir.Cluster.Strategy.Gossip,
         Elixir.Cluster.Strategy.Kubernetes,
         Elixir.Cluster.Strategy.DNSPoll,
-        Elixir.Portal.Cluster.GoogleComputeLabelsStrategy,
         Elixir.Portal.Cluster.PostgresStrategy
       ]
     ),
@@ -358,6 +396,7 @@ defmodule Portal.Config.Definitions do
     end
   )
 
+  # sobelow_skip ["DOS.StringToAtom"]
   defp dump_cluster_adapter_config(map, adapter) do
     keyword = Dumper.keyword(map)
 
@@ -539,8 +578,7 @@ defmodule Portal.Config.Definitions do
     :telemetry_metrics_reporter,
     Ecto.ParameterizedType.init(Ecto.Enum,
       values: [
-        Telemetry.Metrics.ConsoleReporter,
-        Elixir.Portal.Telemetry.Reporter.GoogleCloudMetrics
+        Telemetry.Metrics.ConsoleReporter
       ]
     ),
     default: nil
@@ -562,6 +600,18 @@ defmodule Portal.Config.Definitions do
     default: %{},
     dump: &Dumper.dump_ssl_opts/1
   )
+
+  ##############################################
+  ## Geolocation
+  ##############################################
+
+  @doc """
+  Path to the MaxMind GeoLite2-City database file (MMDB format).
+
+  Used for IP geolocation lookups. Download from https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+  (requires free account).
+  """
+  defconfig(:maxmind_city_db_path, :string, default: nil)
 
   ##############################################
   ## Outbound Email Settings
@@ -635,6 +685,8 @@ defmodule Portal.Config.Definitions do
   defconfig(:stripe_secret_key, :string, sensitive: true, default: nil)
   defconfig(:stripe_webhook_signing_secret, :string, sensitive: true, default: nil)
   defconfig(:stripe_default_price_id, :string, default: nil)
+  defconfig(:stripe_plan_product_ids, {:json_array, :string}, default: [])
+  defconfig(:stripe_adhoc_device_product_id, :string, default: nil)
 
   ##############################################
   ## Local development and Staging Helpers
@@ -677,11 +729,6 @@ defmodule Portal.Config.Definitions do
   Boolean flag to turn Policy Conditions functionality on/off for all accounts.
   """
   defconfig(:feature_policy_conditions_enabled, :boolean, default: false)
-
-  @doc """
-  Boolean flag to turn Multi-Site resources functionality on/off for all accounts.
-  """
-  defconfig(:feature_multi_site_resources_enabled, :boolean, default: false)
 
   @doc """
   Boolean flag to turn API Client UI functionality on/off for all accounts.

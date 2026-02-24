@@ -11,6 +11,15 @@ defmodule PortalAPI.Gateway.SocketTest do
   @connlib_version "1.3.0"
 
   describe "connect/3" do
+    setup do
+      buffer =
+        start_supervised!(
+          {Portal.GatewaySession.Buffer, name: Portal.GatewaySession.Buffer, callers: [self()]}
+        )
+
+      %{buffer: buffer}
+    end
+
     test "returns error when token is missing" do
       connect_info = build_connect_info()
       assert connect(Socket, %{}, connect_info: connect_info) == {:error, :missing_token}
@@ -66,13 +75,26 @@ defmodule PortalAPI.Gateway.SocketTest do
       assert gateway = Map.fetch!(socket.assigns, :gateway)
 
       assert gateway.external_id == attrs["external_id"]
-      assert gateway.public_key == attrs["public_key"]
-      assert gateway.last_seen_user_agent == connect_info.user_agent
-      assert gateway.last_seen_remote_ip_location_region == "Ukraine"
-      assert gateway.last_seen_remote_ip_location_city == "Kyiv"
-      assert gateway.last_seen_remote_ip_location_lat == 50.4333
-      assert gateway.last_seen_remote_ip_location_lon == 30.5167
-      assert gateway.last_seen_version == @connlib_version
+
+      assert session = Map.fetch!(socket.assigns, :session)
+      assert session.public_key == attrs["public_key"]
+      assert session.user_agent == connect_info.user_agent
+      assert session.remote_ip_location_region == "Ukraine"
+      assert session.remote_ip_location_city == "Kyiv"
+      assert session.remote_ip_location_lat == 50.4333
+      assert session.remote_ip_location_lon == 30.5167
+      assert session.version == @connlib_version
+
+      Portal.GatewaySession.Buffer.flush()
+
+      [persisted_session] = Repo.all(Portal.GatewaySession)
+      assert persisted_session.gateway_id == gateway.id
+      assert persisted_session.user_agent == connect_info.user_agent
+      assert persisted_session.remote_ip_location_region == "Ukraine"
+      assert persisted_session.remote_ip_location_city == "Kyiv"
+      assert persisted_session.remote_ip_location_lat == 50.4333
+      assert persisted_session.remote_ip_location_lon == 30.5167
+      assert persisted_session.version == @connlib_version
     end
 
     test "uses region code to put default coordinates" do
@@ -83,11 +105,12 @@ defmodule PortalAPI.Gateway.SocketTest do
       connect_info = build_connect_info(x_headers: [{"x-geo-location-region", "UA"}])
 
       assert {:ok, socket} = connect(Socket, attrs, connect_info: connect_info)
-      assert gateway = Map.fetch!(socket.assigns, :gateway)
-      assert gateway.last_seen_remote_ip_location_region == "UA"
-      assert gateway.last_seen_remote_ip_location_city == nil
-      assert gateway.last_seen_remote_ip_location_lat == 49.0
-      assert gateway.last_seen_remote_ip_location_lon == 32.0
+      assert Map.fetch!(socket.assigns, :gateway)
+      assert session = Map.fetch!(socket.assigns, :session)
+      assert session.remote_ip_location_region == "UA"
+      assert session.remote_ip_location_city == nil
+      assert session.remote_ip_location_lat == 49.0
+      assert session.remote_ip_location_lon == 32.0
     end
 
     test "propagates trace context" do
@@ -109,7 +132,7 @@ defmodule PortalAPI.Gateway.SocketTest do
       assert span_ctx != OpenTelemetry.Tracer.current_span_ctx()
     end
 
-    test "updates existing gateway" do
+    test "reuses existing gateway on reconnect" do
       account = account_fixture()
       site = site_fixture(account: account)
       gateway = gateway_fixture(account: account, site: site)
@@ -120,8 +143,21 @@ defmodule PortalAPI.Gateway.SocketTest do
       connect_info = build_connect_info()
 
       assert {:ok, socket} = connect(Socket, attrs, connect_info: connect_info)
-      assert gateway = Repo.one(Portal.Gateway)
-      assert gateway.id == socket.assigns.gateway.id
+      assert socket.assigns.gateway.id == gateway.id
+
+      Portal.GatewaySession.Buffer.flush()
+
+      import Ecto.Query
+
+      session =
+        from(gs in Portal.GatewaySession, where: gs.gateway_token_id == ^token.id)
+        |> Repo.one!()
+
+      assert session.gateway_id == gateway.id
+      assert session.remote_ip_location_region == "Ukraine"
+      assert session.remote_ip_location_city == "Kyiv"
+      assert session.remote_ip_location_lat == 50.4333
+      assert session.remote_ip_location_lon == 30.5167
     end
 
     test "preserves ipv4 and ipv6 addresses on reconnection" do

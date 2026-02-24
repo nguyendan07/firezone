@@ -1,6 +1,9 @@
 defmodule Portal.ResourceTest do
-  use ExUnit.Case, async: true
-  import Ecto.Changeset
+  use Portal.DataCase, async: true
+
+  import Portal.AccountFixtures
+  import Portal.ResourceFixtures
+  import Portal.SiteFixtures
 
   alias Portal.Resource
 
@@ -120,13 +123,23 @@ defmodule Portal.ResourceTest do
     end
 
     test "validates address_description length maximum" do
-      changeset = build_changeset(%{address_description: String.duplicate("a", 513)})
-      assert %{address_description: ["should be at most 512 character(s)"]} = errors_on(changeset)
+      changeset = build_changeset(%{address_description: String.duplicate("a", 256)})
+      assert %{address_description: ["should be at most 255 character(s)"]} = errors_on(changeset)
     end
 
     test "accepts valid address_description length" do
       changeset = build_changeset(%{address_description: "A valid description"})
       refute Map.has_key?(errors_on(changeset), :address_description)
+    end
+
+    test "inserts name at maximum length" do
+      resource = resource_fixture(name: String.duplicate("a", 255))
+      assert String.length(resource.name) == 255
+    end
+
+    test "inserts address_description at maximum length" do
+      resource = resource_fixture(address_description: String.duplicate("a", 255))
+      assert String.length(resource.address_description) == 255
     end
 
     test "sets default ip_stack to :dual for DNS type" do
@@ -426,11 +439,70 @@ defmodule Portal.ResourceTest do
     end
   end
 
-  defp errors_on(changeset) do
-    Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} ->
-      Regex.replace(~r"%{(\w+)}", msg, fn _, key ->
-        opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
-      end)
-    end)
+  describe "changeset/1 association constraints" do
+    test "enforces account association constraint" do
+      site = site_fixture()
+
+      {:error, changeset} =
+        %Resource{}
+        |> cast(
+          %{
+            account_id: Ecto.UUID.generate(),
+            name: "Test Resource",
+            type: :cidr,
+            address: "10.0.0.0/24",
+            site_id: site.id
+          },
+          [:account_id, :name, :type, :address, :site_id]
+        )
+        |> Resource.changeset()
+        |> Repo.insert()
+
+      assert %{account: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "enforces site association constraint" do
+      account = account_fixture()
+
+      {:error, changeset} =
+        %Resource{}
+        |> cast(
+          %{
+            name: "Test Resource",
+            type: :cidr,
+            address: "10.0.0.0/24",
+            site_id: Ecto.UUID.generate()
+          },
+          [:name, :type, :address, :site_id]
+        )
+        |> put_assoc(:account, account)
+        |> Resource.changeset()
+        |> Repo.insert()
+
+      assert %{site: ["does not exist"]} = errors_on(changeset)
+    end
+
+    test "allows valid associations" do
+      account = account_fixture()
+      site = site_fixture(account: account)
+
+      {:ok, resource} =
+        %Resource{}
+        |> cast(
+          %{
+            name: "Test Resource",
+            type: :cidr,
+            address: "10.0.0.0/24"
+          },
+          [:name, :type, :address]
+        )
+        |> put_assoc(:account, account)
+        |> put_assoc(:site, site)
+        |> Resource.changeset()
+        |> Repo.insert()
+
+      assert resource.account_id == account.id
+      assert resource.site_id == site.id
+    end
   end
 end

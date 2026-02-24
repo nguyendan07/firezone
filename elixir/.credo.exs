@@ -41,9 +41,11 @@
       #
       requires: [
         ".credo/check/warning/unsafe_repo_usage.ex",
-        ".credo/check/warning/safe_calls_outside_db_module.ex",
-        ".credo/check/warning/missing_db_alias.ex",
-        ".credo/check/warning/cross_module_db_call.ex"
+        ".credo/check/warning/safe_calls_outside_database_module.ex",
+        ".credo/check/warning/missing_database_alias.ex",
+        ".credo/check/warning/cross_module_database_call.ex",
+        ".credo/check/warning/action_fallback_usage.ex",
+        ".credo/check/warning/missing_changeset_function.ex"
       ],
       #
       # If you want to enforce a style guide and need a more traditional linting
@@ -155,14 +157,17 @@
           {Credo.Check.Warning.UnusedRegexOperation, []},
           {Credo.Check.Warning.UnusedStringOperation, []},
           {Credo.Check.Warning.UnusedTupleOperation, []},
-          {Credo.Check.Warning.UnsafeExec, []}
+          {Credo.Check.Warning.UnsafeExec, []},
+
+          # Custom Checks
+          {Credo.Check.Warning.ActionFallbackUsage, []},
+          {Credo.Check.Warning.MissingChangesetFunction, []},
+          {Credo.Check.Warning.SafeCallsOutsideDatabaseModule, []},
+          {Credo.Check.Warning.UnsafeRepoUsage, []},
+          {Credo.Check.Warning.MissingDatabaseAlias, []},
+          {Credo.Check.Warning.CrossModuleDatabaseCall, []}
         ],
         disabled: [
-          # Custom Checks for Portal conventions
-          {Credo.Check.Warning.UnsafeRepoUsage, []},
-          {Credo.Check.Warning.SafeCallsOutsideDBModule, []},
-          {Credo.Check.Warning.MissingDBAlias, []},
-          {Credo.Check.Warning.CrossModuleDBCall, []},
           {Credo.Check.Readability.AliasOrder, []},
 
           #

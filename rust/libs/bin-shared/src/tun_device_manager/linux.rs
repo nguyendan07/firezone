@@ -177,6 +177,11 @@ impl TunDeviceManager {
             .await
             {
                 Ok(()) => tracing::debug!("Successfully created routing rules for IPv4"),
+                Err(NetlinkError(err)) if err.raw_code() == -libc::EOPNOTSUPP => {
+                    tracing::warn!(
+                        "VRF/fwmark routing rules not supported for IPv4 (possibly WSL or kernel without VRF): {err}"
+                    )
+                }
                 Err(e) => tracing::warn!("Failed to add IPv4 routing rules: {e}"),
             }
         }
@@ -190,6 +195,11 @@ impl TunDeviceManager {
             .await
             {
                 Ok(()) => tracing::debug!("Successfully created routing rules for IPv6"),
+                Err(NetlinkError(err)) if err.raw_code() == -libc::EOPNOTSUPP => {
+                    tracing::warn!(
+                        "VRF/fwmark routing rules not supported for IPv6 (possibly WSL or kernel without VRF): {err}"
+                    )
+                }
                 Err(e) => tracing::warn!("Failed to add IPv6 routing rules: {e}"),
             }
         }
@@ -214,16 +224,8 @@ impl TunDeviceManager {
         Ok(tun_ip_stack)
     }
 
-    pub async fn set_routes(
-        &mut self,
-        ipv4: impl IntoIterator<Item = Ipv4Network>,
-        ipv6: impl IntoIterator<Item = Ipv6Network>,
-    ) -> Result<()> {
-        let new_routes = ipv4
-            .into_iter()
-            .map(IpNetwork::from)
-            .chain(ipv6.into_iter().map(IpNetwork::from))
-            .collect::<BTreeSet<_>>();
+    pub async fn set_routes(&mut self, routes: impl IntoIterator<Item = IpNetwork>) -> Result<()> {
+        let new_routes = BTreeSet::from_iter(routes);
 
         tracing::info!(new_routes = %DisplayBTreeSet(&new_routes), "Setting new routes");
 

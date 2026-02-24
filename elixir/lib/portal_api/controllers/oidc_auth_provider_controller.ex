@@ -1,11 +1,8 @@
 defmodule PortalAPI.OIDCAuthProviderController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
-  alias Portal.{OIDC, Safe}
-  alias __MODULE__.DB
-  import Ecto.Query
-
-  action_fallback PortalAPI.FallbackController
+  alias PortalAPI.Error
+  alias __MODULE__.Database
 
   tags ["OIDC Auth Providers"]
 
@@ -17,8 +14,9 @@ defmodule PortalAPI.OIDCAuthProviderController do
          PortalAPI.Schemas.OIDCAuthProvider.ListResponse}
     ]
 
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def index(conn, _params) do
-    providers = DB.list_providers(conn.assigns.subject)
+    providers = Database.list_providers(conn.assigns.subject)
     render(conn, :index, providers: providers)
   end
 
@@ -38,26 +36,29 @@ defmodule PortalAPI.OIDCAuthProviderController do
          PortalAPI.Schemas.OIDCAuthProvider.Response}
     ]
 
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    with {:ok, provider} <- DB.fetch_provider(id, conn.assigns.subject) do
+    with {:ok, provider} <- Database.fetch_provider(id, conn.assigns.subject) do
       render(conn, :show, provider: provider)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{OIDC, Safe}
 
     def list_providers(subject) do
       from(p in OIDC.AuthProvider, as: :providers, order_by: [desc: p.inserted_at])
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 
     def fetch_provider(id, subject) do
       result =
         from(p in OIDC.AuthProvider, where: p.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do

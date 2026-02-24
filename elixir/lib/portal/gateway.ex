@@ -11,18 +11,9 @@ defmodule Portal.Gateway do
           id: Ecto.UUID.t(),
           external_id: String.t(),
           name: String.t(),
-          public_key: String.t(),
           psk_base: binary(),
           ipv4_address: Portal.IPv4Address.t(),
           ipv6_address: Portal.IPv6Address.t(),
-          last_seen_user_agent: String.t(),
-          last_seen_remote_ip: Portal.Types.IP.t(),
-          last_seen_remote_ip_location_region: String.t(),
-          last_seen_remote_ip_location_city: String.t(),
-          last_seen_remote_ip_location_lat: float(),
-          last_seen_remote_ip_location_lon: float(),
-          last_seen_version: String.t(),
-          last_seen_at: DateTime.t(),
           online?: boolean(),
           account_id: Ecto.UUID.t(),
           site_id: Ecto.UUID.t(),
@@ -38,36 +29,26 @@ defmodule Portal.Gateway do
 
     field :name, :string
 
-    field :public_key, :string
     field :psk_base, :binary, read_after_writes: true
 
-    field :last_seen_user_agent, :string
-    field :last_seen_remote_ip, Portal.Types.IP
-    field :last_seen_remote_ip_location_region, :string
-    field :last_seen_remote_ip_location_city, :string
-    field :last_seen_remote_ip_location_lat, :float
-    field :last_seen_remote_ip_location_lon, :float
-    field :last_seen_version, :string
-    field :last_seen_at, :utc_datetime_usec
-
     field :online?, :boolean, virtual: true
+    field :latest_session, :any, virtual: true
 
     belongs_to :site, Portal.Site
 
+    has_many :gateway_sessions, Portal.GatewaySession, references: :id
     has_one :ipv4_address, Portal.IPv4Address, references: :id
     has_one :ipv6_address, Portal.IPv6Address, references: :id
 
     timestamps()
   end
 
-  def changeset(changeset) do
+  def changeset(%Ecto.Changeset{} = changeset) do
     changeset
     |> trim_change(:name)
     |> validate_length(:name, min: 1, max: 255)
     |> unique_constraint(:name, name: :gateways_site_id_name_index)
-    |> unique_constraint([:public_key])
     |> unique_constraint(:external_id)
-    |> unique_constraint(:public_key, name: :gateways_account_id_public_key_index)
     |> assoc_constraint(:account)
     |> assoc_constraint(:site)
   end
@@ -86,7 +67,8 @@ defmodule Portal.Gateway do
     gateways
     # Group gateways by their geographical location
     |> Enum.group_by(fn gateway ->
-      {gateway.last_seen_remote_ip_location_lat, gateway.last_seen_remote_ip_location_lon}
+      session = gateway.latest_session
+      {session && session.remote_ip_location_lat, session && session.remote_ip_location_lon}
     end)
     # Replace the location with the approximate distance to the client
     |> Enum.map(fn
@@ -103,7 +85,10 @@ defmodule Portal.Gateway do
     |> List.first()
     |> elem(1)
     # Group nearest gateways by their version and only leave the one running the greatest one
-    |> Enum.group_by(fn gateway -> gateway.last_seen_version end)
+    |> Enum.group_by(fn gateway ->
+      session = gateway.latest_session
+      session && session.version
+    end)
     |> Enum.sort_by(&elem(&1, 0), :desc)
     |> Enum.at(0)
     |> elem(1)
@@ -122,10 +107,15 @@ defmodule Portal.Gateway do
 
   def gateway_outdated?(gateway) do
     latest_release = Portal.ComponentVersions.gateway_version()
+    version = gateway.latest_session && gateway.latest_session.version
 
-    case Version.compare(gateway.last_seen_version, latest_release) do
-      :lt -> true
-      _ -> false
+    if version do
+      case Version.compare(version, latest_release) do
+        :lt -> true
+        _ -> false
+      end
+    else
+      false
     end
   end
 end

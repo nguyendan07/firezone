@@ -69,7 +69,7 @@ defmodule PortalWeb.CoreComponents do
       assign(
         assigns,
         :class,
-        "#{assigns.class} font-semibold p-[0.15rem] bg-neutral-100 rounded"
+        "#{assigns.class} font-semibold p-[0.15rem] bg-neutral-100 rounded-sm"
       )
 
     # Important: leave the </code> on the same line as the render_slot call, otherwise there will be
@@ -116,21 +116,17 @@ defmodule PortalWeb.CoreComponents do
         data-copy-to-clipboard-target={"#{@id}-code"}
         class={~w[
           absolute end-1 top-1 text-gray-900 hover:bg-gray-100
-          rounded py-2 px-2.5 inline-flex items-center justify-center
-          bg-white border-gray-200 border h-8
+          rounded-sm py-2 px-2.5 inline-flex items-center justify-center
+          bg-white border-neutral-200 border h-8
         ]}
       >
         <span id={"#{@id}-default-message"} class="inline-flex items-center">
-          <span class="inline-flex items-center">
-            <.icon name="hero-clipboard" data-icon class="h-4 w-4 me-1.5" />
-            <span class="text-xs font-semibold">Copy</span>
-          </span>
+          <.icon name="hero-clipboard" data-icon class="h-4 w-4 me-1.5" />
+          <span class="text-xs font-semibold">Copy</span>
         </span>
-        <span id={"#{@id}-success-message"} class="inline-flex items-center hidden">
-          <span class="inline-flex items-center">
-            <.icon name="hero-check" data-icon class="text-green-700 h-4 w-4 me-1.5" />
-            <span class="text-xs font-semibold text-green-700">Copied</span>
-          </span>
+        <span id={"#{@id}-success-message"} class="hidden items-center">
+          <.icon name="hero-check" data-icon class="text-green-700 h-4 w-4 me-1.5" />
+          <span class="text-xs font-semibold text-green-700">Copied</span>
         </span>
       </button>
     </div>
@@ -196,9 +192,9 @@ defmodule PortalWeb.CoreComponents do
 
   def tabs(assigns) do
     ~H"""
-    <div class="mb-4 rounded shadow">
+    <div class="mb-4">
       <div
-        class="border-neutral-100 border-b-2 bg-neutral-50 rounded-t"
+        class="border-neutral-100 border-b-2"
         id={"#{@id}-container"}
         phx-hook="Tabs"
         {@rest}
@@ -245,7 +241,7 @@ defmodule PortalWeb.CoreComponents do
       <div id={@id}>
         <%= for tab <- @tab do %>
           <div
-            class="hidden rounded-b bg-white"
+            class="hidden"
             id={tab.id}
             role="tabpanel"
             aria-labelledby={"#{tab.id}-tab"}
@@ -365,8 +361,8 @@ defmodule PortalWeb.CoreComponents do
         @base_kind == :info && "text-blue-800 bg-blue-100 border-blue-300",
         @base_kind == :warning && "text-yellow-800 bg-yellow-100 border-yellow-300",
         @base_kind == :error && "text-red-800 bg-red-100 border-red-300",
-        @style == "toast" && "m-0 border rounded shadow-lg",
-        @style == "inline" && "mb-4 rounded border",
+        @style == "toast" && "m-0 border rounded-sm shadow-md",
+        @style == "inline" && "mb-4 rounded-sm border",
         @class
       ]}
       role="alert"
@@ -388,7 +384,7 @@ defmodule PortalWeb.CoreComponents do
         <button
           :if={@style == "toast"}
           type="button"
-          class="text-current opacity-50 hover:opacity-100 flex-shrink-0"
+          class="text-current opacity-50 hover:opacity-100 shrink-0"
           popovertarget={@id}
           popovertargetaction="hide"
           aria-label="Close"
@@ -866,7 +862,7 @@ defmodule PortalWeb.CoreComponents do
     ~H"""
     <span
       class={[
-        "text-xs px-2.5 py-0.5 rounded whitespace-nowrap",
+        "text-xs px-2.5 py-0.5 rounded-sm whitespace-nowrap",
         @colors[@type],
         @class
       ]}
@@ -940,12 +936,11 @@ defmodule PortalWeb.CoreComponents do
   Renders datetime field in a format that is suitable for the user's locale.
   """
   attr :datetime, DateTime, required: true
-  attr :format, :atom, default: :short
 
   def datetime(assigns) do
     ~H"""
     <span title={@datetime}>
-      {Cldr.DateTime.to_string!(@datetime, Portal.CLDR, format: @format)}
+      {PortalWeb.Format.short_datetime(@datetime)}
     </span>
     """
   end
@@ -970,7 +965,7 @@ defmodule PortalWeb.CoreComponents do
           "underline underline-offset-2 decoration-1 decoration-dotted",
           DateTime.compare(@datetime, @relative_to) == :lt && @negative_class
         ]}>
-          {Cldr.DateTime.Relative.to_string!(@datetime, Portal.CLDR, relative_to: @relative_to)
+          {PortalWeb.Format.relative_datetime(@datetime, @relative_to)
           |> String.capitalize()}
         </span>
       </:target>
@@ -979,7 +974,7 @@ defmodule PortalWeb.CoreComponents do
       </:content>
     </.popover>
     <span :if={not @popover}>
-      {Cldr.DateTime.Relative.to_string!(@datetime, Portal.CLDR, relative_to: @relative_to)
+      {PortalWeb.Format.relative_datetime(@datetime, @relative_to)
       |> String.capitalize()}
     </span>
     <span :if={is_nil(@datetime)}>
@@ -1020,7 +1015,7 @@ defmodule PortalWeb.CoreComponents do
       absolute z-10 invisible inline-block
       text-sm text-neutral-500 transition-opacity
       duration-50 bg-white border border-neutral-200
-      rounded-lg shadow-sm opacity-0
+      rounded-md shadow-xs opacity-0
       ]}>
       <div class="px-3 py-2">
         {render_slot(@content)}
@@ -1039,15 +1034,25 @@ defmodule PortalWeb.CoreComponents do
   def connection_status(assigns) do
     assigns = assign_new(assigns, :relative_to, fn -> DateTime.utc_now() end)
 
+    last_seen_at =
+      if Map.has_key?(assigns.schema, :latest_session) do
+        session = Map.get(assigns.schema, :latest_session)
+        session && session.inserted_at
+      else
+        assigns.schema.last_seen_at
+      end
+
+    assigns = assign(assigns, :display_last_seen_at, last_seen_at)
+
     ~H"""
     <span class={["flex items-center", @class]}>
       <.ping_icon color={if @schema.online?, do: "success", else: "danger"} />
       <span
         class="ml-2.5"
         title={
-          if @schema.last_seen_at,
+          if @display_last_seen_at,
             do:
-              "Last started #{Cldr.DateTime.Relative.to_string!(@schema.last_seen_at, Portal.CLDR, relative_to: @relative_to)}",
+              "Last started #{PortalWeb.Format.relative_datetime(@display_last_seen_at, @relative_to)}",
             else: "Never connected"
         }
       >
@@ -1145,11 +1150,29 @@ defmodule PortalWeb.CoreComponents do
   @doc """
   Renders a group as a badge with optional directory icon.
   Used in contexts like policies list where we need a compact badge representation.
+
+  When group is nil (orphaned policy), displays a warning badge indicating the group is unavailable.
   """
   attr :account, :any, required: true
-  attr :group, :any, required: true
+  attr :group, :any, default: nil
   attr :class, :string, default: nil
   attr :return_to, :string, default: nil
+
+  def group_badge(%{group: nil} = assigns) do
+    ~H"""
+    <span class={[
+      "inline-flex items-center rounded-sm border border-primary-300 bg-primary-50 overflow-hidden mr-1",
+      @class
+    ]}>
+      <span class="inline-flex items-center justify-center py-0.5 px-1.5 text-primary-600 bg-primary-100 border-r border-primary-300">
+        <.icon name="hero-exclamation-triangle-mini" class="h-3.5 w-3.5" />
+      </span>
+      <span class="text-xs truncate min-w-0 py-0.5 pl-1.5 pr-2.5 text-primary-700">
+        Group deleted
+      </span>
+    </span>
+    """
+  end
 
   def group_badge(assigns) do
     # Build the navigate URL with return_to if provided
@@ -1167,7 +1190,7 @@ defmodule PortalWeb.CoreComponents do
     ~H"""
     <span
       class={[
-        "inline-flex items-center rounded border border-neutral-200 overflow-hidden mr-1",
+        "inline-flex items-center rounded-sm border border-neutral-200 overflow-hidden mr-1",
         @class
       ]}
       data-group-id={@group.id}
@@ -1229,7 +1252,7 @@ defmodule PortalWeb.CoreComponents do
         navigate={@navigate_url}
         class={[
           "text-xs truncate min-w-0 py-0.5 text-neutral-900 bg-neutral-50",
-          if(@group.idp_id, do: "rounded-r pl-1.5 pr-2.5", else: "rounded px-2.5")
+          if(@group.idp_id, do: "rounded-r pl-1.5 pr-2.5", else: "rounded-sm px-2.5")
         ]}
       >
         {@group.name}
@@ -1244,31 +1267,66 @@ defmodule PortalWeb.CoreComponents do
   attr :schema, :any, required: true
 
   def last_seen(assigns) do
-    ~H"""
-    <span class="inline-block">
-      {@schema.last_seen_remote_ip}
-    </span>
-    <span class="inline-block">
-      {[
-        @schema.last_seen_remote_ip_location_city,
-        Portal.Geo.country_common_name!(@schema.last_seen_remote_ip_location_region)
-      ]
-      |> Enum.reject(&is_nil/1)
-      |> Enum.join(", ")}
+    assigns = assign_last_seen_fields(assigns)
 
-      <a
-        :if={
-          not is_nil(@schema.last_seen_remote_ip_location_lat) and
-            not is_nil(@schema.last_seen_remote_ip_location_lon)
-        }
-        class="text-accent-800"
-        target="_blank"
-        href={"http://www.google.com/maps/place/#{@schema.last_seen_remote_ip_location_lat},#{@schema.last_seen_remote_ip_location_lon}"}
-      >
-        <.icon name="hero-arrow-top-right-on-square" class="mb-3 w-3 h-3" />
-      </a>
-    </span>
+    ~H"""
+    <%= if @schema do %>
+      <span class="inline-block">
+        {@display_remote_ip}
+      </span>
+      <span class="inline-block">
+        {[
+          @display_remote_ip_location_city,
+          Portal.Geo.country_common_name!(@display_remote_ip_location_region)
+        ]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.join(", ")}
+
+        <a
+          :if={
+            not is_nil(@display_remote_ip_location_lat) and
+              not is_nil(@display_remote_ip_location_lon)
+          }
+          class="text-accent-800"
+          target="_blank"
+          href={"http://www.google.com/maps/place/#{@display_remote_ip_location_lat},#{@display_remote_ip_location_lon}"}
+        >
+          <.icon name="hero-arrow-top-right-on-square" class="mb-3 w-3 h-3" />
+        </a>
+      </span>
+    <% else %>
+      <span class="inline-block">-</span>
+    <% end %>
     """
+  end
+
+  defp assign_last_seen_fields(%{schema: nil} = assigns), do: assigns
+
+  defp assign_last_seen_fields(%{schema: %Portal.ClientSession{} = s} = assigns) do
+    assigns
+    |> assign(:display_remote_ip, s.remote_ip)
+    |> assign(:display_remote_ip_location_city, s.remote_ip_location_city)
+    |> assign(:display_remote_ip_location_region, s.remote_ip_location_region)
+    |> assign(:display_remote_ip_location_lat, s.remote_ip_location_lat)
+    |> assign(:display_remote_ip_location_lon, s.remote_ip_location_lon)
+  end
+
+  defp assign_last_seen_fields(%{schema: %Portal.GatewaySession{} = s} = assigns) do
+    assigns
+    |> assign(:display_remote_ip, s.remote_ip)
+    |> assign(:display_remote_ip_location_city, s.remote_ip_location_city)
+    |> assign(:display_remote_ip_location_region, s.remote_ip_location_region)
+    |> assign(:display_remote_ip_location_lat, s.remote_ip_location_lat)
+    |> assign(:display_remote_ip_location_lon, s.remote_ip_location_lon)
+  end
+
+  defp assign_last_seen_fields(%{schema: s} = assigns) do
+    assigns
+    |> assign(:display_remote_ip, s.last_seen_remote_ip)
+    |> assign(:display_remote_ip_location_city, s.last_seen_remote_ip_location_city)
+    |> assign(:display_remote_ip_location_region, s.last_seen_remote_ip_location_region)
+    |> assign(:display_remote_ip_location_lat, s.last_seen_remote_ip_location_lat)
+    |> assign(:display_remote_ip_location_lon, s.last_seen_remote_ip_location_lon)
   end
 
   @doc """
@@ -1297,7 +1355,7 @@ defmodule PortalWeb.CoreComponents do
 
     ~H"""
     <span data-value={@number} {@rest}>
-      {Portal.CLDR.Number.Cardinal.pluralize(@number, :en, @opts)}
+      {PortalWeb.Format.cardinal_pluralize(@number, @opts)}
     </span>
     """
   end
@@ -1429,6 +1487,10 @@ defmodule PortalWeb.CoreComponents do
   If the group has idp_id but no directory_type, it's synced but we can't determine the provider.
   """
   def provider_type_from_group(%{directory_type: type}) when not is_nil(type), do: to_string(type)
+
+  def provider_type_from_group(%{directory: %{type: type}}) when not is_nil(type),
+    do: to_string(type)
+
   def provider_type_from_group(%{idp_id: idp_id}) when not is_nil(idp_id), do: "unknown"
   def provider_type_from_group(_), do: "firezone"
 
@@ -1516,12 +1578,6 @@ defmodule PortalWeb.CoreComponents do
     """
   end
 
-  def feature_name(%{feature: :multi_site_resources} = assigns) do
-    ~H"""
-    Define globally-distributed Resources
-    """
-  end
-
   def feature_name(%{feature: :traffic_filters} = assigns) do
     ~H"""
     Restrict access based on port and protocol rules
@@ -1600,10 +1656,10 @@ defmodule PortalWeb.CoreComponents do
       />
       <div class={[
         "relative w-11 h-6 bg-gray-200 rounded-full peer",
-        "peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-accent-300",
+        "peer-focus:outline-hidden peer-focus:ring-4 peer-focus:ring-accent-300",
         "peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full",
         "peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px]",
-        "after:start-[2px] after:bg-white after:border-gray-300 after:border",
+        "after:start-[2px] after:bg-white after:border-neutral-300 after:border",
         "after:rounded-full after:h-5 after:w-5 after:transition-all",
         "peer-checked:bg-accent-600",
         @disabled && "opacity-50 cursor-not-allowed"

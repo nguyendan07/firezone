@@ -1,6 +1,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod cleanup;
 pub mod file;
+
+pub use cleanup::{
+    CleanupHandle, DEFAULT_CLEANUP_INTERVAL, DEFAULT_MAX_SIZE_MB, start_log_cleanup_thread,
+};
 mod format;
 #[macro_use]
 mod unwrap_or;
@@ -37,6 +42,7 @@ pub use format::Format;
 
 /// Registers a global subscriber with stdout logging and `additional_layer`
 pub fn setup_global_subscriber<L>(
+    directives: String,
     additional_layer: L,
     stdout_json: bool,
 ) -> Result<FilterReloadHandle>
@@ -46,8 +52,6 @@ where
     if let Err(error) = output_vt100::try_init() {
         tracing::debug!("Failed to init terminal colors: {error}");
     }
-
-    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
     let (filter1, reload_handle1) =
         try_filter(&directives).context("Failed to parse directives")?;

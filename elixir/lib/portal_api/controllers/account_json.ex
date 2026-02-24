@@ -1,5 +1,5 @@
 defmodule PortalAPI.AccountJSON do
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   @doc """
   Render a single Account
@@ -20,11 +20,11 @@ defmodule PortalAPI.AccountJSON do
 
   defp build_limits(account) do
     # Get current usage counts
-    users_count = DB.count_users_for_account(account)
-    monthly_active_users_count = DB.count_1m_active_users_for_account(account)
-    service_accounts_count = DB.count_service_accounts_for_account(account)
-    admin_users_count = DB.count_account_admin_users_for_account(account)
-    sites_count = DB.count_groups_for_account(account)
+    users_count = Database.count_users_for_account(account)
+    monthly_active_users_count = Database.count_1m_active_users_for_account(account)
+    service_accounts_count = Database.count_service_accounts_for_account(account)
+    admin_users_count = Database.count_account_admin_users_for_account(account)
+    sites_count = Database.count_groups_for_account(account)
 
     %{}
     |> put_limit(:users, account.limits.users_count, users_count)
@@ -52,7 +52,7 @@ defmodule PortalAPI.AccountJSON do
     })
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Actor
@@ -64,7 +64,7 @@ defmodule PortalAPI.AccountJSON do
         where: is_nil(a.disabled_at),
         where: a.type in [:account_admin_user, :account_user]
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -74,7 +74,7 @@ defmodule PortalAPI.AccountJSON do
         where: is_nil(a.disabled_at),
         where: a.type == :service_account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -84,14 +84,18 @@ defmodule PortalAPI.AccountJSON do
         where: is_nil(a.disabled_at),
         where: a.type == :account_admin_user
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
     def count_1m_active_users_for_account(account) do
       from(c in Client, as: :clients)
       |> where([clients: c], c.account_id == ^account.id)
-      |> where([clients: c], c.last_seen_at > ago(1, "month"))
+      |> join(:inner, [clients: c], s in Portal.ClientSession,
+        on: s.client_id == c.id and s.account_id == c.account_id,
+        as: :session
+      )
+      |> where([session: s], s.inserted_at > ago(1, "month"))
       |> join(:inner, [clients: c], a in Actor,
         on: c.actor_id == a.id and c.account_id == a.account_id,
         as: :actor
@@ -100,7 +104,7 @@ defmodule PortalAPI.AccountJSON do
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
       |> select([clients: c], c.actor_id)
       |> distinct(true)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -109,7 +113,7 @@ defmodule PortalAPI.AccountJSON do
         where: g.account_id == ^account.id,
         where: g.managed_by == :account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
   end

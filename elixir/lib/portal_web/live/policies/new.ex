@@ -1,12 +1,12 @@
 defmodule PortalWeb.Policies.New do
   use PortalWeb, :live_view
   import PortalWeb.Policies.Components
-  alias Portal.{Policy, Auth}
-  alias __MODULE__.DB
+  alias Portal.{Policy, Authentication}
+  alias __MODULE__.Database
 
   def mount(params, _session, socket) do
     providers =
-      DB.all_active_providers_for_account(
+      Database.all_active_providers_for_account(
         socket.assigns.account,
         socket.assigns.subject
       )
@@ -53,8 +53,8 @@ defmodule PortalWeb.Policies.New do
                   label="Group"
                   placeholder="Select Group"
                   field={@form[:group_id]}
-                  fetch_option_callback={&DB.fetch_group_option(&1, @subject)}
-                  list_options_callback={&DB.list_group_options(&1, @subject)}
+                  fetch_option_callback={&Database.fetch_group_option(&1, @subject)}
+                  list_options_callback={&Database.list_group_options(&1, @subject)}
                   value={@enforced_group_id || @form[:group_id].value}
                   disabled={not is_nil(@enforced_group_id)}
                   required
@@ -67,7 +67,7 @@ defmodule PortalWeb.Policies.New do
                     <div class="flex items-center gap-3">
                       <.provider_icon
                         type={provider_type_from_group(group)}
-                        class="w-5 h-5 flex-shrink-0"
+                        class="w-5 h-5 shrink-0"
                       />
                       <span>{group.name}</span>
                     </div>
@@ -267,7 +267,7 @@ defmodule PortalWeb.Policies.New do
 
   # Inline functions from Portal.Policies
 
-  defp new_policy(attrs, %Auth.Subject{} = subject) do
+  defp new_policy(attrs, %Authentication.Subject{} = subject) do
     import Ecto.Changeset
 
     %Policy{}
@@ -278,20 +278,42 @@ defmodule PortalWeb.Policies.New do
     |> put_change(:account_id, subject.account.id)
   end
 
-  defp create_policy(attrs, %Auth.Subject{} = subject) do
+  defp create_policy(attrs, %Authentication.Subject{} = subject) do
     changeset = new_policy(attrs, subject)
-    DB.insert_policy(changeset, subject)
+    Database.insert_policy(changeset, subject)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Portal.Repo.Query
     alias Portal.{Safe, Userpass, EmailOTP, OIDC, Google, Entra, Okta, Group}
-    alias Portal.Auth
+    alias Portal.Authentication
 
-    def insert_policy(changeset, %Auth.Subject{} = subject) do
+    def insert_policy(changeset, %Authentication.Subject{} = subject) do
+      # Fetch the group's idp_id to store on the policy for reconnection after sync
+      changeset = populate_group_idp_id(changeset, subject)
+
       Safe.scoped(changeset, subject)
       |> Safe.insert()
+    end
+
+    defp populate_group_idp_id(changeset, subject) do
+      case Ecto.Changeset.get_field(changeset, :group_id) do
+        nil ->
+          changeset
+
+        group_id ->
+          case get_group_idp_id(group_id, subject) do
+            nil -> changeset
+            idp_id -> Ecto.Changeset.put_change(changeset, :group_idp_id, idp_id)
+          end
+      end
+    end
+
+    defp get_group_idp_id(group_id, subject) do
+      from(g in Group, where: g.id == ^group_id, select: g.idp_id)
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one()
     end
 
     def all_active_providers_for_account(_account, subject) do
@@ -305,7 +327,7 @@ defmodule PortalWeb.Policies.New do
       ]
       |> Enum.flat_map(fn schema ->
         from(p in schema, where: not p.is_disabled)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
       end)
     end
@@ -340,8 +362,8 @@ defmodule PortalWeb.Policies.New do
             directory_type: d.type
           }
         )
-        |> Safe.scoped(subject)
-        |> Safe.one!()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
 
       {:ok, group_option(group)}
     end
@@ -385,7 +407,7 @@ defmodule PortalWeb.Policies.New do
           query
         end
 
-      groups = query |> Safe.scoped(subject) |> Safe.all()
+      groups = query |> Safe.scoped(subject, :replica) |> Safe.all()
       metadata = %{limit: 25, count: length(groups)}
 
       {:ok, grouped_select_options(groups), metadata}

@@ -1,11 +1,8 @@
 defmodule PortalAPI.EntraDirectoryController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
-  alias Portal.{Entra, Safe}
-  alias __MODULE__.DB
-  import Ecto.Query
-
-  action_fallback PortalAPI.FallbackController
+  alias PortalAPI.Error
+  alias __MODULE__.Database
 
   tags ["Entra Directories"]
 
@@ -17,8 +14,9 @@ defmodule PortalAPI.EntraDirectoryController do
          PortalAPI.Schemas.EntraDirectory.ListResponse}
     ]
 
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def index(conn, _params) do
-    directories = DB.list_directories(conn.assigns.subject)
+    directories = Database.list_directories(conn.assigns.subject)
     render(conn, :index, directories: directories)
   end
 
@@ -38,26 +36,29 @@ defmodule PortalAPI.EntraDirectoryController do
          PortalAPI.Schemas.EntraDirectory.Response}
     ]
 
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    with {:ok, directory} <- DB.fetch_directory(id, conn.assigns.subject) do
+    with {:ok, directory} <- Database.fetch_directory(id, conn.assigns.subject) do
       render(conn, :show, directory: directory)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Entra, Safe}
 
     def list_directories(subject) do
       from(d in Entra.Directory, as: :directories, order_by: [desc: d.inserted_at])
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 
     def fetch_directory(id, subject) do
       result =
         from(d in Entra.Directory, where: d.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do

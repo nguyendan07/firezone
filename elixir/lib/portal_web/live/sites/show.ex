@@ -1,9 +1,9 @@
 defmodule PortalWeb.Sites.Show do
   use PortalWeb, :live_view
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(%{"id" => id}, _session, socket) do
-    site = DB.get_site!(id, socket.assigns.subject)
+    site = Database.get_site!(id, socket.assigns.subject)
 
     if connected?(socket) do
       :ok = Portal.Presence.Gateways.Site.subscribe(site.id)
@@ -20,23 +20,21 @@ defmodule PortalWeb.Sites.Show do
   end
 
   defp mount_page(socket, %{managed_by: :system, name: "Internet"} = site) do
-    resource = DB.get_internet_resource!(socket.assigns.subject)
+    resource = Database.get_internet_resource!(socket.assigns.subject)
 
     socket =
       socket
       |> assign(resource: resource)
       |> assign_live_table("gateways",
-        query_module: DB,
+        query_module: Database,
         enforce_filters: [
           {:site_id, site.id}
         ],
-        sortable_fields: [
-          {:gateways, :last_seen_at}
-        ],
+        sortable_fields: [],
         callback: &handle_gateways_update!/2
       )
       |> assign_live_table("policies",
-        query_module: DB.PolicyQuery,
+        query_module: Database.PolicyQuery,
         enforce_filters: [
           {:resource_id, resource.id}
         ],
@@ -51,17 +49,15 @@ defmodule PortalWeb.Sites.Show do
     socket =
       socket
       |> assign_live_table("gateways",
-        query_module: DB,
+        query_module: Database,
         enforce_filters: [
           {:site_id, site.id}
         ],
-        sortable_fields: [
-          {:gateways, :last_seen_at}
-        ],
+        sortable_fields: [],
         callback: &handle_gateways_update!/2
       )
       |> assign_live_table("resources",
-        query_module: DB.ResourceQuery,
+        query_module: Database.ResourceQuery,
         enforce_filters: [
           {:site_id, site.id}
         ],
@@ -85,12 +81,12 @@ defmodule PortalWeb.Sites.Show do
 
     list_opts =
       list_opts
-      |> Keyword.put(:preload, [:online?])
+      |> Keyword.put(:preload, [:online?, :last_seen])
       |> Keyword.update(:filter, [], fn filter ->
         filter ++ [{:ids, online_ids}]
       end)
 
-    with {:ok, gateways, metadata} <- DB.list_gateways(socket.assigns.subject, list_opts) do
+    with {:ok, gateways, metadata} <- Database.list_gateways(socket.assigns.subject, list_opts) do
       {:ok,
        assign(socket,
          gateways: gateways,
@@ -101,9 +97,9 @@ defmodule PortalWeb.Sites.Show do
 
   def handle_resources_update!(socket, list_opts) do
     with {:ok, resources, metadata} <-
-           DB.list_resources(socket.assigns.subject, list_opts) do
+           Database.list_resources(socket.assigns.subject, list_opts) do
       resource_ids = Enum.map(resources, & &1.id)
-      policy_counts = DB.count_policies_by_resource(resource_ids, socket.assigns.subject)
+      policy_counts = Database.count_policies_by_resource(resource_ids, socket.assigns.subject)
 
       {:ok,
        assign(socket,
@@ -117,7 +113,7 @@ defmodule PortalWeb.Sites.Show do
   def handle_policies_update!(socket, list_opts) do
     list_opts = Keyword.put(list_opts, :preload, group: [], resource: [])
 
-    with {:ok, policies, metadata} <- DB.list_policies(socket.assigns.subject, list_opts) do
+    with {:ok, policies, metadata} <- Database.list_policies(socket.assigns.subject, list_opts) do
       {:ok,
        assign(socket,
          policies: policies,
@@ -231,12 +227,12 @@ defmodule PortalWeb.Sites.Show do
             </:col>
             <:col :let={gateway} label="remote ip">
               <code>
-                {gateway.last_seen_remote_ip}
+                {gateway.latest_session && gateway.latest_session.remote_ip}
               </code>
             </:col>
             <:col :let={gateway} label="version">
               <.version_status outdated={Portal.Gateway.gateway_outdated?(gateway)} />
-              {gateway.last_seen_version}
+              {gateway.latest_session && gateway.latest_session.version}
             </:col>
             <:col :let={gateway} label="status">
               <.connection_status schema={gateway} />
@@ -371,11 +367,11 @@ defmodule PortalWeb.Sites.Show do
           </:col>
           <:col :let={policy} label="status">
             <%= if is_nil(policy.disabled_at) do %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-green-100 text-green-800">
                 Active
               </span>
             <% else %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-red-100 text-red-800">
                 Disabled
               </span>
             <% end %>
@@ -439,7 +435,7 @@ defmodule PortalWeb.Sites.Show do
   def handle_event("revoke_all_tokens", _params, socket) do
     # Permission check happens in Portal.Safe - only account_admin_user can delete tokens
     deleted_token_count =
-      case DB.delete_tokens_for_site(socket.assigns.site, socket.assigns.subject) do
+      case Database.delete_tokens_for_site(socket.assigns.site, socket.assigns.subject) do
         {:error, :unauthorized} -> 0
         {count, _} -> count
       end
@@ -452,7 +448,7 @@ defmodule PortalWeb.Sites.Show do
   end
 
   def handle_event("delete", _params, socket) do
-    {:ok, _deleted_site} = DB.delete_site(socket.assigns.site, socket.assigns.subject)
+    {:ok, _deleted_site} = Database.delete_site(socket.assigns.site, socket.assigns.subject)
     {:noreply, push_navigate(socket, to: ~p"/#{socket.assigns.account}/sites")}
   end
 
@@ -476,7 +472,7 @@ defmodule PortalWeb.Sites.Show do
   end
 
   defp deletion_stats(assigns) do
-    stats = DB.count_site_deletion_stats(assigns.site, assigns.subject)
+    stats = Database.count_site_deletion_stats(assigns.site, assigns.subject)
     total = stats.gateways + stats.tokens + stats.resources
     assigns = assign(assigns, stats: stats, total: total)
 
@@ -505,7 +501,7 @@ defmodule PortalWeb.Sites.Show do
     """
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Gateway
@@ -513,8 +509,8 @@ defmodule PortalWeb.Sites.Show do
     def get_site!(id, subject) do
       from(s in Portal.Site, as: :sites)
       |> where([sites: s], s.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def delete_tokens_for_site(site, subject) do
@@ -525,21 +521,41 @@ defmodule PortalWeb.Sites.Show do
 
     def list_gateways(subject, opts \\ []) do
       from(g in Gateway, as: :gateways)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
     def cursor_fields do
       [
-        {:gateways, :asc, :last_seen_at},
         {:gateways, :asc, :id}
       ]
     end
 
     def preloads do
       [
-        online?: &Portal.Presence.Gateways.preload_gateways_presence/1
+        online?: &Portal.Presence.Gateways.preload_gateways_presence/1,
+        last_seen: &preload_latest_sessions/1
       ]
+    end
+
+    defp preload_latest_sessions(gateways) do
+      account_ids = gateways |> Enum.map(& &1.account_id) |> Enum.uniq()
+      gateway_ids = Enum.map(gateways, & &1.id)
+
+      sessions_by_gateway_id =
+        from(s in Portal.GatewaySession,
+          where: s.account_id in ^account_ids,
+          where: s.gateway_id in ^gateway_ids,
+          distinct: s.gateway_id,
+          order_by: [asc: s.gateway_id, desc: s.inserted_at]
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+        |> Map.new(&{&1.gateway_id, &1})
+
+      Enum.map(gateways, fn gateway ->
+        %{gateway | latest_session: Map.get(sessions_by_gateway_id, gateway.id)}
+      end)
     end
 
     def filters do
@@ -575,17 +591,17 @@ defmodule PortalWeb.Sites.Show do
     def count_site_deletion_stats(site, subject) do
       gateways =
         from(g in Gateway, where: g.site_id == ^site.id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       tokens =
         from(t in Portal.GatewayToken, where: t.site_id == ^site.id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       resources =
         from(r in Portal.Resource, where: r.site_id == ^site.id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.aggregate(:count)
 
       %{gateways: gateways, tokens: tokens, resources: resources}
@@ -595,14 +611,14 @@ defmodule PortalWeb.Sites.Show do
       from(r in Portal.Resource, as: :resources)
       |> where([resources: r], r.type == :internet)
       |> limit(1)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def list_resources(subject, opts \\ []) do
       from(r in Portal.Resource, as: :resources)
-      |> Safe.scoped(subject)
-      |> Safe.list(DB.ResourceQuery, opts)
+      |> Safe.scoped(subject, :replica)
+      |> Safe.list(Database.ResourceQuery, opts)
     end
 
     def count_policies_by_resource(resource_ids, subject) do
@@ -610,19 +626,19 @@ defmodule PortalWeb.Sites.Show do
       |> where([policies: p], p.resource_id in ^resource_ids)
       |> group_by([policies: p], p.resource_id)
       |> select([policies: p], {p.resource_id, count(p.id)})
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
       |> Map.new()
     end
 
     def list_policies(subject, opts \\ []) do
       from(p in Portal.Policy, as: :policies)
-      |> Safe.scoped(subject)
-      |> Safe.list(DB.PolicyQuery, opts)
+      |> Safe.scoped(subject, :replica)
+      |> Safe.list(Database.PolicyQuery, opts)
     end
   end
 
-  defmodule DB.ResourceQuery do
+  defmodule Database.ResourceQuery do
     import Ecto.Query
     import Portal.Repo.Query
 
@@ -665,7 +681,7 @@ defmodule PortalWeb.Sites.Show do
     end
   end
 
-  defmodule DB.PolicyQuery do
+  defmodule Database.PolicyQuery do
     import Ecto.Query
 
     def cursor_fields,

@@ -41,6 +41,11 @@ defmodule Portal.PolicyTest do
       changeset = build_changeset(%{description: String.duplicate("a", 1024)})
       refute Map.has_key?(errors_on(changeset), :description)
     end
+
+    test "inserts description at maximum length" do
+      policy = policy_fixture(description: String.duplicate("a", 1024))
+      assert String.length(policy.description) == 1024
+    end
   end
 
   describe "changeset/1 unique constraints" do
@@ -114,6 +119,26 @@ defmodule Portal.PolicyTest do
   end
 
   describe "changeset/1 association constraints" do
+    test "enforces account association constraint" do
+      group = group_fixture()
+      resource = resource_fixture(account: group.account)
+
+      {:error, changeset} =
+        %Policy{}
+        |> cast(
+          %{
+            account_id: Ecto.UUID.generate(),
+            group_id: group.id,
+            resource_id: resource.id
+          },
+          [:account_id, :group_id, :resource_id]
+        )
+        |> Policy.changeset()
+        |> Repo.insert()
+
+      assert %{account: ["does not exist"]} = errors_on(changeset)
+    end
+
     test "enforces resource association constraint" do
       account = account_fixture()
       group = group_fixture(account: account)

@@ -3,6 +3,8 @@ defmodule Portal.Account do
   import Ecto.Changeset
   alias Portal.Config
 
+  @type t :: %__MODULE__{}
+
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
   @timestamps_opts [type: :utc_datetime_usec]
@@ -58,8 +60,14 @@ defmodule Portal.Account do
     has_one :email_otp_auth_provider, Portal.EmailOTP.AuthProvider
     has_one :userpass_auth_provider, Portal.Userpass.AuthProvider
 
-    field :warning, :string
-    field :warning_delivery_attempts, :integer, default: 0
+    # Billing limit exceeded flags - set by CheckAccountLimits worker and Stripe event processing
+    field :users_limit_exceeded, :boolean, default: false
+    field :seats_limit_exceeded, :boolean, default: false
+    field :service_accounts_limit_exceeded, :boolean, default: false
+    field :sites_limit_exceeded, :boolean, default: false
+    field :admins_limit_exceeded, :boolean, default: false
+
+    # Tracks when the last limit exceeded email was sent (for throttling)
     field :warning_last_sent_at, :utc_datetime_usec
 
     field :disabled_reason, :string
@@ -76,9 +84,11 @@ defmodule Portal.Account do
     |> unique_constraint(:slug, name: :accounts_slug_index)
   end
 
+  @spec active?(t()) :: boolean()
   def active?(%__MODULE__{disabled_at: nil}), do: true
   def active?(%__MODULE__{}), do: false
 
+  # sobelow_skip ["DOS.BinToAtom"]
   for feature <- Portal.Accounts.Features.__schema__(:fields) do
     def unquote(:"#{feature}_enabled?")(account) do
       Config.global_feature_enabled?(unquote(feature)) and

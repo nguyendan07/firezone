@@ -6,7 +6,6 @@
 //
 
 import Combine
-import Sentry
 import SwiftUI
 
 #if os(macOS)
@@ -145,7 +144,7 @@ struct GrantVPNView: View {
     func installSystemExtension() {
       Task {
         do {
-          try await store.systemExtensionRequest(.install)
+          try await store.installSystemExtension()
 
           // The window has a tendency to go to the background after installing
           // the system extension
@@ -168,9 +167,7 @@ struct GrantVPNView: View {
             alert.messageText = "Permission required."
             alert.informativeText =
               "Firezone requires permission to install VPN configurations. Without it, all functionality will be disabled."
-            SentrySDK.pauseAppHangTracking()
-            defer { SentrySDK.resumeAppHangTracking() }
-            _ = alert.runModal()
+            _ = await MacOSAlert.show(alert)
           } else {
             throw error
           }

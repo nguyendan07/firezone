@@ -1,12 +1,12 @@
 // Licensed under Apache 2.0 (C) 2024 Firezone, Inc.
 package dev.firezone.android.features.auth.ui
 
-import androidx.lifecycle.LiveData
-import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.firezone.android.core.data.Repository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.security.SecureRandom
 import javax.inject.Inject
@@ -17,8 +17,8 @@ internal class AuthViewModel
     constructor(
         private val repo: Repository,
     ) : ViewModel() {
-        private val actionMutableLiveData = MutableLiveData<ViewAction>()
-        val actionLiveData: LiveData<ViewAction> = actionMutableLiveData
+        private val actionMutableStateFlow = MutableStateFlow<ViewAction?>(null)
+        val actionStateFlow: StateFlow<ViewAction?> = actionMutableStateFlow
 
         fun onActivityResume() =
             viewModelScope.launch {
@@ -27,12 +27,15 @@ internal class AuthViewModel
                 repo.saveNonceSync(nonce)
                 repo.saveStateSync(state)
                 val config = repo.getConfigSync()
-                val authUrl = "${config.authUrl}/${config.accountSlug}?state=$state&nonce=$nonce&as=client"
+                val authUrl = "${config.authUrl}/${config.accountSlug}?state=$state&nonce=$nonce&as=gui-client"
 
-                actionMutableLiveData.postValue(
-                    ViewAction.LaunchAuthFlow(authUrl),
-                )
+                actionMutableStateFlow.value =
+                    ViewAction.LaunchAuthFlow(authUrl)
             }
+
+        fun clearAction() {
+            actionMutableStateFlow.value = null
+        }
 
         private fun generateRandomString(length: Int): String {
             val random = SecureRandom.getInstanceStrong()

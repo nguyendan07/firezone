@@ -1,8 +1,8 @@
 defmodule PortalWeb.Policies.Show do
   use PortalWeb, :live_view
   import PortalWeb.Policies.Components
-  alias Portal.{Policy, Auth}
-  alias __MODULE__.DB
+  alias Portal.{Policy, Authentication}
+  alias __MODULE__.Database
   import Ecto.Changeset
   import Portal.Changeset
 
@@ -10,7 +10,7 @@ defmodule PortalWeb.Policies.Show do
     policy = get_policy!(id, socket.assigns.subject)
 
     providers =
-      DB.all_active_providers_for_account(socket.assigns.account, socket.assigns.subject)
+      Database.all_active_providers_for_account(socket.assigns.account, socket.assigns.subject)
 
     socket =
       assign(socket,
@@ -19,7 +19,7 @@ defmodule PortalWeb.Policies.Show do
         providers: providers
       )
       |> assign_live_table("policy_authorizations",
-        query_module: DB.PolicyAuthorizationQuery,
+        query_module: Database.PolicyAuthorizationQuery,
         sortable_fields: [],
         hide_filters: [:expiration],
         callback: &handle_policy_authorizations_update!/2
@@ -41,7 +41,7 @@ defmodule PortalWeb.Policies.Show do
       )
 
     with {:ok, policy_authorizations, metadata} <-
-           DB.list_policy_authorizations_for(
+           Database.list_policy_authorizations_for(
              socket.assigns.policy,
              socket.assigns.subject,
              list_opts
@@ -133,7 +133,24 @@ defmodule PortalWeb.Policies.Show do
               Group
             </:label>
             <:value>
-              <.group_badge account={@account} group={@policy.group} return_to={@return_to} />
+              <span class="inline-flex items-center gap-1.5">
+                <.group_badge
+                  account={@account}
+                  group={@policy.group}
+                  return_to={@return_to}
+                />
+                <.popover :if={is_nil(@policy.group) and not is_nil(@policy.group_idp_id)}>
+                  <:target>
+                    <.icon
+                      name="hero-information-circle"
+                      class="h-4 w-4 text-neutral-700 cursor-help"
+                    />
+                  </:target>
+                  <:content>
+                    Group was deleted during sync. To reattach, ensure this group is included in synced groups.
+                  </:content>
+                </.popover>
+              </span>
             </:value>
           </.vertical_table_row>
           <.vertical_table_row>
@@ -293,51 +310,51 @@ defmodule PortalWeb.Policies.Show do
 
   # Inline functions from Portal.Policies
 
-  defp get_policy!(id, %Auth.Subject{} = subject) do
-    DB.get_policy!(id, subject)
+  defp get_policy!(id, %Authentication.Subject{} = subject) do
+    Database.get_policy!(id, subject)
   end
 
-  defp disable_policy(%Policy{} = policy, %Auth.Subject{} = subject) do
+  defp disable_policy(%Policy{} = policy, %Authentication.Subject{} = subject) do
     changeset =
       policy
       |> change()
       |> put_default_value(:disabled_at, DateTime.utc_now())
 
-    DB.update_policy(changeset, subject)
+    Database.update_policy(changeset, subject)
   end
 
-  defp enable_policy(%Policy{} = policy, %Auth.Subject{} = subject) do
+  defp enable_policy(%Policy{} = policy, %Authentication.Subject{} = subject) do
     changeset =
       policy
       |> change()
       |> put_change(:disabled_at, nil)
 
-    DB.update_policy(changeset, subject)
+    Database.update_policy(changeset, subject)
   end
 
-  defp delete_policy(%Policy{} = policy, %Auth.Subject{} = subject) do
-    DB.delete_policy(policy, subject)
+  defp delete_policy(%Policy{} = policy, %Authentication.Subject{} = subject) do
+    Database.delete_policy(policy, subject)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Policy, Safe, Userpass, EmailOTP, OIDC, Google, Entra, Okta}
-    alias Portal.Auth
+    alias Portal.Authentication
 
-    def get_policy!(id, %Auth.Subject{} = subject) do
+    def get_policy!(id, %Authentication.Subject{} = subject) do
       from(p in Policy, as: :policies)
       |> where([policies: p], p.id == ^id)
-      |> preload(group: [], resource: [])
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> preload(group: [:directory], resource: [])
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
-    def update_policy(changeset, %Auth.Subject{} = subject) do
+    def update_policy(changeset, %Authentication.Subject{} = subject) do
       Safe.scoped(changeset, subject)
       |> Safe.update()
     end
 
-    def delete_policy(%Policy{} = policy, %Auth.Subject{} = subject) do
+    def delete_policy(%Policy{} = policy, %Authentication.Subject{} = subject) do
       Safe.scoped(policy, subject)
       |> Safe.delete()
     end
@@ -353,24 +370,24 @@ defmodule PortalWeb.Policies.Show do
       ]
       |> Enum.flat_map(fn schema ->
         from(p in schema, where: not p.is_disabled)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
       end)
     end
 
     def list_policy_authorizations_for(
           %Portal.Policy{} = policy,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_policy_id(policy.id)
-      |> Safe.scoped(subject)
-      |> Safe.list(DB.PolicyAuthorizationQuery, opts)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_policy_id(policy.id)
+      |> Safe.scoped(subject, :replica)
+      |> Safe.list(Database.PolicyAuthorizationQuery, opts)
     end
   end
 
-  defmodule DB.PolicyAuthorizationQuery do
+  defmodule Database.PolicyAuthorizationQuery do
     import Ecto.Query
 
     def all do

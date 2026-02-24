@@ -12,7 +12,7 @@ defmodule Portal.Mailer.Notifications do
   embed_templates "notifications/*.text", suffix: "_text"
 
   def outdated_gateway_email(account, gateways, incompatible_client_count, email) do
-    params = %{clients_order_by: "clients:asc:last_seen_version"}
+    params = %{clients_order_by: "latest_session:asc:version"}
     outdated_clients_url = url(~p"/#{account.id}/clients?#{params}")
 
     default_email()
@@ -24,6 +24,21 @@ defmodule Portal.Mailer.Notifications do
       outdated_clients_url: outdated_clients_url,
       incompatible_client_count: incompatible_client_count,
       latest_version: Portal.ComponentVersions.gateway_version()
+    )
+  end
+
+  def limits_exceeded_email(account, warning, email) do
+    billing_url = url(~p"/#{account.id}/settings/billing")
+    plan_type = Portal.Billing.plan_type(account)
+
+    default_email()
+    |> subject("Firezone Account Limits Exceeded")
+    |> to(email)
+    |> render_body(__MODULE__, :limits_exceeded,
+      account: account,
+      warning: warning,
+      billing_url: billing_url,
+      plan_type: plan_type
     )
   end
 end

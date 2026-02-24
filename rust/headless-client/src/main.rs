@@ -11,6 +11,7 @@ use bin_shared::{
     signals,
 };
 use clap::Parser;
+use ip_network::IpNetwork;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use phoenix_channel::PhoenixChannel;
@@ -136,7 +137,7 @@ struct Cli {
     // until anyone asks for it, env vars are okay and files on disk are slightly better.
     // (Since we run as root and the env var on a headless system is probably stored
     // on disk somewhere anyway.)
-    #[arg(default_value = platform::default_token_path().display().to_string(), env = "FIREZONE_TOKEN_PATH", long)]
+    #[arg(default_value = known_dirs::default_token_path().display().to_string(), env = "FIREZONE_TOKEN_PATH", long)]
     token_path: PathBuf,
 
     /// Increase the `core.rmem_max` and `core.wmem_max` kernel parameters.
@@ -160,10 +161,32 @@ impl Cli {
     }
 }
 
-#[derive(clap::Subcommand, Clone, Copy)]
-#[clap(hide = true)]
+#[derive(clap::Subcommand, Clone)]
 enum Cmd {
+    #[clap(hide = true)]
     Standalone,
+
+    /// Sign in via browser-based authentication
+    SignIn {
+        /// Auth base URL
+        #[arg(
+            long,
+            env = "FIREZONE_AUTH_BASE_URL",
+            default_value = "https://app.firezone.dev"
+        )]
+        auth_base_url: url::Url,
+
+        /// Account slug
+        #[arg(long, env = "FIREZONE_ACCOUNT_SLUG")]
+        account_slug: Option<String>,
+    },
+
+    /// Sign out by removing the stored token
+    SignOut {
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -192,6 +215,25 @@ fn try_main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    match &cli._command {
+        Some(Cmd::SignIn {
+            auth_base_url,
+            account_slug,
+        }) => {
+            handle_sign_in(auth_base_url, account_slug.as_deref(), &cli.token_path)?;
+
+            return Ok(());
+        }
+        Some(Cmd::SignOut { force }) => {
+            handle_sign_out(&cli.token_path, *force)?;
+
+            return Ok(());
+        }
+        Some(Cmd::Standalone) | None => {
+            // Continue with normal operation
+        }
+    }
+
     // Modifying the environment of a running process is unsafe. If any other
     // thread is reading or writing the environment, something bad can happen.
     // So `run` must take over as early as possible during startup, and
@@ -215,7 +257,26 @@ fn try_main() -> Result<()> {
         .as_deref()
         .map(|dir| logging::file::layer(dir, "firezone-headless-client"))
         .unzip();
-    logging::setup_global_subscriber(layer, false).context("Failed to set up logging")?;
+    logging::setup_global_subscriber(
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+        layer,
+        false,
+    )
+    .context("Failed to set up logging")?;
+
+    // Start background log cleanup if file logging is enabled
+    let _cleanup_handle = cli
+        .log_dir
+        .as_ref()
+        .map(|log_dir| {
+            logging::start_log_cleanup_thread(
+                vec![log_dir.clone()],
+                logging::DEFAULT_MAX_SIZE_MB,
+                logging::DEFAULT_CLEANUP_INTERVAL,
+            )
+        })
+        .transpose()
+        .context("Failed to start log cleanup thread")?;
 
     // Deactivate DNS control before starting telemetry or connecting to the portal,
     // in case a previous run of Firezone left DNS control on and messed anything up.
@@ -225,9 +286,12 @@ fn try_main() -> Result<()> {
     // and we need to recover. <https://github.com/firezone/firezone/issues/4899>
     dns_controller.deactivate()?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("connlib")
         .enable_all()
-        .build()?;
+        .build()
+        .context("Failed to create tokio runtime")?;
 
     if cfg!(target_os = "linux") && cli.is_inc_buf_allowed() {
         let recv_buf_size = socket_factory::RECV_BUFFER_SIZE;
@@ -401,16 +465,18 @@ fn try_main() -> Result<()> {
             };
 
             match event {
-                // TODO: Headless Client shouldn't be using messages labelled `Ipc`
                 client_shared::Event::Disconnected(error) => break Err(anyhow!(error).context("Firezone disconnected")),
                 client_shared::Event::ResourcesUpdated(_) => {
                     // On every Resources update, flush DNS to mitigate <https://github.com/firezone/firezone/issues/5052>
                     dns_controller.flush()?;
                 }
                 client_shared::Event::TunInterfaceUpdated(config) => {
-                    tun_device.set_ips(config.ip.v4, config.ip.v6).await?;
+                    let tun_ip_stack = tun_device.set_ips(config.ip.v4, config.ip.v6).await?;
                     dns_controller.set_dns(config.dns_by_sentinel.sentinel_ips(), config.search_domain).await?;
-                    tun_device.set_routes(config.ipv4_routes, config.ipv6_routes).await?;
+                    tun_device.set_routes(config.routes.into_iter().filter(|r| match r {
+                        IpNetwork::V4(_) => tun_ip_stack.supports_ipv4(),
+                        IpNetwork::V6(_) => tun_ip_stack.supports_ipv6(),
+                    })).await?;
 
                     // `on_set_interface_config` is guaranteed to be called when the tunnel is completely ready
                     // <https://github.com/firezone/firezone/pull/6026#discussion_r1692297438>
@@ -424,6 +490,7 @@ fn try_main() -> Result<()> {
                         break Ok(());
                     }
                 }
+                client_shared::Event::GatewayVersionMismatch { .. } | client_shared::Event::AllGatewaysOffline { .. } => {},
             }
         };
 
@@ -439,6 +506,120 @@ fn try_main() -> Result<()> {
 
     rt.shutdown_timeout(Duration::from_secs(1));
 
+    Ok(())
+}
+
+/// Constructs the authentication URL for browser-based sign-in.
+fn build_auth_url(auth_base_url: &url::Url, account_slug: Option<&str>) -> url::Url {
+    let mut auth_url = auth_base_url.clone();
+    if let Some(slug) = account_slug {
+        auth_url.set_path(slug);
+    }
+    auth_url
+        .query_pairs_mut()
+        .append_pair("as", "headless-client");
+    auth_url
+}
+
+/// Removes the token file at the given path.
+/// Returns Ok(true) if the file was removed, Ok(false) if it didn't exist.
+fn remove_token_file(token_path: &Path) -> Result<bool> {
+    match std::fs::remove_file(token_path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to remove token file: {}", token_path.display()))
+        }
+    }
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "This command is designed to print to stdout for user interaction"
+)]
+fn handle_sign_in(
+    auth_base_url: &url::Url,
+    account_slug: Option<&str>,
+    token_path: &Path,
+) -> Result<()> {
+    use std::io::{self, Write};
+
+    let auth_url = build_auth_url(auth_base_url, account_slug);
+
+    println!("\n==========================================================================");
+    println!("Firezone Headless Client - Browser Authentication");
+    println!("==========================================================================\n");
+    println!("To sign in to Firezone, please follow these steps:\n");
+    println!("1. Open the following URL in your web browser:\n");
+    println!("   {}\n", auth_url);
+    println!("2. Complete the sign-in process in your browser");
+    println!("3. Copy the token displayed in the browser");
+    println!("4. Return to this terminal and paste the token below\n");
+    println!("==========================================================================\n");
+
+    print!("Enter the token from your browser: ");
+    io::stdout().flush()?;
+
+    let input = rpassword::read_password().context("Failed to read token from stdin")?;
+    println!();
+    let token = input.trim();
+
+    if token.is_empty() {
+        anyhow::bail!("No token provided");
+    }
+
+    platform::write_token(token_path, token)?;
+
+    println!("\n✓ Token saved successfully to: {}", token_path.display());
+    println!("\nYou can now start the Firezone client. It will automatically use this token.");
+
+    Ok(())
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "This command is designed to print to stdout for user interaction"
+)]
+fn handle_sign_out(token_path: &Path, force: bool) -> Result<()> {
+    use std::io::{self, BufRead, Write};
+
+    // Check if token file exists first
+    if !token_path.exists() {
+        println!("No token file found at: {}", token_path.display());
+        return Ok(());
+    }
+
+    let token_path_display = token_path.display();
+
+    // Ask for confirmation unless --force is specified
+    if !force {
+        println!(
+            "Warning: This will permanently remove the token file at:\n  {}\n",
+            token_path_display
+        );
+        println!("The token cannot be recovered after deletion.");
+        print!("Are you sure you want to sign out? [y/N]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .context("Failed to read user input")?;
+
+        let input = input.trim().to_lowercase();
+        if input != "y" && input != "yes" {
+            println!("Sign out cancelled.");
+            return Ok(());
+        }
+    }
+
+    remove_token_file(token_path)?;
+
+    println!(
+        "\n✓ Token removed successfully from: {}",
+        token_path_display
+    );
     Ok(())
 }
 
@@ -495,7 +676,7 @@ fn tonic_otlp_exporter(
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Cmd};
     use clap::Parser;
     use std::path::PathBuf;
     use url::Url;
@@ -517,5 +698,259 @@ mod tests {
             Cli::try_parse_from([exe_name, "--check", "--log-dir", "bogus_log_dir"]).unwrap();
         assert!(actual.check);
         assert_eq!(actual.log_dir, Some(PathBuf::from("bogus_log_dir")));
+    }
+
+    #[test]
+    fn sign_in_bare() {
+        let actual = Cli::try_parse_from(["firezone-headless-client", "sign-in"]).unwrap();
+        match actual._command {
+            Some(Cmd::SignIn {
+                auth_base_url,
+                account_slug,
+            }) => {
+                assert_eq!(auth_base_url.as_str(), "https://app.firezone.dev/");
+                assert_eq!(account_slug, None);
+            }
+            _ => panic!("Expected SignIn command"),
+        }
+    }
+
+    #[test]
+    fn sign_in_with_options() {
+        let actual = Cli::try_parse_from([
+            "firezone-headless-client",
+            "sign-in",
+            "--auth-base-url",
+            "https://auth.example.com",
+            "--account-slug",
+            "my-team",
+        ])
+        .unwrap();
+
+        match actual._command {
+            Some(Cmd::SignIn {
+                auth_base_url,
+                account_slug,
+            }) => {
+                assert_eq!(auth_base_url.as_str(), "https://auth.example.com/");
+                assert_eq!(account_slug.unwrap(), "my-team");
+            }
+            _ => panic!("Expected SignIn command"),
+        }
+    }
+
+    #[test]
+    fn sign_in_respects_token_path() {
+        let actual = Cli::try_parse_from([
+            "firezone-headless-client",
+            "--token-path",
+            "/custom/token/path",
+            "sign-in",
+        ])
+        .unwrap();
+
+        assert_eq!(actual.token_path, PathBuf::from("/custom/token/path"));
+        assert!(matches!(actual._command, Some(Cmd::SignIn { .. })));
+    }
+
+    #[test]
+    fn sign_in_uses_default_token_path() {
+        let actual = Cli::try_parse_from(["firezone-headless-client", "sign-in"]).unwrap();
+
+        assert_eq!(actual.token_path, known_dirs::default_token_path());
+    }
+
+    #[test]
+    fn sign_out_bare() {
+        let actual = Cli::try_parse_from(["firezone-headless-client", "sign-out"]).unwrap();
+        assert!(matches!(
+            actual._command,
+            Some(Cmd::SignOut { force: false })
+        ));
+    }
+
+    #[test]
+    fn sign_out_with_force() {
+        let actual =
+            Cli::try_parse_from(["firezone-headless-client", "sign-out", "--force"]).unwrap();
+        assert!(matches!(
+            actual._command,
+            Some(Cmd::SignOut { force: true })
+        ));
+    }
+
+    #[test]
+    fn sign_out_respects_token_path() {
+        let actual = Cli::try_parse_from([
+            "firezone-headless-client",
+            "--token-path",
+            "/custom/token/path",
+            "sign-out",
+        ])
+        .unwrap();
+
+        assert_eq!(actual.token_path, PathBuf::from("/custom/token/path"));
+        assert!(matches!(actual._command, Some(Cmd::SignOut { .. })));
+    }
+
+    /// Verifies that `set_token_permissions` produces a file that passes `check_token_permissions`.
+    /// On Linux, this requires running as root (CI runs in Docker as root).
+    /// On macOS/Windows, both functions are no-ops so this always passes.
+    #[test]
+    fn set_token_permissions_satisfies_check() {
+        use std::io::Write;
+
+        let token_path = std::env::temp_dir().join("firezone_test_token");
+
+        // Create a token file
+        let mut file = std::fs::File::create(&token_path).unwrap();
+        file.write_all(b"test_token").unwrap();
+        drop(file);
+
+        // Set permissions
+        super::platform::set_token_permissions(&token_path)
+            .expect("set_token_permissions should succeed");
+
+        // Verify that check_token_permissions is satisfied
+        super::platform::check_token_permissions(&token_path)
+            .expect("check_token_permissions should succeed after set_token_permissions");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    // =========================================================================
+    // Tests for sign-in/sign-out core logic
+    // =========================================================================
+
+    #[test]
+    fn build_auth_url_without_slug() {
+        let base_url = Url::parse("https://app.firezone.dev").unwrap();
+        let auth_url = super::build_auth_url(&base_url, None);
+
+        assert_eq!(auth_url.host_str(), Some("app.firezone.dev"));
+        assert_eq!(auth_url.path(), "/");
+        assert_eq!(auth_url.query(), Some("as=headless-client"));
+    }
+
+    #[test]
+    fn build_auth_url_with_slug() {
+        let base_url = Url::parse("https://app.firezone.dev").unwrap();
+        let auth_url = super::build_auth_url(&base_url, Some("my-team"));
+
+        assert_eq!(auth_url.host_str(), Some("app.firezone.dev"));
+        assert_eq!(auth_url.path(), "/my-team");
+        assert_eq!(auth_url.query(), Some("as=headless-client"));
+    }
+
+    #[test]
+    fn build_auth_url_with_custom_base() {
+        let base_url = Url::parse("https://auth.example.com").unwrap();
+        let auth_url = super::build_auth_url(&base_url, Some("acme-corp"));
+
+        assert_eq!(auth_url.host_str(), Some("auth.example.com"));
+        assert_eq!(auth_url.path(), "/acme-corp");
+        assert_eq!(auth_url.query(), Some("as=headless-client"));
+    }
+
+    #[test]
+    fn write_token_creates_file_with_content() {
+        let token_path = std::env::temp_dir().join("firezone_test_write_token");
+        let _ = std::fs::remove_file(&token_path); // Clean up any previous test run
+
+        let test_token = "test_token_content_12345";
+        super::platform::write_token(&token_path, test_token).expect("write_token should succeed");
+
+        // Verify the file exists and has correct content
+        let content = std::fs::read_to_string(&token_path).expect("Should be able to read token");
+        assert_eq!(content, test_token);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    #[test]
+    fn write_token_creates_parent_directories() {
+        let token_path = std::env::temp_dir()
+            .join("firezone_test_nested")
+            .join("subdir")
+            .join("token");
+        let parent = token_path.parent().unwrap();
+
+        // Ensure the directory doesn't exist
+        let _ = std::fs::remove_dir_all(parent);
+
+        let test_token = "nested_token";
+        super::platform::write_token(&token_path, test_token)
+            .expect("write_token should create parent directories");
+
+        assert!(token_path.exists());
+        let content = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(content, test_token);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("firezone_test_nested"));
+    }
+
+    #[test]
+    fn write_token_overwrites_existing() {
+        let token_path = std::env::temp_dir().join("firezone_test_overwrite");
+
+        // Write initial token
+        super::platform::write_token(&token_path, "first_token").unwrap();
+
+        // Overwrite with new token
+        super::platform::write_token(&token_path, "second_token").unwrap();
+
+        let content = std::fs::read_to_string(&token_path).unwrap();
+        assert_eq!(content, "second_token");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    #[test]
+    fn remove_token_file_removes_existing() {
+        let token_path = std::env::temp_dir().join("firezone_test_remove");
+
+        // Create a token file
+        std::fs::write(&token_path, "token_to_remove").unwrap();
+        assert!(token_path.exists());
+
+        // Remove it
+        let removed = super::remove_token_file(&token_path).unwrap();
+        assert!(removed);
+        assert!(!token_path.exists());
+    }
+
+    #[test]
+    fn remove_token_file_returns_false_for_nonexistent() {
+        let token_path = std::env::temp_dir().join("firezone_test_nonexistent_token");
+        let _ = std::fs::remove_file(&token_path); // Ensure it doesn't exist
+
+        let removed = super::remove_token_file(&token_path).unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn token_roundtrip_write_and_read() {
+        let token_path = std::env::temp_dir().join("firezone_test_roundtrip");
+        let _ = std::fs::remove_file(&token_path);
+
+        let test_token = "roundtrip_test_token_abc123";
+
+        // Write token
+        super::platform::write_token(&token_path, test_token).unwrap();
+
+        // Read it back using the same function used by the client
+        let read_token = super::read_token_file(&token_path)
+            .expect("read_token_file should succeed")
+            .expect("Token should exist");
+
+        use secrecy::ExposeSecret;
+        assert_eq!(read_token.expose_secret(), test_token);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&token_path);
     }
 }

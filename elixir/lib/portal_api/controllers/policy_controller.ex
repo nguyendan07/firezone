@@ -2,9 +2,8 @@ defmodule PortalAPI.PolicyController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
   alias PortalAPI.Pagination
-  alias __MODULE__.DB
-
-  action_fallback PortalAPI.FallbackController
+  alias PortalAPI.Error
+  alias __MODULE__.Database
 
   tags ["Policies"]
 
@@ -18,12 +17,14 @@ defmodule PortalAPI.PolicyController do
       ok: {"Policy Response", "application/json", PortalAPI.Schemas.Policy.ListResponse}
     ]
 
-  # List Policies
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def index(conn, params) do
     list_opts = Pagination.params_to_list_opts(params)
 
-    with {:ok, policies, metadata} <- DB.list_policies(conn.assigns.subject, list_opts) do
+    with {:ok, policies, metadata} <- Database.list_policies(conn.assigns.subject, list_opts) do
       render(conn, :index, policies: policies, metadata: metadata)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -41,10 +42,12 @@ defmodule PortalAPI.PolicyController do
       ok: {"Policy Response", "application/json", PortalAPI.Schemas.Policy.Response}
     ]
 
-  # Show a specific Policy
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    with {:ok, policy} <- DB.fetch_policy(id, conn.assigns.subject) do
+    with {:ok, policy} <- Database.fetch_policy(id, conn.assigns.subject) do
       render(conn, :show, policy: policy)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -57,22 +60,23 @@ defmodule PortalAPI.PolicyController do
       ok: {"Policy Response", "application/json", PortalAPI.Schemas.Policy.Response}
     ]
 
-  # Create a new Policy
+  @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, %{"policy" => params}) do
     subject = conn.assigns.subject
 
-    # Check if this is for an internet resource
-    with :ok <- DB.validate_internet_resource_policy(params, subject),
-         {:ok, policy} <- DB.create_policy(params, subject) do
+    with :ok <- Database.validate_internet_resource_policy(params, subject),
+         {:ok, policy} <- Database.create_policy(params, subject) do
       conn
       |> put_status(:created)
       |> put_resp_header("location", ~p"/policies/#{policy}")
       |> render(:show, policy: policy)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  def create(_conn, _params) do
-    {:error, :bad_request}
+  def create(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
   end
 
   operation :update,
@@ -91,19 +95,21 @@ defmodule PortalAPI.PolicyController do
       ok: {"Policy Response", "application/json", PortalAPI.Schemas.Policy.Response}
     ]
 
-  # Update a Policy
+  @spec update(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def update(conn, %{"id" => id, "policy" => params}) do
     subject = conn.assigns.subject
 
-    with {:ok, policy} <- DB.fetch_policy(id, subject),
-         :ok <- DB.validate_internet_resource_policy(params, subject),
-         {:ok, policy} <- DB.update_policy(policy, params, subject) do
+    with {:ok, policy} <- Database.fetch_policy(id, subject),
+         :ok <- Database.validate_internet_resource_policy(params, subject),
+         {:ok, policy} <- Database.update_policy(policy, params, subject) do
       render(conn, :show, policy: policy)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  def update(_conn, _params) do
-    {:error, :bad_request}
+  def update(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
   end
 
   operation :delete,
@@ -120,31 +126,33 @@ defmodule PortalAPI.PolicyController do
       ok: {"Policy Response", "application/json", PortalAPI.Schemas.Policy.Response}
     ]
 
-  # Delete a Policy
+  @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete(conn, %{"id" => id}) do
     subject = conn.assigns.subject
 
-    with {:ok, policy} <- DB.fetch_policy(id, subject),
-         {:ok, policy} <- DB.delete_policy(policy, subject) do
+    with {:ok, policy} <- Database.fetch_policy(id, subject),
+         {:ok, policy} <- Database.delete_policy(policy, subject) do
       render(conn, :show, policy: policy)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Ecto.Changeset
-    alias Portal.{Policy, Safe, Auth}
+    alias Portal.{Policy, Safe, Authentication}
 
     def list_policies(subject, opts \\ []) do
       from(p in Policy, as: :policies)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
     def fetch_policy(id, subject) do
       result =
         from(p in Policy, where: p.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do
@@ -157,18 +165,18 @@ defmodule PortalAPI.PolicyController do
     def update_policy(policy, attrs, subject) do
       policy
       |> changeset(attrs)
+      |> populate_group_idp_id(subject)
       |> Safe.scoped(subject)
       |> Safe.update()
     end
 
-    def validate_internet_resource_policy(attrs, %Auth.Subject{} = subject) do
+    def validate_internet_resource_policy(attrs, %Authentication.Subject{} = subject) do
       resource_id = attrs["resource_id"]
 
       if resource_id do
-        # Fetch the resource to check its type
         resource =
           from(r in Portal.Resource, where: r.id == ^resource_id)
-          |> Safe.scoped(subject)
+          |> Safe.scoped(subject, :replica)
           |> Safe.one()
 
         case resource do
@@ -176,11 +184,10 @@ defmodule PortalAPI.PolicyController do
             {:error, :not_found}
 
           %{type: :internet} ->
-            # Check if internet resource is enabled for the account
             if Portal.Account.internet_resource_enabled?(subject.account) do
               :ok
             else
-              {:error, {:forbidden, "Internet resource is not enabled for this account"}}
+              {:error, :forbidden, reason: "Internet resource is not enabled for this account"}
             end
 
           _ ->
@@ -191,11 +198,32 @@ defmodule PortalAPI.PolicyController do
       end
     end
 
-    def create_policy(attrs, %Auth.Subject{} = subject) do
-      changeset = create_changeset(attrs, subject)
+    def create_policy(attrs, %Authentication.Subject{} = subject) do
+      changeset =
+        create_changeset(attrs, subject)
+        |> populate_group_idp_id(subject)
 
       Safe.scoped(changeset, subject)
       |> Safe.insert()
+    end
+
+    defp populate_group_idp_id(changeset, subject) do
+      case get_change(changeset, :group_id) do
+        nil ->
+          changeset
+
+        group_id ->
+          case get_group_idp_id(group_id, subject) do
+            nil -> put_change(changeset, :group_idp_id, nil)
+            idp_id -> put_change(changeset, :group_idp_id, idp_id)
+          end
+      end
+    end
+
+    defp get_group_idp_id(group_id, subject) do
+      from(g in Portal.Group, where: g.id == ^group_id, select: g.idp_id)
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one()
     end
 
     def delete_policy(policy, subject) do
@@ -204,7 +232,7 @@ defmodule PortalAPI.PolicyController do
       |> Safe.delete()
     end
 
-    defp create_changeset(attrs, %Auth.Subject{} = subject) do
+    defp create_changeset(attrs, %Authentication.Subject{} = subject) do
       %Policy{}
       |> cast(attrs, ~w[description group_id resource_id]a)
       |> validate_required(~w[group_id resource_id]a)

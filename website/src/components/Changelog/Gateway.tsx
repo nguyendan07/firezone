@@ -23,6 +23,33 @@ export default function Gateway() {
   return (
     <Entries downloadLinks={downloadLinks} title="Gateway">
       <Unreleased>
+        <ChangeItem pull="12251">
+          Gracefully handles WebSocket closes from the portal instead of logging
+          a deserialization error.
+        </ChangeItem>
+        <ChangeItem pull="12134">
+          Fixes an issue where outdated and thus irrelevant candidates were sent
+          to Clients, causing connectivity issues in rare situations.
+        </ChangeItem>
+        <ChangeItem pull="12248">
+          Re-establishes the WebSocket connection to the control plane if it
+          becomes unresponsive.
+        </ChangeItem>
+      </Unreleased>
+      <Entry version="1.5.0" date={new Date("2026-02-02")}>
+        <ChangeItem pull="11771">
+          BREAKING: Remove support for Firezone 1.3.x Clients and lower.
+        </ChangeItem>
+        <ChangeItem pull="11770">
+          Enables detailed flow logs for tunneled TCP and UDP connections. Set
+          `FIREZONE_FLOW_LOGS=true` or `--flow-logs` to enable.
+        </ChangeItem>
+        <ChangeItem pull="11664">
+          Adds a <code>FIREZONE_MAX_PARTITION_TIME</code> environment variable
+          to configure how long the Gateway will retry connecting to the portal
+          before exiting. Accepts human-readable durations like <code>5m</code>,{" "}
+          <code>1h</code>, or <code>30d</code>. Defaults to 24 hours.
+        </ChangeItem>
         <ChangeItem pull="11625">
           Fails faster when the initial connection to the control plane cannot
           be established, allowing faster restarts by the process manager.
@@ -47,7 +74,11 @@ export default function Gateway() {
           Implements retry with exponential backoff on 429 (Too Many Requests)
           responses from the portal.
         </ChangeItem>
-      </Unreleased>
+        <ChangeItem pull="11804">
+          Fixes an issue where connections would flap between relayed and
+          direct, causing WireGuard connection timeouts.
+        </ChangeItem>
+      </Entry>
       <Entry version="1.4.19" date={new Date("2025-12-23")}>
         <ChangeItem pull="10972">
           Fixes an issue where IPv6-only DNS resources could not be reached.
@@ -57,8 +88,8 @@ export default function Gateway() {
           is present but not routable.
         </ChangeItem>
         <ChangeItem pull="11208">
-          Fixes an issue where the Gateway would not boot up if IPv6 was
-          disabled on the system.
+          Fixes an issue where the Gateway could reboot when the WebSocket
+          connection to the portal got cut.
         </ChangeItem>
       </Entry>
       <Entry version="1.4.18" date={new Date("2025-11-10")}>
@@ -186,8 +217,9 @@ export default function Gateway() {
           not be sent.
         </ChangeItem>
         <ChangeItem pull="9060">
-          Fixes an issue where service discovery for DNS resources would fail in
-          case the Gateway&apos;s started up with no network connectivity.
+          {
+            "Fixes an issue where service discovery for DNS resources would fail in case the Gateway's started up with no network connectivity."
+          }
         </ChangeItem>
         <ChangeItem pull="9088">
           Fixes an issue where large batches of packets to the same Client got
@@ -259,8 +291,9 @@ export default function Gateway() {
       </Entry>
       <Entry version="1.4.3" date={new Date("2025-01-28")}>
         <ChangeItem pull="7567">
-          Fixes an issue where ICMPv6&apos;s &apos;PacketTooBig&apos; errors
-          were not correctly translated by the NAT64 module.
+          {
+            "Fixes an issue where ICMPv6's 'PacketTooBig' errors were not correctly translated by the NAT64 module."
+          }
         </ChangeItem>
         <ChangeItem pull="7565">
           Fails early in case the binary is not started as <code>root</code> or
@@ -326,9 +359,9 @@ export default function Gateway() {
       </Entry>
       <Entry version="1.3.2" date={new Date("2024-10-02")}>
         <ChangeItem pull="6733">
-          Reduces log level of the &quot;Couldn&apos;t find connection by
-          IP&quot; message so that it doesn&apos;t log each time a client
-          disconnects.
+          {
+            "Reduces log level of the \"Couldn't find connection by IP\" message so that it doesn't log each time a client disconnects."
+          }
         </ChangeItem>
         <ChangeItem pull="6845">
           Fixes connectivity issues on idle connections by entering an

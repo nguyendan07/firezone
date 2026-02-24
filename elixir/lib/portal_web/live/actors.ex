@@ -1,10 +1,10 @@
 defmodule PortalWeb.Actors do
   use PortalWeb, :live_view
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   alias Portal.Actor
-  alias Portal.Auth
+  alias Portal.Authentication
   alias Portal.ExternalIdentity
   alias Portal.PortalSession
   alias Portal.ClientToken
@@ -17,7 +17,7 @@ defmodule PortalWeb.Actors do
       socket
       |> assign(page_title: "Actors")
       |> assign_live_table("actors",
-        query_module: DB,
+        query_module: Database,
         sortable_fields: [
           {:actors, :name},
           {:actors, :email},
@@ -71,75 +71,113 @@ defmodule PortalWeb.Actors do
 
   # Show Actor Modal
   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :show}} = socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      # Load identities and tokens/sessions based on actor type
+      identities = Database.get_identities_for_actor(actor.id, socket.assigns.subject)
+      groups = Database.get_groups_for_actor(actor.id, socket.assigns.subject)
 
-    # Load identities and tokens/sessions based on actor type
-    identities = DB.get_identities_for_actor(actor.id, socket.assigns.subject)
-    groups = DB.get_groups_for_actor(actor.id, socket.assigns.subject)
+      # Load tokens and sessions based on actor type
+      {tokens, sessions} =
+        if actor.type == :service_account do
+          {Database.get_client_tokens_for_actor(actor.id, socket.assigns.subject), []}
+        else
+          # Users have both client tokens and portal sessions
+          {Database.get_client_tokens_for_actor(actor.id, socket.assigns.subject),
+           Database.get_portal_sessions_for_actor(actor.id, socket.assigns.subject)}
+        end
 
-    # Load tokens and sessions based on actor type
-    {tokens, sessions} =
-      if actor.type == :service_account do
-        {DB.get_client_tokens_for_actor(actor.id, socket.assigns.subject), []}
-      else
-        # Users have both client tokens and portal sessions
-        {DB.get_client_tokens_for_actor(actor.id, socket.assigns.subject),
-         DB.get_portal_sessions_for_actor(actor.id, socket.assigns.subject)}
-      end
+      socket = handle_live_tables_params(socket, params, uri)
 
-    socket = handle_live_tables_params(socket, params, uri)
+      default_tab = if actor.type == :service_account, do: "tokens", else: "identities"
 
-    default_tab = if actor.type == :service_account, do: "tokens", else: "identities"
+      socket =
+        socket
+        |> assign(
+          actor: actor,
+          active_tab: default_tab,
+          identities: identities,
+          groups: groups,
+          tokens: tokens,
+          sessions: sessions
+        )
+        |> assign_new(:created_token, fn -> nil end)
 
-    socket =
-      socket
-      |> assign(
-        actor: actor,
-        active_tab: default_tab,
-        identities: identities,
-        groups: groups,
-        tokens: tokens,
-        sessions: sessions
-      )
-      |> assign_new(:created_token, fn -> nil end)
+      {:noreply, socket}
+    else
+      {:error, :not_found} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Actor not found")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
 
-    {:noreply, socket}
+      {:error, :unauthorized} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "You are not authorized to view this actor")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+    end
   end
 
   # Add Token Modal
   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :add_token}} = socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
-    socket = handle_live_tables_params(socket, params, uri)
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      socket = handle_live_tables_params(socket, params, uri)
 
-    # Default token expiration to 1 year from now
-    default_expiration =
-      Date.utc_today()
-      |> Date.add(365)
-      |> Date.to_iso8601()
+      # Default token expiration to 1 year from now
+      default_expiration =
+        Date.utc_today()
+        |> Date.add(365)
+        |> Date.to_iso8601()
 
-    {:noreply,
-     assign(socket,
-       actor: actor,
-       token_expiration: default_expiration
-     )}
+      {:noreply,
+       assign(socket,
+         actor: actor,
+         token_expiration: default_expiration
+       )}
+    else
+      {:error, :not_found} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Actor not found")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+
+      {:error, :unauthorized} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "You are not authorized to view this actor")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+    end
   end
 
   # Edit Actor Modal
   def handle_params(%{"id" => id} = params, uri, %{assigns: %{live_action: :edit}} = socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
-    socket = handle_live_tables_params(socket, params, uri)
-    changeset = changeset(actor, %{})
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      socket = handle_live_tables_params(socket, params, uri)
+      changeset = changeset(actor, %{})
 
-    is_last_admin =
-      actor.type == :account_admin_user and
-        not other_enabled_admins_exist?(actor, socket.assigns.subject)
+      is_last_admin =
+        actor.type == :account_admin_user and
+          not other_enabled_admins_exist?(actor, socket.assigns.subject)
 
-    {:noreply,
-     assign(socket,
-       actor: actor,
-       form: to_form(changeset),
-       is_last_admin: is_last_admin
-     )}
+      {:noreply,
+       assign(socket,
+         actor: actor,
+         form: to_form(changeset),
+         is_last_admin: is_last_admin
+       )}
+    else
+      {:error, :not_found} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Actor not found")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+
+      {:error, :unauthorized} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "You are not authorized to view this actor")
+         |> push_navigate(to: ~p"/#{socket.assigns.account}/actors")}
+    end
   end
 
   # Default handler
@@ -204,7 +242,7 @@ defmodule PortalWeb.Actors do
         {:noreply, put_flash(socket, :error_inline, "Admin user limit reached for your account")}
 
       true ->
-        case DB.create(changeset, socket.assigns.subject) do
+        case Database.create(changeset, socket.assigns.subject) do
           {:ok, actor} ->
             socket =
               socket
@@ -233,7 +271,7 @@ defmodule PortalWeb.Actors do
       token_expiration = Map.get(params, "token_expiration")
 
       result =
-        DB.create_service_account_with_token(
+        Database.create_service_account_with_token(
           changeset,
           token_expiration,
           socket.assigns.subject,
@@ -289,7 +327,7 @@ defmodule PortalWeb.Actors do
 
       {:noreply, assign(socket, form: to_form(changeset))}
     else
-      case DB.update(changeset, socket.assigns.subject) do
+      case Database.update(changeset, socket.assigns.subject) do
         {:ok, actor} ->
           socket =
             socket
@@ -308,80 +346,88 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("delete", %{"id" => id}, socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      # Prevent users from deleting themselves
+      if actor.id == socket.assigns.subject.actor.id do
+        {:noreply, put_flash(socket, :error, "You cannot delete yourself")}
+      else
+        case Database.delete(actor, socket.assigns.subject) do
+          {:ok, _actor} ->
+            {:noreply, handle_success(socket, "Actor deleted successfully")}
 
-    # Prevent users from deleting themselves
-    if actor.id == socket.assigns.subject.actor.id do
-      {:noreply, put_flash(socket, :error, "You cannot delete yourself")}
-    else
-      case DB.delete(actor, socket.assigns.subject) do
-        {:ok, _actor} ->
-          {:noreply, handle_success(socket, "Actor deleted successfully")}
+          {:error, :unauthorized} ->
+            {:noreply, put_flash(socket, :error, "You are not authorized to delete this actor")}
 
-        {:error, :unauthorized} ->
-          {:noreply, put_flash(socket, :error, "You are not authorized to delete this actor")}
-
-        {:error, _changeset} ->
-          {:noreply, put_flash(socket, :error, "Failed to delete actor")}
+          {:error, _changeset} ->
+            {:noreply, put_flash(socket, :error, "Failed to delete actor")}
+        end
       end
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to delete this actor")}
     end
   end
 
   def handle_event("disable", %{"id" => id}, socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
-
-    # Prevent users from disabling themselves
-    if actor.id == socket.assigns.subject.actor.id do
-      {:noreply, put_flash(socket, :error, "You cannot disable yourself")}
-    else
-      case actor
-           |> change()
-           |> put_change(:disabled_at, DateTime.utc_now())
-           |> DB.update(socket.assigns.subject) do
-        {:ok, updated_actor} ->
-          socket = reload_live_table!(socket, "actors")
-
-          # If the modal is open for this actor, update it
-          socket =
-            if Map.get(socket.assigns, :actor) && socket.assigns.actor.id == id do
-              assign(socket, actor: updated_actor)
-            else
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      # Prevent users from disabling themselves
+      if actor.id == socket.assigns.subject.actor.id do
+        {:noreply, put_flash(socket, :error, "You cannot disable yourself")}
+      else
+        case actor
+             |> change()
+             |> put_change(:disabled_at, DateTime.utc_now())
+             |> Database.update(socket.assigns.subject) do
+          {:ok, updated_actor} ->
+            socket =
               socket
-            end
+              |> reload_live_table!("actors")
+              |> maybe_update_actor_assign(id, updated_actor)
 
-          {:noreply, put_flash(socket, :success_inline, "Actor disabled successfully")}
+            {:noreply, put_flash(socket, :success_inline, "Actor disabled successfully")}
 
-        {:error, :unauthorized} ->
-          {:noreply, put_flash(socket, :error, "You are not authorized to disable this actor")}
+          {:error, :unauthorized} ->
+            {:noreply, put_flash(socket, :error, "You are not authorized to disable this actor")}
 
-        {:error, _changeset} ->
-          {:noreply, put_flash(socket, :error, "Failed to disable actor")}
+          {:error, _changeset} ->
+            {:noreply, put_flash(socket, :error, "Failed to disable actor")}
+        end
       end
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to disable this actor")}
     end
   end
 
   def handle_event("enable", %{"id" => id}, socket) do
-    actor = DB.get_actor!(id, socket.assigns.subject)
-
-    case actor
-         |> change()
-         |> put_change(:disabled_at, nil)
-         |> DB.update(socket.assigns.subject) do
-      {:ok, updated_actor} ->
-        socket = reload_live_table!(socket, "actors")
-
-        # If the modal is open for this actor, update it
-        socket =
-          if Map.get(socket.assigns, :actor) && socket.assigns.actor.id == id do
-            assign(socket, actor: updated_actor)
-          else
+    with {:ok, actor} <- Database.get_actor(id, socket.assigns.subject) do
+      case actor
+           |> change()
+           |> put_change(:disabled_at, nil)
+           |> Database.update(socket.assigns.subject) do
+        {:ok, updated_actor} ->
+          socket =
             socket
-          end
+            |> reload_live_table!("actors")
+            |> maybe_update_actor_assign(id, updated_actor)
 
-        {:noreply, put_flash(socket, :success_inline, "Actor enabled successfully")}
+          {:noreply, put_flash(socket, :success_inline, "Actor enabled successfully")}
 
-      {:error, _} ->
-        {:noreply, put_flash(socket, :error, "Failed to enable actor")}
+        {:error, _} ->
+          {:noreply, put_flash(socket, :error, "Failed to enable actor")}
+      end
+    else
+      {:error, :not_found} ->
+        {:noreply, put_flash(socket, :error, "Actor not found")}
+
+      {:error, :unauthorized} ->
+        {:noreply, put_flash(socket, :error, "You are not authorized to enable this actor")}
     end
   end
 
@@ -416,13 +462,14 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("delete_token", %{"id" => token_id}, socket) do
-    token = DB.get_client_token_by_id(token_id, socket.assigns.subject)
+    token = Database.get_client_token_by_id(token_id, socket.assigns.subject)
     entity = if socket.assigns.actor.type == :service_account, do: "token", else: "session"
 
     if token do
-      case DB.delete(token, socket.assigns.subject) do
+      case Database.delete(token, socket.assigns.subject) do
         {:ok, _} ->
-          tokens = DB.get_client_tokens_for_actor(socket.assigns.actor.id, socket.assigns.subject)
+          tokens =
+            Database.get_client_tokens_for_actor(socket.assigns.actor.id, socket.assigns.subject)
 
           {:noreply,
            socket
@@ -438,17 +485,19 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("delete_session", %{"id" => session_id}, socket) do
-    session = DB.get_portal_session_by_id(session_id, socket.assigns.subject)
+    session = Database.get_portal_session_by_id(session_id, socket.assigns.subject)
 
     if session do
       :ok =
-        Auth.delete_portal_session(%PortalSession{
+        Authentication.delete_portal_session(%PortalSession{
           account_id: socket.assigns.account.id,
           id: session.id
         })
 
       # Reload sessions for the actor
-      sessions = DB.get_portal_sessions_for_actor(socket.assigns.actor.id, socket.assigns.subject)
+      sessions =
+        Database.get_portal_sessions_for_actor(socket.assigns.actor.id, socket.assigns.subject)
+
       socket = assign(socket, sessions: sessions)
       {:noreply, put_flash(socket, :success_inline, "Session deleted successfully")}
     else
@@ -457,16 +506,16 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_event("delete_identity", %{"id" => identity_id}, socket) do
-    case DB.get_identity_by_id(identity_id, socket.assigns.subject) do
+    case Database.get_identity_by_id(identity_id, socket.assigns.subject) do
       nil ->
         {:noreply, put_flash(socket, :error, "Identity not found")}
 
       identity ->
-        case DB.delete(identity, socket.assigns.subject) do
+        case Database.delete(identity, socket.assigns.subject) do
           {:ok, _} ->
             # Reload identities for the actor
             identities =
-              DB.get_identities_for_actor(socket.assigns.actor.id, socket.assigns.subject)
+              Database.get_identities_for_actor(socket.assigns.actor.id, socket.assigns.subject)
 
             socket = assign(socket, identities: identities)
             {:noreply, put_flash(socket, :success_inline, "Identity deleted successfully")}
@@ -522,8 +571,16 @@ defmodule PortalWeb.Actors do
   end
 
   def handle_actors_update!(socket, list_opts) do
-    with {:ok, actors, metadata} <- DB.list_actors(socket.assigns.subject, list_opts) do
+    with {:ok, actors, metadata} <- Database.list_actors(socket.assigns.subject, list_opts) do
       {:ok, assign(socket, actors: actors, actors_metadata: metadata)}
+    end
+  end
+
+  defp maybe_update_actor_assign(socket, id, updated_actor) do
+    if Map.get(socket.assigns, :actor) && socket.assigns.actor.id == id do
+      assign(socket, actor: updated_actor)
+    else
+      socket
     end
   end
 
@@ -576,11 +633,11 @@ defmodule PortalWeb.Actors do
           </:col>
           <:col :let={actor} label="status" class="w-1/12">
             <%= if actor.disabled_at do %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-red-100 text-red-800">
                 Disabled
               </span>
             <% else %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-green-100 text-green-800">
                 Active
               </span>
             <% end %>
@@ -617,7 +674,7 @@ defmodule PortalWeb.Actors do
             type="button"
             phx-click="select_type"
             phx-value-type="user"
-            class="flex flex-col items-center justify-center p-6 border-2 border-neutral-200 rounded-lg hover:border-accent-500 hover:bg-neutral-50 transition-all"
+            class="flex flex-col items-center justify-center p-6 border-2 border-neutral-200 rounded-md hover:border-accent-500 hover:bg-neutral-50 transition-all"
           >
             <.icon name="hero-user" class="w-12 h-12 mb-3 text-neutral-600" />
             <span class="text-lg font-semibold text-neutral-900">User</span>
@@ -630,7 +687,7 @@ defmodule PortalWeb.Actors do
             type="button"
             phx-click="select_type"
             phx-value-type="service_account"
-            class="flex flex-col items-center justify-center p-6 border-2 border-neutral-200 rounded-lg hover:border-accent-500 hover:bg-neutral-50 transition-all"
+            class="flex flex-col items-center justify-center p-6 border-2 border-neutral-200 rounded-md hover:border-accent-500 hover:bg-neutral-50 transition-all"
           >
             <.icon name="hero-server" class="w-12 h-12 mb-3 text-neutral-600" />
             <span class="text-lg font-semibold text-neutral-900">Service account</span>
@@ -738,7 +795,7 @@ defmodule PortalWeb.Actors do
                 type="date"
                 name="token_expiration"
                 value={@token_expiration}
-                class="block w-full rounded-lg border-neutral-300 focus:border-accent-400 focus:ring focus:ring-accent-200 focus:ring-opacity-50"
+                class="block w-full rounded-md border-neutral-300 focus:border-accent-400 focus:ring-3 focus:ring-accent-200/50"
               />
             </div>
           </div>
@@ -761,7 +818,7 @@ defmodule PortalWeb.Actors do
               <span>{@actor.name}</span>
               <.actor_type_badge actor={@actor} />
               <%= if @actor.disabled_at do %>
-                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-red-100 text-red-800">
                   Disabled
                 </span>
               <% end %>
@@ -774,10 +831,10 @@ defmodule PortalWeb.Actors do
         <%= if @created_token do %>
           <div
             id="created-token-display"
-            class="bg-green-50 border border-green-200 rounded-lg p-4 mb-4"
+            class="bg-green-50 border border-green-200 rounded-md p-4 mb-4"
           >
             <div class="flex items-start gap-3">
-              <.icon name="hero-check-circle" class="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
+              <.icon name="hero-check-circle" class="w-5 h-5 text-green-600 shrink-0 mt-0.5" />
               <div class="flex-1">
                 <h4 class="text-sm font-semibold text-green-900 mb-2">Token Created Successfully</h4>
                 <p class="text-sm text-green-800 mb-3">
@@ -786,7 +843,7 @@ defmodule PortalWeb.Actors do
                 <div id="created-token-copy-container" class="relative" phx-hook="CopyClipboard">
                   <code
                     id="created-token-copy-container-code"
-                    class="block bg-white border border-green-300 rounded px-3 py-2 pr-24 text-sm font-mono text-neutral-900 break-all"
+                    class="block bg-white border border-green-300 rounded-sm px-3 py-2 pr-24 text-sm font-mono text-neutral-900 break-all"
                   >
                     {@created_token}
                   </code>
@@ -795,7 +852,7 @@ defmodule PortalWeb.Actors do
                     data-copy-to-clipboard-target="created-token-copy-container-code"
                     data-copy-to-clipboard-content-type="innerHTML"
                     data-copy-to-clipboard-html-entities="true"
-                    class="absolute top-1 right-1 px-3 py-1.5 text-sm font-medium text-green-700 bg-white border border-green-300 hover:bg-green-50 rounded inline-flex items-center"
+                    class="absolute top-1 right-1 px-3 py-1.5 text-sm font-medium text-green-700 bg-white border border-green-300 hover:bg-green-50 rounded-sm inline-flex items-center"
                   >
                     <span
                       id="created-token-copy-container-default-message"
@@ -851,13 +908,13 @@ defmodule PortalWeb.Actors do
                   <div class="flex items-center gap-2">
                     <span
                       :if={@actor.allow_email_otp_sign_in}
-                      class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800"
+                      class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-green-100 text-green-800"
                     >
                       <.icon name="hero-check-circle" class="w-3.5 h-3.5 mr-1" /> Allowed
                     </span>
                     <span
                       :if={!@actor.allow_email_otp_sign_in}
-                      class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-neutral-100 text-neutral-600"
+                      class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-neutral-100 text-neutral-600"
                     >
                       <.icon name="hero-no-symbol" class="w-3.5 h-3.5 mr-1" /> Not Allowed
                     </span>
@@ -868,7 +925,7 @@ defmodule PortalWeb.Actors do
                 <:target>
                   <button
                     type="button"
-                    class="text-neutral-500 hover:text-neutral-700 focus:outline-none ml-4"
+                    class="text-neutral-500 hover:text-neutral-700 focus:outline-hidden ml-4"
                   >
                     <.icon name="hero-ellipsis-horizontal" class="w-6 h-6" />
                   </button>
@@ -877,14 +934,14 @@ defmodule PortalWeb.Actors do
                   <div class="py-1">
                     <.link
                       navigate={~p"/#{@account}/actors/#{@actor.id}/edit?#{@query_params}"}
-                      class="px-3 py-2 text-sm text-neutral-800 rounded-lg hover:bg-neutral-100 flex items-center gap-2 whitespace-nowrap"
+                      class="px-3 py-2 text-sm text-neutral-800 rounded-md hover:bg-neutral-100 flex items-center gap-2 whitespace-nowrap"
                     >
                       <.icon name="hero-pencil" class="w-4 h-4" /> Edit
                     </.link>
                     <.link
                       :if={@actor.type == :service_account}
                       navigate={~p"/#{@account}/actors/#{@actor.id}/add_token?#{@query_params}"}
-                      class="px-3 py-2 text-sm text-neutral-800 rounded-lg hover:bg-neutral-100 flex items-center gap-2 whitespace-nowrap"
+                      class="px-3 py-2 text-sm text-neutral-800 rounded-md hover:bg-neutral-100 flex items-center gap-2 whitespace-nowrap"
                     >
                       <.icon name="hero-key" class="w-4 h-4" /> Add Token
                     </.link>
@@ -893,7 +950,7 @@ defmodule PortalWeb.Actors do
                       type="button"
                       phx-click="send_welcome_email"
                       phx-value-id={@actor.id}
-                      class="w-full px-3 py-2 text-sm text-blue-600 rounded-lg hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
+                      class="w-full px-3 py-2 text-sm text-blue-600 rounded-md hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
                     >
                       <.icon name="hero-envelope" class="w-4 h-4" /> Send Welcome Email
                     </button>
@@ -902,7 +959,7 @@ defmodule PortalWeb.Actors do
                       type="button"
                       phx-click="disable"
                       phx-value-id={@actor.id}
-                      class="w-full px-3 py-2 text-sm text-orange-600 rounded-lg hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
+                      class="w-full px-3 py-2 text-sm text-orange-600 rounded-md hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
                     >
                       <.icon name="hero-lock-closed" class="w-4 h-4" /> Disable
                     </button>
@@ -911,7 +968,7 @@ defmodule PortalWeb.Actors do
                       type="button"
                       phx-click="enable"
                       phx-value-id={@actor.id}
-                      class="w-full px-3 py-2 text-sm text-green-600 rounded-lg hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
+                      class="w-full px-3 py-2 text-sm text-green-600 rounded-md hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
                     >
                       <.icon name="hero-lock-open" class="w-4 h-4" /> Enable
                     </button>
@@ -920,7 +977,7 @@ defmodule PortalWeb.Actors do
                       type="button"
                       phx-click="delete"
                       phx-value-id={@actor.id}
-                      class="w-full px-3 py-2 text-sm text-red-600 rounded-lg hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
+                      class="w-full px-3 py-2 text-sm text-red-600 rounded-md hover:bg-neutral-100 flex items-center gap-2 border-0 bg-transparent whitespace-nowrap"
                       data-confirm="Are you sure you want to delete this actor?"
                     >
                       <.icon name="hero-trash" class="w-4 h-4" /> Delete
@@ -1015,7 +1072,7 @@ defmodule PortalWeb.Actors do
           </div>
           <!-- Identities Tab -->
           <%= if @actor.type != :service_account and @active_tab == "identities" do %>
-            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-lg">
+            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-md">
               <%= if @identities == [] do %>
                 <div class="text-center text-neutral-500 p-8">No external identities to display.</div>
               <% else %>
@@ -1026,7 +1083,7 @@ defmodule PortalWeb.Actors do
                         <div class="flex items-center gap-2 min-w-0">
                           <.provider_icon
                             type={provider_type_from_issuer(identity.issuer)}
-                            class="w-5 h-5 flex-shrink-0"
+                            class="w-5 h-5 shrink-0"
                           />
                           <div
                             class="font-medium text-sm text-neutral-900 truncate"
@@ -1137,7 +1194,7 @@ defmodule PortalWeb.Actors do
                         type="button"
                         phx-click="delete_identity"
                         phx-value-id={identity.id}
-                        class="text-red-600 hover:text-red-800 flex-shrink-0"
+                        class="text-red-600 hover:text-red-800 shrink-0"
                         data-confirm="Are you sure you want to delete this identity?"
                       >
                         <.icon name="hero-trash" class="w-5 h-5" />
@@ -1150,7 +1207,7 @@ defmodule PortalWeb.Actors do
           <% end %>
           <!-- Client Sessions Tab (Users only) -->
           <%= if @actor.type != :service_account and @active_tab == "client_sessions" do %>
-            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-lg">
+            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-md">
               <%= if @tokens == [] do %>
                 <div class="text-center text-neutral-500 p-8">
                   No client sessions to display.
@@ -1164,32 +1221,37 @@ defmodule PortalWeb.Actors do
                         title={if token.online?, do: "Online", else: "Offline"}
                       />
                       <.icon
-                        name={client_os_icon_name(token.last_seen_user_agent)}
-                        class="w-6 h-6 flex-shrink-0"
+                        name={
+                          client_os_icon_name(token.latest_session && token.latest_session.user_agent)
+                        }
+                        class="w-6 h-6 shrink-0"
                       />
-                      <div class="flex-1 grid grid-cols-3 gap-x-4 text-sm">
-                        <div>
+                      <div class="flex-1 grid grid-cols-[auto_auto_1fr] gap-x-4 text-sm">
+                        <div class="w-28">
                           <span class="text-xs uppercase text-neutral-500">Last connected</span>
                           <div class="text-neutral-900">
-                            <.relative_datetime datetime={token.last_seen_at} />
+                            <.relative_datetime datetime={
+                              token.latest_session && token.latest_session.inserted_at
+                            } />
+                          </div>
+                        </div>
+                        <div class="w-20">
+                          <span class="text-xs uppercase text-neutral-500">Expires</span>
+                          <div class="text-neutral-900">
+                            <.relative_datetime datetime={token.expires_at} />
                           </div>
                         </div>
                         <div>
                           <span class="text-xs uppercase text-neutral-500">Location</span>
                           <div class="text-neutral-900">
-                            <%= if token_location(token) do %>
-                              <span class="truncate" title={token_location(token)}>
-                                {token_location(token)}
-                              </span>
+                            <%= if token_location(token) || (token.latest_session && token.latest_session.remote_ip) do %>
+                              <div :if={token_location(token)}>{token_location(token)}</div>
+                              <div :if={token.latest_session && token.latest_session.remote_ip}>
+                                {token.latest_session.remote_ip}
+                              </div>
                             <% else %>
                               -
                             <% end %>
-                          </div>
-                        </div>
-                        <div>
-                          <span class="text-xs uppercase text-neutral-500">Expires</span>
-                          <div class="text-neutral-900">
-                            <.relative_datetime datetime={token.expires_at} />
                           </div>
                         </div>
                       </div>
@@ -1210,7 +1272,7 @@ defmodule PortalWeb.Actors do
           <% end %>
           <!-- Tokens Tab (Service Accounts only) -->
           <%= if @actor.type == :service_account and @active_tab == "tokens" do %>
-            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-lg">
+            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-md">
               <%= if @tokens == [] do %>
                 <div class="text-center text-neutral-500 p-8">
                   No tokens to display.
@@ -1224,32 +1286,37 @@ defmodule PortalWeb.Actors do
                         title={if token.online?, do: "Online", else: "Offline"}
                       />
                       <.icon
-                        name={client_os_icon_name(token.last_seen_user_agent)}
-                        class="w-6 h-6 flex-shrink-0"
+                        name={
+                          client_os_icon_name(token.latest_session && token.latest_session.user_agent)
+                        }
+                        class="w-6 h-6 shrink-0"
                       />
-                      <div class="flex-1 grid grid-cols-3 gap-x-4 text-sm">
-                        <div>
+                      <div class="flex-1 grid grid-cols-[auto_auto_1fr] gap-x-4 text-sm">
+                        <div class="w-28">
                           <span class="text-xs uppercase text-neutral-500">Last used</span>
                           <div class="text-neutral-900">
-                            <.relative_datetime datetime={token.last_seen_at} />
+                            <.relative_datetime datetime={
+                              token.latest_session && token.latest_session.inserted_at
+                            } />
+                          </div>
+                        </div>
+                        <div class="w-20">
+                          <span class="text-xs uppercase text-neutral-500">Expires</span>
+                          <div class="text-neutral-900">
+                            <.relative_datetime datetime={token.expires_at} />
                           </div>
                         </div>
                         <div>
                           <span class="text-xs uppercase text-neutral-500">Location</span>
                           <div class="text-neutral-900">
-                            <%= if token_location(token) do %>
-                              <span class="truncate" title={token_location(token)}>
-                                {token_location(token)}
-                              </span>
+                            <%= if token_location(token) || (token.latest_session && token.latest_session.remote_ip) do %>
+                              <div :if={token_location(token)}>{token_location(token)}</div>
+                              <div :if={token.latest_session && token.latest_session.remote_ip}>
+                                {token.latest_session.remote_ip}
+                              </div>
                             <% else %>
                               -
                             <% end %>
-                          </div>
-                        </div>
-                        <div>
-                          <span class="text-xs uppercase text-neutral-500">Expires</span>
-                          <div class="text-neutral-900">
-                            <.relative_datetime datetime={token.expires_at} />
                           </div>
                         </div>
                       </div>
@@ -1270,7 +1337,7 @@ defmodule PortalWeb.Actors do
           <% end %>
           <!-- Portal Sessions Tab (Users only) -->
           <%= if @actor.type != :service_account and @active_tab == "portal_sessions" do %>
-            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-lg">
+            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-md">
               <%= if @sessions == [] do %>
                 <div class="text-center text-neutral-500 p-8">
                   No sessions to display.
@@ -1285,31 +1352,32 @@ defmodule PortalWeb.Actors do
                       />
                       <.icon
                         name={session_user_agent_icon(session.user_agent)}
-                        class="w-6 h-6 flex-shrink-0"
+                        class="w-6 h-6 shrink-0"
                       />
-                      <div class="flex-1 grid grid-cols-3 gap-x-4 text-sm">
-                        <div>
+                      <div class="flex-1 grid grid-cols-[auto_auto_1fr] gap-x-4 text-sm">
+                        <div class="w-28">
                           <span class="text-xs uppercase text-neutral-500">Signed in</span>
                           <div class="text-neutral-900">
                             <.relative_datetime datetime={session.inserted_at} />
                           </div>
                         </div>
-                        <div>
-                          <span class="text-xs uppercase text-neutral-500">Location</span>
-                          <div class="text-neutral-900">
-                            <%= if session_location(session) do %>
-                              <span class="truncate" title={session_location(session)}>
-                                {session_location(session)}
-                              </span>
-                            <% else %>
-                              -
-                            <% end %>
-                          </div>
-                        </div>
-                        <div>
+                        <div class="w-20">
                           <span class="text-xs uppercase text-neutral-500">Expires</span>
                           <div class="text-neutral-900">
                             <.relative_datetime datetime={session.expires_at} />
+                          </div>
+                        </div>
+                        <div>
+                          <span class="text-xs uppercase text-neutral-500">Location</span>
+                          <div class="text-neutral-900">
+                            <%= if session_location(session) || session.remote_ip do %>
+                              <div :if={session_location(session)}>{session_location(session)}</div>
+                              <div :if={session.remote_ip}>
+                                {session.remote_ip}
+                              </div>
+                            <% else %>
+                              -
+                            <% end %>
                           </div>
                         </div>
                       </div>
@@ -1330,7 +1398,7 @@ defmodule PortalWeb.Actors do
           <% end %>
           <!-- Groups Tab -->
           <%= if @active_tab == "groups" do %>
-            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-lg">
+            <div class="max-h-96 overflow-y-auto border border-neutral-200 rounded-md">
               <%= if @groups == [] do %>
                 <div class="text-center text-neutral-500 p-8">No groups to display.</div>
               <% else %>
@@ -1351,7 +1419,7 @@ defmodule PortalWeb.Actors do
                       <div class="flex items-center gap-3">
                         <.provider_icon
                           type={provider_type_from_group(group)}
-                          class="w-5 h-5 flex-shrink-0"
+                          class="w-5 h-5 shrink-0"
                         />
                         <div class="flex-1 min-w-0">
                           <span class="flex items-center gap-2">
@@ -1360,7 +1428,7 @@ defmodule PortalWeb.Actors do
                             </span>
                             <span
                               :if={group.entity_type == :org_unit}
-                              class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-neutral-100 text-neutral-600"
+                              class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-xs font-medium bg-neutral-100 text-neutral-600"
                               title="Organizational Unit"
                             >
                               OU
@@ -1467,7 +1535,7 @@ defmodule PortalWeb.Actors do
                 type="date"
                 name="token_expiration"
                 value={@token_expiration}
-                class="block w-full rounded-lg border-neutral-300 focus:border-accent-400 focus:ring focus:ring-accent-200 focus:ring-opacity-50"
+                class="block w-full rounded-md border-neutral-300 focus:border-accent-400 focus:ring-3 focus:ring-accent-200/50"
                 required
               />
             </div>
@@ -1527,7 +1595,7 @@ defmodule PortalWeb.Actors do
   defp actor_type_badge(assigns) do
     ~H"""
     <span class={[
-      "inline-flex items-center px-2 py-0.5 rounded text-xs font-medium uppercase",
+      "inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium uppercase",
       actor_type_badge_color(@actor.type)
     ]}>
       {actor_display_type(@actor)}
@@ -1644,9 +1712,9 @@ defmodule PortalWeb.Actors do
         # Build the token attributes
         attrs = %{"expires_at" => expires_at}
 
-        case Auth.create_headless_client_token(actor, attrs, subject) do
+        case Authentication.create_headless_client_token(actor, attrs, subject) do
           {:ok, token} ->
-            encoded_token = Auth.encode_fragment!(token)
+            encoded_token = Authentication.encode_fragment!(token)
             {:ok, {token, encoded_token}}
 
           error ->
@@ -1697,16 +1765,15 @@ defmodule PortalWeb.Actors do
     end
   end
 
-  defp token_location(token) do
+  defp token_location(%{latest_session: nil}), do: nil
+
+  defp token_location(%{latest_session: session}) do
     cond do
-      token.last_seen_remote_ip_location_city && token.last_seen_remote_ip_location_region ->
-        "#{token.last_seen_remote_ip_location_city}, #{token.last_seen_remote_ip_location_region}"
+      session.remote_ip_location_city && session.remote_ip_location_region ->
+        "#{session.remote_ip_location_city}, #{session.remote_ip_location_region}"
 
-      token.last_seen_remote_ip_location_region ->
-        token.last_seen_remote_ip_location_region
-
-      token.last_seen_remote_ip ->
-        to_string(token.last_seen_remote_ip)
+      session.remote_ip_location_region ->
+        session.remote_ip_location_region
 
       true ->
         nil
@@ -1721,43 +1788,34 @@ defmodule PortalWeb.Actors do
   defp session_user_agent_icon(_), do: "hero-computer-desktop"
 
   defp session_location(session) do
-    location =
-      cond do
-        session.remote_ip_location_city && session.remote_ip_location_region ->
-          "#{session.remote_ip_location_city}, #{session.remote_ip_location_region}"
+    cond do
+      session.remote_ip_location_city && session.remote_ip_location_region ->
+        "#{session.remote_ip_location_city}, #{session.remote_ip_location_region}"
 
-        session.remote_ip_location_region ->
-          session.remote_ip_location_region
+      session.remote_ip_location_region ->
+        session.remote_ip_location_region
 
-        true ->
-          nil
-      end
-
-    ip = if session.remote_ip, do: to_string(session.remote_ip)
-
-    case {location, ip} do
-      {nil, nil} -> nil
-      {nil, ip} -> ip
-      {location, nil} -> location
-      {location, ip} -> "#{location} (#{ip})"
+      true ->
+        nil
     end
   end
 
   defp other_enabled_admins_exist?(actor, subject) do
     case actor do
       %{type: :account_admin_user, account_id: account_id, id: id} ->
-        DB.other_enabled_admins_exist?(account_id, id, subject)
+        Database.other_enabled_admins_exist?(account_id, id, subject)
 
       _ ->
         false
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Portal.Repo.Query
     alias Portal.ExternalIdentity
     alias Portal.Actor
+    alias Portal.ClientSession
     alias Portal.Presence
     alias Portal.Safe
     alias Portal.Directory
@@ -1838,7 +1896,7 @@ defmodule PortalWeb.Actors do
           },
           order_by: [asc: fragment("COALESCE(?, ?, ?)", google.name, entra.name, okta.name)]
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> case do
           {:error, _} ->
@@ -1899,16 +1957,23 @@ defmodule PortalWeb.Actors do
 
     def list_actors(subject, opts \\ []) do
       all()
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
-    def get_actor!(id, subject) do
-      from(a in Actor, as: :actors)
-      |> where([actors: a], a.id == ^id)
-      |> where([actors: a], a.type != :api_client)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+    def get_actor(id, subject) do
+      result =
+        from(a in Actor, as: :actors)
+        |> where([actors: a], a.id == ^id)
+        |> where([actors: a], a.type != :api_client)
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one(fallback_to_primary: true)
+
+      case result do
+        nil -> {:error, :not_found}
+        {:error, :unauthorized} -> {:error, :unauthorized}
+        actor -> {:ok, actor}
+      end
     end
 
     def get_identities_for_actor(actor_id, subject) do
@@ -1940,7 +2005,7 @@ defmodule PortalWeb.Actors do
         }
       )
       |> order_by([identities: i], desc: i.inserted_at)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 
@@ -1951,31 +2016,55 @@ defmodule PortalWeb.Actors do
         where: a.id != ^actor_id,
         where: is_nil(a.disabled_at)
       )
-      |> Safe.scoped(subject)
-      |> Safe.exists?()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.exists?(fallback_to_primary: true)
     end
 
     def get_client_tokens_for_actor(actor_id, subject) do
-      from(c in ClientToken, as: :client_tokens)
-      |> where([client_tokens: c], c.actor_id == ^actor_id)
-      |> order_by([client_tokens: c], desc: c.inserted_at)
-      |> Safe.scoped(subject)
-      |> Safe.all()
+      tokens =
+        from(c in ClientToken, as: :client_tokens)
+        |> where([client_tokens: c], c.actor_id == ^actor_id)
+        |> order_by([client_tokens: c], desc: c.inserted_at)
+        |> Safe.scoped(subject, :replica)
+        |> Safe.all()
+
+      tokens
+      |> preload_latest_sessions_for_tokens()
       |> Presence.Clients.preload_client_tokens_presence()
+    end
+
+    defp preload_latest_sessions_for_tokens(tokens) do
+      account_ids = tokens |> Enum.map(& &1.account_id) |> Enum.uniq()
+      token_ids = Enum.map(tokens, & &1.id)
+
+      sessions_by_token_id =
+        from(s in ClientSession,
+          where: s.account_id in ^account_ids,
+          where: s.client_token_id in ^token_ids,
+          distinct: s.client_token_id,
+          order_by: [asc: s.client_token_id, desc: s.inserted_at]
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+        |> Map.new(&{&1.client_token_id, &1})
+
+      Enum.map(tokens, fn token ->
+        %{token | latest_session: Map.get(sessions_by_token_id, token.id)}
+      end)
     end
 
     def get_identity_by_id(identity_id, subject) do
       from(i in ExternalIdentity, as: :identities)
       |> where([identities: i], i.id == ^identity_id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def get_client_token_by_id(token_id, subject) do
       from(c in ClientToken, as: :client_tokens)
       |> where([client_tokens: c], c.id == ^token_id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def get_portal_sessions_for_actor(actor_id, subject) do
@@ -2005,7 +2094,7 @@ defmodule PortalWeb.Actors do
           )
       })
       |> order_by([portal_sessions: ps], desc: ps.inserted_at)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
       |> Presence.PortalSessions.preload_portal_sessions_presence()
     end
@@ -2013,8 +2102,8 @@ defmodule PortalWeb.Actors do
     def get_portal_session_by_id(session_id, subject) do
       from(ps in PortalSession, as: :portal_sessions)
       |> where([portal_sessions: ps], ps.id == ^session_id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def get_groups_for_actor(actor_id, subject) do
@@ -2045,7 +2134,7 @@ defmodule PortalWeb.Actors do
         }
       )
       |> order_by([groups: g], asc: g.name)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 

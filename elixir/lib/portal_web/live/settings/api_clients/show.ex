@@ -1,11 +1,11 @@
 defmodule PortalWeb.Settings.ApiClients.Show do
   use PortalWeb, :live_view
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   import Ecto.Changeset
 
   def mount(%{"id" => id}, _session, socket) do
     if Portal.Account.rest_api_enabled?(socket.assigns.account) do
-      actor = DB.get_api_client!(id, socket.assigns.subject)
+      actor = Database.get_api_client!(id, socket.assigns.subject)
 
       socket =
         socket
@@ -14,7 +14,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
           page_title: "API Client #{actor.name}"
         )
         |> assign_live_table("tokens",
-          query_module: DB,
+          query_module: Database,
           sortable_fields: [],
           callback: &handle_tokens_update!/2
         )
@@ -31,7 +31,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
   end
 
   def handle_tokens_update!(socket, list_opts) do
-    case DB.list_tokens_for(socket.assigns.actor, socket.assigns.subject, list_opts) do
+    case Database.list_tokens_for(socket.assigns.actor, socket.assigns.subject, list_opts) do
       {:ok, tokens, metadata} ->
         {:ok,
          assign(socket,
@@ -113,7 +113,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
           <.vertical_table_row>
             <:label>Created</:label>
             <:value>
-              {Cldr.DateTime.Formatter.date(@actor.inserted_at, 1, "en", Portal.CLDR, [])}
+              {PortalWeb.Format.short_date(@actor.inserted_at)}
             </:value>
           </.vertical_table_row>
         </.vertical_table>
@@ -164,7 +164,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
             {token.name}
           </:col>
           <:col :let={token} label="expires at">
-            {Cldr.DateTime.Formatter.date(token.expires_at, 1, "en", Portal.CLDR, [])}
+            {PortalWeb.Format.short_date(token.expires_at)}
           </:col>
           <:col :let={token} label="last used">
             <.relative_datetime datetime={token.last_seen_at} />
@@ -233,7 +233,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
   def handle_event("disable", _params, socket) do
     changeset = disable_actor_changeset(socket.assigns.actor)
 
-    with {:ok, actor} <- DB.update_actor(changeset, socket.assigns.subject) do
+    with {:ok, actor} <- Database.update_actor(changeset, socket.assigns.subject) do
       socket =
         socket
         |> put_flash(:success, "API Client was disabled.")
@@ -246,7 +246,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
 
   def handle_event("enable", _params, socket) do
     changeset = enable_actor_changeset(socket.assigns.actor)
-    {:ok, actor} = DB.update_actor(changeset, socket.assigns.subject)
+    {:ok, actor} = Database.update_actor(changeset, socket.assigns.subject)
 
     socket =
       socket
@@ -259,7 +259,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
 
   def handle_event("revoke_all_tokens", _params, socket) do
     {:ok, deleted_tokens_count} =
-      DB.delete_all_tokens_for_actor(socket.assigns.actor, socket.assigns.subject)
+      Database.delete_all_tokens_for_actor(socket.assigns.actor, socket.assigns.subject)
 
     socket =
       socket
@@ -270,7 +270,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
   end
 
   def handle_event("revoke_token", %{"id" => id}, socket) do
-    {:ok, _token} = DB.delete_token(id, socket.assigns.subject)
+    {:ok, _token} = Database.delete_token(id, socket.assigns.subject)
 
     socket =
       socket
@@ -281,7 +281,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
   end
 
   def handle_event("delete", _params, socket) do
-    with {:ok, _actor} <- DB.delete_actor(socket.assigns.actor, socket.assigns.subject) do
+    with {:ok, _actor} <- Database.delete_actor(socket.assigns.actor, socket.assigns.subject) do
       {:noreply, push_navigate(socket, to: ~p"/#{socket.assigns.account}/settings/api_clients")}
     end
   end
@@ -298,7 +298,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
     |> put_change(:disabled_at, nil)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -307,8 +307,8 @@ defmodule PortalWeb.Settings.ApiClients.Show do
         where: a.id == ^id,
         where: a.type == :api_client
       )
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def update_actor(changeset, subject) do
@@ -323,7 +323,7 @@ defmodule PortalWeb.Settings.ApiClients.Show do
         where: t.actor_id == ^actor.id,
         order_by: [desc: t.inserted_at, desc: t.id]
       )
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -339,8 +339,8 @@ defmodule PortalWeb.Settings.ApiClients.Show do
           where: t.id == ^token_id,
           where: t.expires_at > ^DateTime.utc_now() or is_nil(t.expires_at)
         )
-        |> Safe.scoped(subject)
-        |> Safe.one()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one(fallback_to_primary: true)
 
       case result do
         nil -> {:error, :not_found}

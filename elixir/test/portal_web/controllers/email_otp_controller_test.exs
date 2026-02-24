@@ -541,6 +541,139 @@ defmodule PortalWeb.EmailOTPControllerTest do
       assert state == %{}
     end
 
+    test "successfully authenticates admin user in gui-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_admin_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in with gui-client context
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Verify with gui-client context
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # gui-client context renders the client_redirect page (200)
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+
+      # Email OTP cookie should be cleared
+      state = get_cookie_state(conn)
+      assert state == %{}
+    end
+
+    test "successfully authenticates admin user in headless-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_admin_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in with headless-client context
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Verify with headless-client context
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      # Headless client context renders the token display page (200)
+      assert conn.status == 200
+      assert conn.resp_body =~ "token-value"
+      assert conn.resp_body =~ "Copy token to clipboard"
+      assert conn.resp_body =~ actor.name
+
+      # Email OTP cookie should be cleared
+      state = get_cookie_state(conn)
+      assert state == %{}
+    end
+
+    test "successfully authenticates account_user in headless-client context", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in with headless-client context
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Verify with headless-client context
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      # Headless client context renders the token display page (200)
+      assert conn.status == 200
+      assert conn.resp_body =~ "Copy token to clipboard"
+
+      # Email OTP cookie should be cleared
+      state = get_cookie_state(conn)
+      assert state == %{}
+    end
+
     test "rejects account_user in browser context (portal requires admin)", %{
       conn: conn,
       account: account,
@@ -574,6 +707,215 @@ defmodule PortalWeb.EmailOTPControllerTest do
       # Should be rejected - account_user can't access portal
       assert redirected_to(conn) == ~p"/#{account.id}"
       assert flash(conn, :error) =~ "admin privileges"
+    end
+
+    test "rejects client sign-in when account has exceeded user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Set limit exceeded flag on the account
+      update_account(account, %{users_limit_exceeded: true})
+
+      # Try to verify
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert redirected_to(conn) =~ "/#{account.id}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "allows gui-client sign-in when account has exceeded monthly active users limits (soft limit)",
+         %{
+           conn: conn,
+           account: account,
+           provider: provider
+         } do
+      actor =
+        actor_fixture(
+          type: :account_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Set limit exceeded flag on the account (seats_limit_exceeded is used for monthly active users)
+      update_account(account, %{seats_limit_exceeded: true})
+
+      # Try to verify - sign-in should still succeed since seats is a soft limit
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "gui-client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "rejects headless-client sign-in when account has exceeded user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Set multiple limit exceeded flags including users
+      update_account(account, %{users_limit_exceeded: true, sites_limit_exceeded: true})
+
+      # Try to verify
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "headless-client",
+          "state" => "test-state"
+        })
+
+      assert redirected_to(conn) =~ "/#{account.id}"
+      assert flash(conn, :error) =~ "exceeding billing limits"
+    end
+
+    test "allows client sign-in when account warning does not include user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email},
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Set a limit flag that doesn't include users or seats
+      update_account(account, %{sites_limit_exceeded: true})
+
+      # Try to verify
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code,
+          "as" => "client",
+          "state" => "test-state",
+          "nonce" => "test-nonce"
+        })
+
+      # Should be allowed - sites warning doesn't block client auth
+      assert conn.status == 200
+      assert conn.resp_body =~ "client_redirect"
+    end
+
+    test "allows portal sign-in when account has exceeded user limits", %{
+      conn: conn,
+      account: account,
+      provider: provider
+    } do
+      actor =
+        actor_fixture(
+          type: :account_admin_user,
+          account: account,
+          allow_email_otp_sign_in: true
+        )
+
+      # Initiate sign-in
+      conn =
+        post(conn, ~p"/#{account.id}/sign_in/email_otp/#{provider.id}", %{
+          "email" => %{"email" => actor.email}
+        })
+
+      # Get the code from the email
+      assert_received {:email, email}
+      code = extract_code_from_email(email)
+
+      # Set limit exceeded flag on the account
+      update_account(account, %{users_limit_exceeded: true})
+
+      # Try to verify in portal context
+      conn =
+        conn
+        |> recycle_with_cookie()
+        |> post(~p"/#{account.id}/sign_in/email_otp/#{provider.id}/verify", %{
+          "secret" => code
+        })
+
+      # Portal sign-in should still be allowed so admins can manage billing
+      assert redirected_to(conn) =~ "/sites"
     end
   end
 

@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # mark:next-apple-version
-      RELEASE_NAME: macos-client-1.5.12
+      RELEASE_NAME: macos-client-1.5.14
     steps:
-      - uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5 # v6.1.0
+      - uses: release-drafter/release-drafter@6db134d15f3909ccc9eefd369f02bd1e9cffdf97 # v6.2.0
         if: "${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'main' }}"
         id: update-release-draft
         with:
@@ -29,11 +29,11 @@ jobs:
   test:
     runs-on: macos-15
     env:
-      XCODE_VERSION: "26.0"
+      XCODE_VERSION: "26.2"
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: sudo xcode-select --switch "$(find /Applications -maxdepth 1 -name "Xcode*${XCODE_VERSION}*.app" | sort -V | tail -n 1)"
-      - uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3.5.1
+      - uses: jdx/mise-action@6d1e696aa24c1aa1bcc1adea0212707c71ab78a8 # v3.6.1
         with:
           install_args: --cd swift/apple
       - run: mise run //swift/apple:test-coverage
@@ -49,11 +49,11 @@ jobs:
   static-analysis:
     runs-on: macos-15
     env:
-      XCODE_VERSION: "26.0"
+      XCODE_VERSION: "26.2"
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: sudo xcode-select --switch "$(find /Applications -maxdepth 1 -name "Xcode*${XCODE_VERSION}*.app" | sort -V | tail -n 1)"
-      - uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3.5.1
+      - uses: jdx/mise-action@6d1e696aa24c1aa1bcc1adea0212707c71ab78a8 # v3.6.1
         with:
           install_args: --cd swift/apple
       - name: Check Swift formatting and linting
@@ -66,7 +66,7 @@ jobs:
     needs: update-release-draft
     runs-on: macos-15
     env:
-      XCODE_VERSION: "26.0"
+      XCODE_VERSION: "26.2"
       MISE_EXPERIMENTAL: "1"
     permissions:
       contents: write # for attaching the build artifacts to the release
@@ -94,22 +94,24 @@ jobs:
             build-script: scripts/build/macos-standalone.sh
             upload-script: scripts/upload/github-release.sh
             # mark:next-apple-version
-            artifact-file: "firezone-macos-client-1.5.12.dmg"
+            artifact-file: "firezone-macos-client-1.5.14.dmg"
             # mark:next-apple-version
-            pkg-artifact-file: "firezone-macos-client-1.5.12.pkg"
+            pkg-artifact-file: "firezone-macos-client-1.5.14.pkg"
             # mark:next-apple-version
-            release-name: macos-client-1.5.12
+            release-name: macos-client-1.5.14
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-tags: true # Otherwise we cannot embed the correct version into the build.
-      - uses: jdx/mise-action@146a28175021df8ca24f8ee1828cc2a60f980bd5 # v3.5.1
+      - uses: jdx/mise-action@6d1e696aa24c1aa1bcc1adea0212707c71ab78a8 # v3.6.1
         with:
           install_args: --cd swift/apple
       - uses: ./.github/actions/setup-rust-stable
         with:
           targets: ${{ matrix.rust-targets }}
-      - uses: ./.github/actions/setup-rust-sccache
+      - uses: ./.github/actions/setup-rust-target-dependency-cache
+        with:
+          save-if: ${{ github.event_name == 'merge_group' || github.ref == 'refs/heads/main' }}
       - run: ${{ matrix.build-script }}
         env:
           IOS_APP_PROVISIONING_PROFILE: "${{ secrets.APPLE_IOS_APP_PROVISIONING_PROFILE }}"

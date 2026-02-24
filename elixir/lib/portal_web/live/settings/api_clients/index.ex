@@ -1,14 +1,14 @@
 defmodule PortalWeb.Settings.ApiClients.Index do
   use PortalWeb, :live_view
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
     def list_actors(subject, opts \\ []) do
       from(a in Portal.Actor, as: :actors)
       |> where([actors: a], a.type == :api_client)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -27,7 +27,7 @@ defmodule PortalWeb.Settings.ApiClients.Index do
         |> assign(page_title: "API Clients")
         |> assign(api_url: Portal.Config.get_env(:portal, :api_external_url))
         |> assign_live_table("actors",
-          query_module: DB,
+          query_module: Database,
           sortable_fields: [
             {:actors, :name},
             {:actors, :status}
@@ -48,7 +48,7 @@ defmodule PortalWeb.Settings.ApiClients.Index do
 
   def handle_api_clients_update!(socket, list_opts) do
     with {:ok, actors, actors_metadata} <-
-           DB.list_actors(socket.assigns.subject, list_opts) do
+           Database.list_actors(socket.assigns.subject, list_opts) do
       socket =
         assign(socket,
           actors: actors,
@@ -104,7 +104,7 @@ defmodule PortalWeb.Settings.ApiClients.Index do
             </.badge>
           </:col>
           <:col :let={actor} label="created at">
-            {Cldr.DateTime.Formatter.date(actor.inserted_at, 1, "en", Portal.CLDR, [])}
+            {PortalWeb.Format.short_date(actor.inserted_at)}
           </:col>
           <:empty>
             <div class="flex justify-center text-center text-neutral-500 p-4">

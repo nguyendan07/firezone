@@ -100,7 +100,7 @@ defmodule PortalWeb.LiveTable do
     Map.take(filter.params, keys) != %{}
   end
 
-  def datetime_input(assigns) do
+  defp datetime_input(assigns) do
     ~H"""
     <div class={["flex items-center"]}>
       <input
@@ -113,10 +113,10 @@ defmodule PortalWeb.LiveTable do
         min="2023-01-01"
         autocomplete="off"
         class={[
-          "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded",
+          "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded-sm",
           "block w-1/2 mr-1",
           "disabled:bg-neutral-50 disabled:text-neutral-500 disabled:border-neutral-300 disabled:shadow-none",
-          "focus:outline-none focus:border-1 focus:ring-0",
+          "focus:outline-hidden focus:ring-0",
           @field.errors != [] && "border-rose-400"
         ]}
       />
@@ -128,11 +128,11 @@ defmodule PortalWeb.LiveTable do
         id={@field.id <> "[#{@from_or_to}][time]"}
         value={normalize_value("time", Map.get(@field.value || %{}, @from_or_to)) || "00:00:00"}
         class={[
-          "bg-neutral-50 border text-neutral-900 text-sm rounded",
+          "bg-neutral-50 border text-neutral-900 text-sm rounded-sm",
           "block w-1/2",
           "border-neutral-300",
           "disabled:bg-neutral-50 disabled:text-neutral-500 disabled:border-neutral-300 disabled:shadow-none",
-          "focus:outline-none focus:border-1 focus:ring-0",
+          "focus:outline-hidden focus:ring-0",
           @field.errors != [] && "border-rose-400"
         ]}
       />
@@ -173,7 +173,7 @@ defmodule PortalWeb.LiveTable do
           <.icon name="hero-arrow-path" class="mr-1 w-3.5 h-3.5" /> Reload
         </.button>
         <%= for notice <- @notice do %>
-          <span class={["text-sm px-3 py-1.5 rounded", notice_style(notice[:type])]}>
+          <span class={["text-sm px-3 py-1.5 rounded-sm", notice_style(notice[:type])]}>
             {render_slot(notice)}
           </span>
         <% end %>
@@ -238,10 +238,10 @@ defmodule PortalWeb.LiveTable do
           placeholder={"Search by " <> @filter.title}
           phx-debounce="300"
           class={[
-            "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded",
+            "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded-sm",
             "block w-full md:w-72 pl-10 p-2",
             "disabled:bg-neutral-50 disabled:text-neutral-500 disabled:border-neutral-300 disabled:shadow-none",
-            "focus:outline-none focus:border-1 focus:ring-0",
+            "focus:outline-hidden focus:border-1 focus:ring-0",
             @form[@filter.name].errors != [] && "border-rose-400"
           ]}
         />
@@ -272,10 +272,10 @@ defmodule PortalWeb.LiveTable do
           placeholder={"Search by " <> @filter.title}
           phx-debounce="300"
           class={[
-            "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded",
+            "bg-neutral-50 border border-neutral-300 text-neutral-900 text-sm rounded-sm",
             "block w-full md:w-72 pl-10 p-2",
             "disabled:bg-neutral-50 disabled:text-neutral-500 disabled:border-neutral-300 disabled:shadow-none",
-            "focus:outline-none focus:border-1 focus:ring-0",
+            "focus:outline-hidden focus:border-1 focus:ring-0",
             @form[@filter.name].errors != [] && "border-rose-400"
           ]}
         />
@@ -327,7 +327,7 @@ defmodule PortalWeb.LiveTable do
        when values != [] and length(values) < 5 do
     ~H"""
     <div class="flex items-center order-first">
-      <div class="flex rounded" role="group">
+      <div class="flex rounded-sm" role="group">
         <.intersperse_blocks>
           <:item>
             <label
@@ -400,6 +400,7 @@ defmodule PortalWeb.LiveTable do
   def paginator(assigns) do
     ~H"""
     <nav
+      :if={@rows_count > 0}
       class="flex flex-col md:flex-row justify-between items-start md:items-center space-y-3 md:space-y-0 p-4"
       aria-label="Table navigation"
     >
@@ -852,10 +853,9 @@ defmodule PortalWeb.LiveTable do
 
   defp put_filter_to_params(params, id, filter) do
     filter_params = flatten_filter(filter, "#{id}_filter", %{})
-    filter_keys = Map.keys(filter) |> Enum.map(&"#{id}_filter[#{&1}]")
 
     params
-    |> Map.drop(filter_keys)
+    |> Map.reject(fn {key, _} -> String.starts_with?(key, "#{id}_filter[") end)
     |> Map.merge(filter_params)
   end
 

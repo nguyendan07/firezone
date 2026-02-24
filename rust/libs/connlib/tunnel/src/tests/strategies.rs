@@ -81,6 +81,8 @@ pub(crate) fn latency(max: u64) -> impl Strategy<Value = Duration> {
 pub(crate) fn stub_portal() -> impl Strategy<Value = StubPortal> {
     collection::btree_set(site(), 2..=4)
         .prop_flat_map(|sites| {
+            let clients = collection::btree_set(client_id(), 2);
+
             let (internet_site, regular_sites) = create_internet_site(sites);
 
             let cidr_resources = collection::btree_set(
@@ -106,28 +108,66 @@ pub(crate) fn stub_portal() -> impl Strategy<Value = StubPortal> {
 
             let gateway_selector = any::<sample::Selector>();
 
+            let upstream_do53_servers = upstream_do53_servers();
+            let upstream_doh_servers = upstream_doh_servers();
+
             (
+                clients,
                 gateways_by_site,
                 cidr_resources,
                 dns_resources,
                 internet_resource,
                 gateway_selector,
+                upstream_do53_servers,
+                upstream_doh_servers,
             )
         })
-        .prop_map(
+        .prop_flat_map(
             |(
+                clients,
                 gateways_by_site,
                 cidr_resources,
                 dns_resources,
                 internet_resource,
                 gateway_selector,
+                upstream_do53_servers,
+                upstream_doh_servers,
+            )| {
+                (
+                    Just(clients),
+                    Just(gateways_by_site),
+                    Just(cidr_resources),
+                    search_domain(dns_resources.clone()),
+                    Just(dns_resources),
+                    Just(internet_resource),
+                    Just(gateway_selector),
+                    Just(upstream_do53_servers),
+                    Just(upstream_doh_servers),
+                )
+            },
+        )
+        .prop_map(
+            |(
+                clients,
+                gateways_by_site,
+                cidr_resources,
+                search_domain,
+                dns_resources,
+                internet_resource,
+                gateway_selector,
+                upstream_do53_servers,
+                upstream_doh_servers,
             )| {
                 StubPortal::new(
+                    clients,
                     gateways_by_site,
                     gateway_selector,
                     cidr_resources,
                     dns_resources,
                     internet_resource,
+                    search_domain,
+                    upstream_do53_servers,
+                    upstream_doh_servers,
                 )
             },
         )
@@ -176,6 +216,25 @@ pub(crate) fn tcp_resources(
     })
 }
 
+pub(crate) fn search_domain(
+    dns_resources: impl IntoIterator<Item = DnsResource>,
+) -> impl Strategy<Value = Option<DomainName>> {
+    let possible_search_domains = dns_resources
+        .into_iter()
+        .map(|r| {
+            // For `*.example.com`, we want to extract `example.com`.
+            // For `**.example.com`, we want to extract `example.com`.
+            // For `app.example.com`, we want to extract `example.com`.
+            // Therefore, we can always split by the first dot.
+            let (_, search_domain) = r.address.split_once(".").unwrap();
+
+            DomainName::vec_from_str(search_domain).unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    proptest::option::of(sample::select(possible_search_domains))
+}
+
 fn create_internet_site(mut sites: BTreeSet<Site>) -> (Site, BTreeSet<Site>) {
     // Rebrand the first site as the Internet site. That way, we can guarantee to always have one.
     let mut internet_site = sites.pop_first().unwrap();
@@ -193,7 +252,7 @@ pub(crate) fn relays(
 /// Sample a list of Do53 servers.
 ///
 /// We make sure to always have at least 1 IPv4 and 1 IPv6 DNS server.
-pub(crate) fn do53_servers() -> impl Strategy<Value = BTreeSet<IpAddr>> {
+pub(crate) fn do53_servers() -> impl Strategy<Value = BTreeSet<IpAddr>> + Clone {
     let ip4_dns_servers =
         collection::btree_set(non_reserved_ipv4().prop_map_into::<IpAddr>(), 1..4);
     let ip6_dns_servers =
@@ -205,7 +264,7 @@ pub(crate) fn do53_servers() -> impl Strategy<Value = BTreeSet<IpAddr>> {
     })
 }
 
-pub(crate) fn doh_server() -> impl Strategy<Value = DoHUrl> {
+pub(crate) fn doh_server() -> impl Strategy<Value = DoHUrl> + Clone {
     prop_oneof![
         Just(DoHUrl::quad9()),
         Just(DoHUrl::cloudflare()),
@@ -221,7 +280,7 @@ pub(crate) fn non_reserved_ip() -> impl Strategy<Value = IpAddr> {
     ]
 }
 
-fn non_reserved_ipv4() -> impl Strategy<Value = Ipv4Addr> {
+fn non_reserved_ipv4() -> impl Strategy<Value = Ipv4Addr> + Clone {
     let undesired_ranges = [
         Ipv4Network::new(Ipv4Addr::BROADCAST, 32).unwrap(),
         Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 32).unwrap(),
@@ -242,7 +301,7 @@ fn non_reserved_ipv4() -> impl Strategy<Value = Ipv4Addr> {
     })
 }
 
-fn non_reserved_ipv6() -> impl Strategy<Value = Ipv6Addr> {
+fn non_reserved_ipv6() -> impl Strategy<Value = Ipv6Addr> + Clone {
     let undesired_ranges = [
         Ipv6Network::new(Ipv6Addr::UNSPECIFIED, 32).unwrap(),
         DNS_SENTINELS_V6,
@@ -367,7 +426,7 @@ pub(crate) fn documentation_ip6s(subnet: u16) -> impl Strategy<Value = Ipv6Addr>
     (first..=last).prop_map(Ipv6Addr::from_bits)
 }
 
-pub(crate) fn system_dns_servers() -> impl Strategy<Value = Vec<IpAddr>> {
+pub(crate) fn system_dns_servers() -> impl Strategy<Value = Vec<IpAddr>> + Clone {
     do53_servers().prop_flat_map(|dns_servers| {
         let max = dns_servers.len();
 
@@ -375,7 +434,7 @@ pub(crate) fn system_dns_servers() -> impl Strategy<Value = Vec<IpAddr>> {
     })
 }
 
-pub(crate) fn upstream_do53_servers() -> impl Strategy<Value = Vec<UpstreamDo53>> {
+pub(crate) fn upstream_do53_servers() -> impl Strategy<Value = Vec<UpstreamDo53>> + Clone {
     do53_servers().prop_flat_map(|dns_servers| {
         let max = dns_servers.len();
 
@@ -384,7 +443,7 @@ pub(crate) fn upstream_do53_servers() -> impl Strategy<Value = Vec<UpstreamDo53>
     })
 }
 
-pub(crate) fn upstream_doh_servers() -> impl Strategy<Value = Vec<UpstreamDoH>> {
+pub(crate) fn upstream_doh_servers() -> impl Strategy<Value = Vec<UpstreamDoH>> + Clone {
     btree_set(doh_server(), 0..2)
         .prop_map(|servers| servers.into_iter().map(|url| UpstreamDoH { url }).collect())
 }

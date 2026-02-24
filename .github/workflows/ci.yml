@@ -28,13 +28,13 @@ jobs:
     outputs:
       jobs_to_run: ${{ steps.plan.outputs.jobs_to_run }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Plan jobs to run
         id: plan
         run: |
           set -e
 
-          jobs="static-analysis,elixir,rust,tauri,kotlin,swift,codeql,control-plane,data-plane,loadtest";
+          jobs="elixir,rust,tauri,kotlin,swift,codeql,control-plane,data-plane,loadtest";
 
           # For workflow_dispatch or workflow_call, run all jobs
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
@@ -84,7 +84,7 @@ jobs:
             exit 0;
           fi
 
-          jobs="static-analysis" # Always run static-analysis
+          jobs=""
 
           if grep -q '^rust/' changed_files.txt; then
             jobs="${jobs},rust,kotlin,swift,control-plane,data-plane,loadtest"
@@ -122,7 +122,6 @@ jobs:
         elixir,
         rust,
         tauri,
-        static-analysis,
         codeql,
         control-plane,
         data-plane,
@@ -132,7 +131,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Check if all jobs are successful
         run: |
           set -e
@@ -149,7 +148,7 @@ jobs:
     name: shell-tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: bats-core/bats-action@42fcc8700f773c075a16a90eb11674c0318ad507 # v3.0.1
         id: setup-bats
       - run: bats scripts/tests/bats
@@ -167,7 +166,7 @@ jobs:
     if: "!cancelled() && needs.kotlin.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   swift:
@@ -181,7 +180,7 @@ jobs:
     if: "!cancelled() && needs.swift.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   elixir:
@@ -195,7 +194,7 @@ jobs:
     if: "!cancelled() && needs.elixir.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   rust:
@@ -209,7 +208,7 @@ jobs:
     if: "!cancelled() && needs.rust.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   tauri:
@@ -223,21 +222,7 @@ jobs:
     if: "!cancelled() && needs.tauri.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-      - run: gh run cancel ${{ github.run_id }}
-
-  static-analysis:
-    needs: planner
-    if: contains(needs.planner.outputs.jobs_to_run, 'static-analysis')
-    uses: ./.github/workflows/_static-analysis.yml
-    secrets: inherit
-
-  monitor-static-analysis:
-    needs: [static-analysis]
-    if: "!cancelled() && needs.static-analysis.result == 'failure' && github.event_name == 'merge_group'"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   codeql:
@@ -251,7 +236,7 @@ jobs:
     if: "!cancelled() && needs.codeql.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   control-plane:
@@ -265,7 +250,7 @@ jobs:
     if: "!cancelled() && needs.control-plane.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   data-plane:
@@ -284,7 +269,7 @@ jobs:
     if: "!cancelled() && needs.data-plane.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   loadtest:
@@ -298,7 +283,7 @@ jobs:
     if: "!cancelled() && needs.loadtest.result == 'failure' && github.event_name == 'merge_group'"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: gh run cancel ${{ github.run_id }}
 
   integration-tests:

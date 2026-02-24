@@ -1,4 +1,6 @@
 import com.google.firebase.crashlytics.buildtools.gradle.CrashlyticsExtension
+import groovy.json.JsonSlurper
+import java.io.ByteArrayOutputStream
 
 plugins {
     id("org.mozilla.rust-android-gradle.rust-android")
@@ -6,7 +8,7 @@ plugins {
     id("com.google.dagger.hilt.android")
     id("com.google.gms.google-services")
     id("com.google.firebase.crashlytics")
-    id("com.diffplug.spotless") version "8.1.0"
+    id("com.diffplug.spotless") version "8.2.1"
     id("com.google.firebase.appdistribution")
     id("kotlin-parcelize")
     id("androidx.navigation.safeargs")
@@ -174,26 +176,26 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-livedata-ktx:2.10.0")
 
     // Navigation
-    implementation("androidx.navigation:navigation-fragment-ktx:2.9.6")
-    implementation("androidx.navigation:navigation-ui-ktx:2.9.6")
+    implementation("androidx.navigation:navigation-fragment-ktx:2.9.7")
+    implementation("androidx.navigation:navigation-ui-ktx:2.9.7")
 
     // Hilt
-    implementation("com.google.dagger:hilt-android:2.57.2")
+    implementation("com.google.dagger:hilt-android:2.58")
     implementation("androidx.browser:browser:1.9.0")
     implementation("com.google.firebase:firebase-installations")
-    implementation("com.google.android.gms:play-services-tasks:18.4.0")
+    implementation("com.google.android.gms:play-services-tasks:18.4.1")
     kapt("androidx.hilt:hilt-compiler:1.3.0")
-    kapt("com.google.dagger:hilt-android-compiler:2.57.2")
+    kapt("com.google.dagger:hilt-android-compiler:2.58")
     // Instrumented Tests
-    androidTestImplementation("com.google.dagger:hilt-android-testing:2.57.2")
-    kaptAndroidTest("com.google.dagger:hilt-android-compiler:2.57.2")
+    androidTestImplementation("com.google.dagger:hilt-android-testing:2.58")
+    kaptAndroidTest("com.google.dagger:hilt-android-compiler:2.58")
     androidTestImplementation("androidx.test:runner:1.7.0")
-    androidTestImplementation("androidx.navigation:navigation-testing:2.9.6")
+    androidTestImplementation("androidx.navigation:navigation-testing:2.9.7")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
     androidTestImplementation("androidx.test.espresso:espresso-contrib:3.7.0")
     androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
     // Unit Tests
-    testImplementation("com.google.dagger:hilt-android-testing:2.57.2")
+    testImplementation("com.google.dagger:hilt-android-testing:2.58")
 
     // Retrofit 2
     implementation("com.squareup.retrofit2:retrofit:3.0.0")
@@ -219,7 +221,7 @@ dependencies {
     androidTestImplementation("androidx.fragment:fragment-testing:1.8.9")
 
     // Import the BoM for the Firebase platform
-    implementation(platform("com.google.firebase:firebase-bom:34.7.0"))
+    implementation(platform("com.google.firebase:firebase-bom:34.8.0"))
 
     // Add the dependencies for the Crashlytics and Analytics libraries
     // When using the BoM, you don't specify versions in Firebase library dependencies
@@ -229,6 +231,33 @@ dependencies {
 
     // UniFFI
     implementation("net.java.dev.jna:jna:5.18.1@aar")
+}
+
+val rustDir = layout.projectDirectory.dir("../../../rust")
+
+// Resolve the cargo target directory from cargo metadata so we don't hardcode a path that may
+// be overridden by the user's ~/.cargo/config.toml (e.g. `target-dir`).
+val cargoTargetDir: String by lazy {
+    val metadataOutput = ByteArrayOutputStream()
+    project.exec {
+        workingDir = rustDir.asFile
+        commandLine("cargo", "metadata", "--format-version", "1")
+        standardOutput = metadataOutput
+    }
+    val metadataJson = metadataOutput.toString(Charsets.UTF_8.name())
+    val metadata =
+        try {
+            JsonSlurper().parseText(metadataJson) as Map<*, *>
+        } catch (e: Exception) {
+            throw GradleException(
+                "Failed to parse cargo metadata JSON. Ensure 'cargo' is installed and accessible. Error: ${e.message}",
+                e,
+            )
+        }
+    metadata["target_directory"] as? String
+        ?: throw GradleException(
+            "cargo metadata did not contain 'target_directory' field. Output was: ${metadataJson.take(500)}",
+        )
 }
 
 cargo {
@@ -249,7 +278,7 @@ cargo {
             "x86",
             "arm",
         )
-    targetDirectory = "../../../rust/target"
+    targetDirectory = cargoTargetDir
 }
 
 // Custom task to run uniffi-bindgen
@@ -269,12 +298,14 @@ val generateUniffiBindings =
                 "debug"
             }
 
-        val rustDir = layout.projectDirectory.dir("../../../rust")
+        val outDir = layout.buildDirectory.dir("generated/source/uniffi/$profile").get()
 
         // Hardcode the x86_64 target here, it doesn't matter which one we use, they are
         // all the same from the bindings PoV.
-        val input = rustDir.dir("target/x86_64-linux-android/$profile/libconnlib.so")
-        val outDir = layout.buildDirectory.dir("generated/source/uniffi/$profile").get()
+        val inputFile = file("$cargoTargetDir/x86_64-linux-android/$profile/libconnlib.so")
+
+        inputs.file(inputFile)
+        outputs.dir(outDir)
 
         doLast {
             // Execute uniffi-bindgen command from the rust directory
@@ -284,13 +315,10 @@ val generateUniffiBindings =
                 commandLine(
                     "sh",
                     "-c",
-                    "cd ${rustDir.asFile} && cargo run --bin uniffi-bindgen generate --library --language kotlin ${input.asFile} --out-dir ${outDir.asFile}",
+                    "cd ${rustDir.asFile} && cargo run --bin uniffi-bindgen generate --library --language kotlin $inputFile --out-dir ${outDir.asFile}",
                 )
             }
         }
-
-        inputs.file(input)
-        outputs.dir(outDir)
     }
 
 tasks.matching { it.name.matches(Regex("merge.*JniLibFolders")) }.configureEach {

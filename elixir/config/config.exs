@@ -16,6 +16,7 @@ config :portal, ecto_repos: [Portal.Repo]
 config :portal, generators: [binary_id: true]
 
 config :portal, sql_sandbox: false
+config :portal, replica_repo: Portal.Repo.Replica
 
 # Don't run manual migrations by default
 config :portal, run_manual_migrations: false
@@ -31,17 +32,30 @@ config :portal, Portal.Repo,
   queue_interval: 1000,
   migration_timestamps: [type: :timestamptz],
   migration_lock: :pg_advisory_lock,
-  start_apps_before_migration: [:ssl, :logger_json]
+  start_apps_before_migration: [:ssl, :logger_json],
+  parameters: [application_name: "portal"]
+
+config :portal, Portal.Repo.Replica,
+  hostname: "localhost",
+  username: "postgres",
+  password: "postgres",
+  database: "firezone_dev",
+  show_sensitive_data_on_connection_error: true,
+  pool_size: :erlang.system_info(:logical_processors_available) * 2,
+  queue_target: 500,
+  queue_interval: 1000,
+  parameters: [application_name: "replica"]
 
 config :portal, Portal.ChangeLogs.ReplicationConnection,
   replication_slot_name: "change_logs_slot",
   publication_name: "change_logs_publication",
+  region: "",
   enabled: true,
   connection_opts: [
     hostname: "localhost",
     port: 5432,
     ssl: false,
-    parameters: [],
+    parameters: [application_name: "change_logs"],
     username: "postgres",
     database: "firezone_dev",
     password: "postgres"
@@ -93,12 +107,13 @@ config :portal, Portal.ChangeLogs.ReplicationConnection,
 config :portal, Portal.Changes.ReplicationConnection,
   replication_slot_name: "changes_slot",
   publication_name: "changes_publication",
+  region: "",
   enabled: true,
   connection_opts: [
     hostname: "localhost",
     port: 5432,
     ssl: false,
-    parameters: [],
+    parameters: [application_name: "changes"],
     username: "postgres",
     database: "firezone_dev",
     password: "postgres"
@@ -161,12 +176,15 @@ config :portal, Portal.Entra.APIClient,
   client_id: System.get_env("ENTRA_SYNC_CLIENT_ID"),
   client_secret: System.get_env("ENTRA_SYNC_CLIENT_SECRET"),
   endpoint: "https://graph.microsoft.com",
-  token_base_url: "https://login.microsoftonline.com"
+  token_base_url: "https://login.microsoftonline.com",
+  # 15 minutes in milliseconds
+  req_opts: [receive_timeout: 900_000]
 
 config :portal, Portal.Google.APIClient,
   endpoint: "https://admin.googleapis.com",
   service_account_key: System.get_env("GOOGLE_SERVICE_ACCOUNT_KEY"),
-  token_endpoint: "https://oauth2.googleapis.com/token"
+  token_endpoint: "https://oauth2.googleapis.com/token",
+  req_opts: [receive_timeout: 60_000]
 
 config :portal, Portal.Google.AuthProvider,
   # Should match an external OAuth2 client in Google Cloud Console
@@ -180,6 +198,9 @@ config :portal, Portal.Okta.AuthProvider,
   # Should match an external OAuth2 client in Okta
   response_type: "code",
   scope: "openid email profile"
+
+# 15 minutes in milliseconds
+config :portal, Portal.Okta.APIClient, req_opts: [receive_timeout: 900_000]
 
 config :portal, Portal.Entra.AuthProvider,
   # Should match an external OAuth2 client in Azure
@@ -201,18 +222,18 @@ config :portal, Portal.Billing,
   enabled: true,
   secret_key: "sk_test_1111",
   webhook_signing_secret: "whsec_test_1111",
-  default_price_id: "price_1OkUIcADeNU9NGxvTNA4PPq6"
-
-config :portal, platform_adapter: nil
-
-config :portal, Portal.GoogleCloudPlatform,
-  metadata_endpoint_url: "http://metadata.google.internal/computeMetadata/v1",
-  aggregated_list_endpoint_url:
-    "https://compute.googleapis.com/compute/v1/projects/${project_id}/aggregated/instances",
-  cloud_metrics_endpoint_url:
-    "https://monitoring.googleapis.com/v3/projects/${project_id}/timeSeries",
-  sign_endpoint_url: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/",
-  cloud_storage_url: "https://storage.googleapis.com"
+  default_price_id: "price_1OkUIcADeNU9NGxvTNA4PPq6",
+  # Stripe sandbox/test mode product IDs
+  plan_product_ids: [
+    # Starter
+    "prod_PZdZiSBX1HdXO2",
+    # Team
+    "prod_PZdbLazRNU3Bdi",
+    # Enterprise
+    "prod_PZdb7NJhcdyjRV"
+  ],
+  # Adhoc Device
+  adhoc_device_product_id: "prod_TrPXF2LVHSJpMk"
 
 config :portal, Portal.ComponentVersions,
   firezone_releases_url: "https://www.firezone.dev/api/releases",
@@ -234,7 +255,6 @@ config :portal, :enabled_features,
   traffic_filters: true,
   sign_up: true,
   policy_conditions: true,
-  multi_site_resources: true,
   rest_api: true,
   internet_resource: true
 
@@ -245,6 +265,8 @@ config :portal, docker_registry: "ghcr.io/firezone"
 config :portal, outbound_email_adapter_configured?: false
 
 config :portal, relay_presence_topic: "presences:global_relays"
+
+config :portal, region: ""
 
 config :portal, web_external_url: "https://localhost:13443"
 
@@ -333,9 +355,6 @@ config :portal,
 config :openid_connect,
   finch_transport_opts: []
 
-config :ex_cldr,
-  default_locale: "en"
-
 config :mime, :types, %{
   "application/xml" => ["xml"]
 }
@@ -359,28 +378,27 @@ config :portal, Portal.Mailer,
   from_email: "test@firez.one"
 
 config :esbuild,
-  version: "0.25.3",
+  version: "0.25.4",
   portal: [
     args: [
       "js/app.js",
       "--bundle",
       "--loader:.woff2=file",
       "--loader:.woff=file",
-      "--target=es2017",
+      "--target=es2022",
       "--outdir=../priv/static/assets",
       "--external:/fonts/*",
       "--external:/images/*"
     ],
     cd: Path.expand("../assets", __DIR__),
-    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+    env: %{"NODE_PATH" => System.get_env("MIX_DEPS_PATH", Path.expand("../deps", __DIR__))}
   ]
 
 # Configure tailwind (the version is required)
 config :tailwind,
-  version: "3.4.17",
+  version: "4.1.12",
   portal: [
     args: [
-      "--config=tailwind.config.js",
       "--input=css/main.css",
       "--output=../priv/static/assets/main.css"
     ],

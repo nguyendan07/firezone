@@ -4,6 +4,7 @@
 //  LICENSE: Apache-2.0
 //
 
+import Combine
 import FirezoneKit
 import Sentry
 import SwiftUI
@@ -12,6 +13,7 @@ import SwiftUI
 struct FirezoneApp: App {
   #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @State private var connectingAnimationFrame: Int = 0
   #endif
 
   @StateObject var store: Store
@@ -41,14 +43,8 @@ struct FirezoneApp: App {
         "Welcome to Firezone",
         id: AppView.WindowDefinition.main.identifier
       ) {
-        if let menuBar = appDelegate.menuBar {
-          // menuBar will be initialized by this point
-          AppView()
-            .environmentObject(store)
-            .environmentObject(menuBar)
-        } else {
-          ProgressView("Loading...")
-        }
+        AppView()
+          .environmentObject(store)
       }
       .handlesExternalEvents(
         matching: [AppView.WindowDefinition.main.externalEventMatchString]
@@ -63,14 +59,65 @@ struct FirezoneApp: App {
       .handlesExternalEvents(
         matching: [AppView.WindowDefinition.settings.externalEventMatchString]
       )
+
+      MenuBarExtra {
+        MenuBarView()
+          .environmentObject(store)
+          .onReceive(connectingAnimationPublisher) { _ in
+            connectingAnimationFrame = (connectingAnimationFrame + 1) % 3
+          }
+          .onReceive(store.$menuBarOpenRequested) { requested in
+            if requested {
+              StatusItemIntrospection.statusItem()?.button?.performClick(nil)
+              store.menuBarOpenRequested = false
+            }
+          }
+      } label: {
+        Label {
+          Text("Firezone")
+        } icon: {
+          Image(menuBarIconName)
+            .renderingMode(.template)
+        }
+      }
+      .menuBarExtraStyle(.menu)
     #endif
   }
+
+  #if os(macOS)
+    var menuBarIconName: String {
+      switch store.vpnStatus {
+      case .connecting, .disconnecting, .reasserting:
+        return "MenuBarIconConnecting\(connectingAnimationFrame + 1)"
+      default:
+        return store.menuBarIconName
+      }
+    }
+
+    /// Publisher that emits timer ticks only when VPN is in a transitional state
+    private var connectingAnimationPublisher: AnyPublisher<Date, Never> {
+      Timer.publish(every: 0.25, on: .main, in: .common)
+        .autoconnect()
+        .filter { [store] _ in
+          switch store.vpnStatus {
+          case .connecting, .disconnecting, .reasserting:
+            return true
+          default:
+            return false
+          }
+        }
+        .eraseToAnyPublisher()
+    }
+  #endif
 }
 
 #if os(macOS)
   @MainActor
   final class AppDelegate: NSObject, NSApplicationDelegate {
-    var menuBar: MenuBar?
+    private static let softwareUpdateURL = URL(
+      string: "x-apple.systempreferences:com.apple.preferences.softwareupdate"
+    )!  // swiftlint:disable:this force_unwrapping
+
     var store: Store?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -83,7 +130,6 @@ struct FirezoneApp: App {
 
     func applicationDidFinishLaunching(_: Notification) {
       if let store {
-        menuBar = MenuBar(store: store)
         AppView.subscribeToGlobalEvents(store: store)
       }
 
@@ -122,7 +168,7 @@ struct FirezoneApp: App {
       guard runningApps.count > 1 else { return }
 
       for app in runningApps where app != NSRunningApplication.current {
-        DispatchQueue.main.async {
+        Task { @MainActor in
           let alert = NSAlert()
           alert.messageText = "Another Firezone Instance Detected"
           alert.informativeText = """
@@ -134,9 +180,7 @@ struct FirezoneApp: App {
           alert.alertStyle = .warning
           alert.addButton(withTitle: "OK")
 
-          // Show alert
-          SentrySDK.pauseAppHangTracking()
-          alert.runModal()
+          _ = await MacOSAlert.show(alert)
 
           // Exit this instance since we can't terminate the other one
           NSApp.terminate(nil)
@@ -153,29 +197,23 @@ struct FirezoneApp: App {
         return
       }
 
-      let alert = NSAlert()
-      alert.messageText = "macOS Update Required"
-      alert.informativeText =
-        """
-        macOS 15.0 contains a known issue that can prevent Firezone and other VPN
-        apps from functioning correctly. It's highly recommended you upgrade to
-        macOS 15.1 or higher.
-        """
-      alert.addButton(withTitle: "Open System Preferences")
-      alert.addButton(withTitle: "OK")
+      Task { @MainActor in
+        let alert = NSAlert()
+        alert.messageText = "macOS Update Required"
+        alert.informativeText =
+          """
+          macOS 15.0 contains a known issue that can prevent Firezone and other VPN
+          apps from functioning correctly. It's highly recommended you upgrade to
+          macOS 15.1 or higher.
+          """
+        alert.addButton(withTitle: "Open System Preferences")
+        alert.addButton(withTitle: "OK")
 
-      SentrySDK.pauseAppHangTracking()
-      defer { SentrySDK.resumeAppHangTracking() }
-      let response = alert.runModal()
+        let response = await MacOSAlert.show(alert)
 
-      if response == .alertFirstButtonReturn {
-        let softwareUpdateURL = URL(
-          string: "x-apple.systempreferences:com.apple.preferences.softwareupdate"
-        )
-
-        // Static URL literal is guaranteed valid
-        // swiftlint:disable:next force_unwrapping
-        Task { await NSWorkspace.shared.openAsync(softwareUpdateURL!) }
+        if response == .alertFirstButtonReturn {
+          await NSWorkspace.shared.openAsync(Self.softwareUpdateURL)
+        }
       }
     }
   }

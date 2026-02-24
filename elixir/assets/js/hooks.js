@@ -205,13 +205,25 @@ Hooks.CopyClipboard = {
         .writeText(textToCopy)
         .then(() => {
           // Show success state
-          if ($defaultMessage) $defaultMessage.classList.add("hidden");
-          if ($successMessage) $successMessage.classList.remove("hidden");
+          if ($defaultMessage) {
+            $defaultMessage.classList.add("hidden");
+            $defaultMessage.classList.remove("inline-flex");
+          }
+          if ($successMessage) {
+            $successMessage.classList.remove("hidden");
+            $successMessage.classList.add("inline-flex");
+          }
 
           // Reset after 2 seconds
           setTimeout(() => {
-            if ($defaultMessage) $defaultMessage.classList.remove("hidden");
-            if ($successMessage) $successMessage.classList.add("hidden");
+            if ($defaultMessage) {
+              $defaultMessage.classList.remove("hidden");
+              $defaultMessage.classList.add("inline-flex");
+            }
+            if ($successMessage) {
+              $successMessage.classList.remove("inline-flex");
+              $successMessage.classList.add("hidden");
+            }
           }, 2000);
         })
         .catch((err) => {
@@ -403,6 +415,19 @@ Hooks.Toast = {
       clearTimeout(this.timeout);
       this.timeout = null;
     }
+  },
+};
+
+Hooks.CloseWindow = {
+  mounted() {
+    const seconds = parseInt(this.el.dataset.seconds) || 5;
+
+    this.timer = setTimeout(() => {
+      window.close();
+    }, seconds * 1000);
+  },
+  destroyed() {
+    if (this.timer) clearTimeout(this.timer);
   },
 };
 

@@ -1,7 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use bin_shared::{DnsControlMethod, signals};
+
+use crate::ipc::SocketId;
 
 /// Cross-platform entry point for systemd / Windows services
 ///
@@ -11,15 +13,19 @@ pub fn run(log_dir: Option<PathBuf>, dns_control: DnsControlMethod) -> Result<()
     if !elevation_check()? {
         bail!("Tunnel service failed its elevation check, try running as admin / root");
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("connlib")
         .enable_all()
-        .build()?;
+        .build()
+        .context("Failed to create tokio runtime")?;
     let _guard = rt.enter();
     let mut signals = signals::Terminate::new()?;
 
     rt.block_on(super::ipc_listen(
         dns_control,
         &log_filter_reloader,
+        SocketId::Tunnel,
         &mut signals,
     ))
     .inspect_err(|e| tracing::error!("IPC service failed: {e:#}"))?;

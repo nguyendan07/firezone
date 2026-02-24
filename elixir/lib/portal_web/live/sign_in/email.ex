@@ -1,6 +1,6 @@
 defmodule PortalWeb.SignIn.Email do
   use PortalWeb, {:live_view, layout: {PortalWeb.Layouts, :public}}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(
         %{
@@ -10,9 +10,9 @@ defmodule PortalWeb.SignIn.Email do
         session,
         socket
       ) do
-    redirect_params = PortalWeb.Auth.take_sign_in_params(params)
+    redirect_params = PortalWeb.Authentication.take_sign_in_params(params)
 
-    account = DB.get_account_by_id_or_slug(account_id_or_slug)
+    account = Database.get_account_by_id_or_slug(account_id_or_slug)
 
     with %Portal.Account{} = account <- account,
          {:ok, email} <- Map.fetch(session, "email") do
@@ -65,7 +65,7 @@ defmodule PortalWeb.SignIn.Email do
       <div class="flex flex-col items-center justify-center px-6 py-8 mx-auto lg:py-0">
         <.hero_logo text={@account.name} />
 
-        <div class="w-full col-span-6 mx-auto bg-white rounded shadow md:mt-0 sm:max-w-lg xl:p-0">
+        <div class="w-full col-span-6 mx-auto bg-white rounded-sm shadow-sm md:mt-0 sm:max-w-lg xl:p-0">
           <div class="p-6 space-y-4 lg:space-y-6 sm:p-8">
             <h1 class="text-xl leading-tight tracking-tight text-neutral-900 sm:text-2xl">
               Please check your email
@@ -185,7 +185,7 @@ defmodule PortalWeb.SignIn.Email do
       class={[
         "w-1/2 m-2 inline-flex items-center justify-center py-2.5 px-5",
         "text-sm text-neutral-900 bg-white ",
-        "rounded border border-neutral-200",
+        "rounded-sm border border-neutral-200",
         "hover:text-neutral-900 hover:bg-neutral-100"
       ]}
     >
@@ -194,7 +194,7 @@ defmodule PortalWeb.SignIn.Email do
     """
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Account

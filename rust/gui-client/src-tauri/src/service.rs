@@ -8,29 +8,32 @@ use backoff::ExponentialBackoffBuilder;
 use bin_shared::{
     DnsControlMethod, DnsController, TunDeviceManager,
     device_id::{self, DeviceId},
-    device_info, known_dirs,
+    device_info,
     platform::{UdpSocketFactory, tcp_socket_factory},
     signals,
 };
-use connlib_model::ResourceView;
+use connlib_model::{ResourceId, ResourceView};
 use futures::{
-    Future as _, SinkExt as _, Stream, StreamExt,
+    Future as _, FutureExt, SinkExt as _, Stream, StreamExt,
     future::poll_fn,
     stream::{self, BoxStream},
     task::{Context, Poll},
 };
+use ip_network::IpNetwork;
 use logging::{FilterReloadHandle, err_with_src};
 use phoenix_channel::{DeviceInfo, LoginUrl, PhoenixChannel, get_user_agent};
 use secrecy::{ExposeSecret, SecretString};
 use std::{
     io::{self, Write},
     mem,
+    panic::AssertUnwindSafe,
     pin::pin,
     sync::Arc,
     time::Duration,
 };
 use telemetry::{Telemetry, analytics};
 use tokio::time::Instant;
+use tracing::Instrument as _;
 use url::Url;
 
 #[cfg(target_os = "linux")]
@@ -66,6 +69,8 @@ pub enum ClientMsg {
         release: String,
         account_slug: Option<String>,
     },
+    #[cfg(debug_assertions)]
+    Panic,
 }
 
 fn serialize_token<S>(token: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
@@ -86,6 +91,12 @@ pub enum ServerMsg {
     OnDisconnect {
         error_msg: String,
         is_authentication_error: bool,
+    },
+    AllGatewaysOffline {
+        resource_id: ResourceId,
+    },
+    GatewayVersionMismatch {
+        resource_id: ResourceId,
     },
     OnUpdateResources(Vec<ResourceView>),
     /// The Tunnel service is terminating, maybe due to a software update
@@ -109,12 +120,17 @@ impl ServerMsg {
 async fn ipc_listen(
     dns_control_method: DnsControlMethod,
     log_filter_reloader: &FilterReloadHandle,
+    socket_id: SocketId,
     signals: &mut signals::Terminate,
 ) -> Result<()> {
     // Create the device ID and Tunnel service config dir if needed
     // This also gives the GUI a safe place to put the log filter config
+    #[cfg(not(test))]
     let device_id =
         device_id::get_or_create_client().context("Failed to read / create device ID")?;
+
+    #[cfg(test)]
+    let device_id = device_id::DeviceId::test();
 
     // Fix up the group of the device ID file and directory so the GUI client can access it.
     #[cfg(target_os = "linux")]
@@ -133,7 +149,7 @@ async fn ipc_listen(
             .with_context(|| format!("Failed to change ownership of '{}'", dir.display()))?;
     }
 
-    let mut server = ipc::Server::new(SocketId::Tunnel)?;
+    let mut server = ipc::Server::new(socket_id)?;
     let mut dns_controller = DnsController { dns_control_method };
     loop {
         let mut handler_fut = pin!(Handler::new(
@@ -165,8 +181,21 @@ async fn ipc_listen(
                 continue;
             }
         };
-        if let HandlerOk::ServiceTerminating = handler.run(signals).await {
-            break;
+
+        match AssertUnwindSafe(handler.run(signals)).catch_unwind().await {
+            Ok(HandlerOk::ServiceTerminating) => break,
+            Ok(HandlerOk::ClientDisconnected | HandlerOk::Err) => {}
+            Err(e) => {
+                let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s
+                } else {
+                    "Unknown"
+                };
+
+                tracing::error!("Handler panicked: {panic_msg}")
+            }
         }
     }
     Ok(())
@@ -347,10 +376,9 @@ impl<'a> Handler<'a> {
                 Event::Ipc(msg) => {
                     let msg_variant = serde_variant::to_variant_name(&msg)
                         .expect("IPC messages should be enums, not structs or anything else.");
-                    let _entered =
-                        tracing::error_span!("handle_ipc_msg", msg = %msg_variant).entered();
-                    if let Err(error) = self.handle_ipc_msg(msg).await {
-                        tracing::error!("Error while handling IPC message from client: {error:#}");
+                    let span = tracing::error_span!("handle_ipc_msg", msg = %msg_variant);
+                    if let Err(error) = self.handle_ipc_msg(msg).instrument(span).await {
+                        tracing::error!(%msg_variant, "Error while handling IPC message from client: {error:#}");
                         continue;
                     }
                 }
@@ -406,20 +434,7 @@ impl<'a> Handler<'a> {
                             continue;
                         }
 
-                        let msg = match result {
-                            Ok(session) => {
-                                self.session = session;
-
-                                ServerMsg::connect_result(Ok(()))
-                            }
-                            Err(e) => ServerMsg::connect_result(Err(e)),
-                        };
-
-                        let _ = self
-                            .ipc_tx
-                            .send(&msg)
-                            .await
-                            .context("Failed to send `ConnectResult`");
+                        let _ = self.handle_connect_result(result).await;
                     }
                     Session::None => continue,
                 },
@@ -494,14 +509,25 @@ impl<'a> Handler<'a> {
             client_shared::Event::TunInterfaceUpdated(config) => {
                 self.session.transition_to_connected()?;
 
-                self.tun_device.set_ips(config.ip.v4, config.ip.v6).await?;
+                let tun_ip_stack = self.tun_device.set_ips(config.ip.v4, config.ip.v6).await?;
                 self.dns_controller
                     .set_dns(config.dns_by_sentinel.sentinel_ips(), config.search_domain)
                     .await?;
                 self.tun_device
-                    .set_routes(config.ipv4_routes, config.ipv6_routes)
+                    .set_routes(config.routes.into_iter().filter(|r| match r {
+                        IpNetwork::V4(_) => tun_ip_stack.supports_ipv4(),
+                        IpNetwork::V6(_) => tun_ip_stack.supports_ipv6(),
+                    }))
                     .await?;
                 self.dns_controller.flush()?;
+            }
+            client_shared::Event::AllGatewaysOffline { resource_id } => {
+                self.send_ipc(ServerMsg::AllGatewaysOffline { resource_id })
+                    .await?;
+            }
+            client_shared::Event::GatewayVersionMismatch { resource_id } => {
+                self.send_ipc(ServerMsg::GatewayVersionMismatch { resource_id })
+                    .await?;
             }
             client_shared::Event::ResourcesUpdated(resources) => {
                 // On every resources update, flush DNS to mitigate <https://github.com/firezone/firezone/issues/5052>
@@ -548,16 +574,7 @@ impl<'a> Handler<'a> {
                     return Ok(());
                 }
 
-                let msg = match result {
-                    Ok(session) => {
-                        self.session = session;
-
-                        ServerMsg::connect_result(Ok(()))
-                    }
-                    Err(e) => ServerMsg::connect_result(Err(e)),
-                };
-
-                self.send_ipc(msg).await?;
+                self.handle_connect_result(result).await?;
             }
             ClientMsg::Disconnect => {
                 self.session = Session::None;
@@ -619,6 +636,8 @@ impl<'a> Handler<'a> {
                     }
                 }
             }
+            #[cfg(debug_assertions)]
+            ClientMsg::Panic => panic!("Explicit panic"),
         }
         Ok(())
     }
@@ -686,6 +705,26 @@ impl<'a> Handler<'a> {
         })
     }
 
+    async fn handle_connect_result(&mut self, result: Result<Session>) -> Result<()> {
+        let msg = match result {
+            Ok(session) => {
+                self.session = session;
+                tracing::debug!("Created new session");
+
+                ServerMsg::connect_result(Ok(()))
+            }
+            Err(e) => {
+                tracing::debug!("Failed to create new session: {e:#}");
+
+                ServerMsg::connect_result(Err(e))
+            }
+        };
+
+        self.send_ipc(msg).await?;
+
+        Ok(())
+    }
+
     async fn send_ipc(&mut self, msg: ServerMsg) -> Result<()> {
         self.ipc_tx
             .send(&msg)
@@ -706,13 +745,20 @@ pub fn run_debug(dns_control: DnsControlMethod) -> Result<()> {
     if !elevation_check()? {
         bail!("Tunnel service failed its elevation check, try running as admin / root");
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("connlib")
         .enable_all()
         .build()?;
     let _guard = rt.enter();
     let mut signals = signals::Terminate::new()?;
 
-    rt.block_on(ipc_listen(dns_control, &log_filter_reloader, &mut signals))
+    rt.block_on(ipc_listen(
+        dns_control,
+        &log_filter_reloader,
+        SocketId::Tunnel,
+        &mut signals,
+    ))
 }
 
 /// Listen for exactly one connection from a GUI, then exit
@@ -789,4 +835,44 @@ async fn new_network_notifier() -> Result<impl Stream<Item = Result<()>>> {
 
         Ok(Some(((), worker)))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panic_inside_handler_doesnt_interrupt_service() {
+        let _guard = logging::test("debug");
+
+        let id = SocketId::Test(rand::random());
+
+        let handle = tokio::spawn(async move {
+            let (_, log_filter_reloader) = logging::try_filter::<()>("info").unwrap();
+            let mut signals = signals::Terminate::new().unwrap();
+
+            ipc_listen(
+                DnsControlMethod::default(),
+                &log_filter_reloader,
+                id,
+                &mut signals,
+            )
+            .await
+        });
+
+        let (_, mut tx) = ipc::connect::<ServerMsg, ClientMsg>(id, ipc::ConnectOptions::default())
+            .await
+            .unwrap();
+
+        tx.send(&ClientMsg::Panic).await.unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap_err(); // We want to timeout because that means the task is still running.
+
+        // We can reconnect another instance.
+        let (_, _) = ipc::connect::<ServerMsg, ClientMsg>(id, ipc::ConnectOptions::default())
+            .await
+            .unwrap();
+    }
 }

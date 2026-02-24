@@ -1,9 +1,9 @@
 defmodule PortalWeb.Sites.Gateways.Index do
   use PortalWeb, :live_view
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(%{"id" => id}, _session, socket) do
-    site = DB.get_site!(id, socket.assigns.subject)
+    site = Database.get_site!(id, socket.assigns.subject)
 
     if connected?(socket) do
       :ok = Portal.Presence.Gateways.Site.subscribe(site.id)
@@ -16,13 +16,12 @@ defmodule PortalWeb.Sites.Gateways.Index do
         site: site
       )
       |> assign_live_table("gateways",
-        query_module: DB,
+        query_module: Database,
         enforce_filters: [
           {:site_id, site.id}
         ],
         sortable_fields: [
-          {:gateways, :name},
-          {:gateways, :last_seen_at}
+          {:gateways, :name}
         ],
         callback: &handle_gateways_update!/2
       )
@@ -36,9 +35,9 @@ defmodule PortalWeb.Sites.Gateways.Index do
   end
 
   def handle_gateways_update!(socket, list_opts) do
-    list_opts = Keyword.put(list_opts, :preload, [:online?])
+    list_opts = Keyword.put(list_opts, :preload, [:online?, :last_seen])
 
-    with {:ok, gateways, metadata} <- DB.list_gateways(socket.assigns.subject, list_opts) do
+    with {:ok, gateways, metadata} <- Database.list_gateways(socket.assigns.subject, list_opts) do
       {:ok,
        assign(socket,
          gateways: gateways,
@@ -88,11 +87,11 @@ defmodule PortalWeb.Sites.Gateways.Index do
           </:col>
           <:col :let={gateway} label="remote ip">
             <code>
-              {gateway.last_seen_remote_ip}
+              {gateway.latest_session && gateway.latest_session.remote_ip}
             </code>
           </:col>
           <:col :let={gateway} label="version">
-            {gateway.last_seen_version}
+            {gateway.latest_session && gateway.latest_session.version}
           </:col>
           <:col :let={gateway} label="status">
             <.connection_status schema={gateway} />
@@ -137,35 +136,55 @@ defmodule PortalWeb.Sites.Gateways.Index do
   def handle_event(event, params, socket) when event in ["paginate", "order_by", "filter"],
     do: handle_live_table_event(event, params, socket)
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
-    alias Portal.{Safe, Gateway}
+    alias Portal.{Safe, Gateway, GatewaySession}
 
     def get_site!(id, subject) do
       from(s in Portal.Site, as: :sites)
       |> where([sites: s], s.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def list_gateways(subject, opts \\ []) do
       from(g in Gateway, as: :gateways)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
     def cursor_fields do
       [
         {:gateways, :asc, :name},
-        {:gateways, :asc, :last_seen_at},
         {:gateways, :asc, :id}
       ]
     end
 
     def preloads do
       [
-        online?: &Portal.Presence.Gateways.preload_gateways_presence/1
+        online?: &Portal.Presence.Gateways.preload_gateways_presence/1,
+        last_seen: &preload_latest_sessions/1
       ]
+    end
+
+    defp preload_latest_sessions(gateways) do
+      account_ids = gateways |> Enum.map(& &1.account_id) |> Enum.uniq()
+      gateway_ids = Enum.map(gateways, & &1.id)
+
+      sessions_by_gateway_id =
+        from(s in GatewaySession,
+          where: s.account_id in ^account_ids,
+          where: s.gateway_id in ^gateway_ids,
+          distinct: s.gateway_id,
+          order_by: [asc: s.gateway_id, desc: s.inserted_at]
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.all()
+        |> Map.new(&{&1.gateway_id, &1})
+
+      Enum.map(gateways, fn gateway ->
+        %{gateway | latest_session: Map.get(sessions_by_gateway_id, gateway.id)}
+      end)
     end
 
     def filters do

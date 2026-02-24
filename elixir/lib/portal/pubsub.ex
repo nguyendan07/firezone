@@ -44,7 +44,7 @@ defmodule Portal.PubSub do
     Phoenix.PubSub.unsubscribe(__MODULE__, topic)
   end
 
-  defmodule Account do
+  defmodule Changes do
     def subscribe(account_id) do
       account_id
       |> topic()
@@ -52,13 +52,33 @@ defmodule Portal.PubSub do
     end
 
     def broadcast(account_id, payload) do
-      account_id
-      |> topic()
-      |> Portal.PubSub.broadcast(payload)
+      topic = topic(account_id)
+      region = Portal.Config.get_env(:portal, :region, "")
+
+      for node <- target_nodes(region) do
+        Phoenix.PubSub.direct_broadcast!(node, Portal.PubSub, topic, payload)
+      end
+
+      :ok
     end
 
     defp topic(account_id) do
       Atom.to_string(__MODULE__) <> ":" <> account_id
+    end
+
+    # In dev / test region we don't have a cluster / region; send to self
+    defp target_nodes(""), do: [Node.self()]
+
+    # Node names: portal-{region}-{type}-{index}-{hash}@{ip}
+    defp target_nodes(region) do
+      web_prefix = "portal-" <> region <> "-web"
+      api_prefix = "portal-" <> region <> "-api"
+
+      Node.list()
+      |> Enum.filter(fn node ->
+        name = Atom.to_string(node)
+        String.starts_with?(name, web_prefix) or String.starts_with?(name, api_prefix)
+      end)
     end
   end
 end

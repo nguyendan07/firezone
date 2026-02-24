@@ -1,11 +1,11 @@
 defmodule PortalWeb.Policies.Index do
   use PortalWeb, :live_view
   alias Portal.{Changes.Change, PubSub}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      :ok = PubSub.Account.subscribe(socket.assigns.account.id)
+      :ok = PubSub.Changes.subscribe(socket.assigns.account.id)
     end
 
     socket =
@@ -13,7 +13,7 @@ defmodule PortalWeb.Policies.Index do
       |> assign(stale: false)
       |> assign(page_title: "Policies")
       |> assign_live_table("policies",
-        query_module: DB,
+        query_module: Database,
         sortable_fields: [],
         hide_filters: [
           :group_id,
@@ -30,7 +30,7 @@ defmodule PortalWeb.Policies.Index do
 
   def handle_params(%{"policies_filter" => %{"site_id" => site_id}} = params, uri, socket) do
     socket = handle_live_tables_params(socket, params, uri)
-    filter_site = DB.get_site(site_id, socket.assigns.subject)
+    filter_site = Database.get_site(site_id, socket.assigns.subject)
 
     {:noreply,
      assign(socket, filter_site: filter_site, filter_resource: nil, return_to: uri_path(uri))}
@@ -38,7 +38,7 @@ defmodule PortalWeb.Policies.Index do
 
   def handle_params(%{"policies_filter" => %{"resource_id" => resource_id}} = params, uri, socket) do
     socket = handle_live_tables_params(socket, params, uri)
-    filter_resource = DB.get_resource(resource_id, socket.assigns.subject)
+    filter_resource = Database.get_resource(resource_id, socket.assigns.subject)
 
     {:noreply,
      assign(socket, filter_site: nil, filter_resource: filter_resource, return_to: uri_path(uri))}
@@ -55,9 +55,9 @@ defmodule PortalWeb.Policies.Index do
   end
 
   def handle_policies_update!(socket, list_opts) do
-    list_opts = Keyword.put(list_opts, :preload, group: [], resource: [])
+    list_opts = Keyword.put(list_opts, :preload, group: [:directory], resource: [])
 
-    with {:ok, policies, metadata} <- DB.list_policies(socket.assigns.subject, list_opts) do
+    with {:ok, policies, metadata} <- Database.list_policies(socket.assigns.subject, list_opts) do
       {:ok,
        assign(socket,
          policies: policies,
@@ -116,7 +116,11 @@ defmodule PortalWeb.Policies.Index do
             </.link>
           </:col>
           <:col :let={policy} label="group" class="w-3/12">
-            <.group_badge account={@account} group={policy.group} return_to={@return_to} />
+            <.group_badge
+              account={@account}
+              group={policy.group}
+              return_to={@return_to}
+            />
           </:col>
           <:col :let={policy} label="resource" class="w-2/12">
             <.link class={link_style()} navigate={~p"/#{@account}/resources/#{policy.resource_id}"}>
@@ -125,11 +129,11 @@ defmodule PortalWeb.Policies.Index do
           </:col>
           <:col :let={policy} label="status">
             <%= if is_nil(policy.disabled_at) do %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-green-100 text-green-800">
                 Active
               </span>
             <% else %>
-              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+              <span class="inline-flex items-center px-2 py-0.5 rounded-sm text-xs font-medium bg-red-100 text-red-800">
                 Disabled
               </span>
             <% end %>
@@ -167,7 +171,7 @@ defmodule PortalWeb.Policies.Index do
     {:noreply, socket}
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Portal.Repo.Query
     alias Portal.{Safe, Policy, Site, Resource}
@@ -175,20 +179,20 @@ defmodule PortalWeb.Policies.Index do
     def get_site(id, subject) do
       from(s in Site, as: :sites)
       |> where([sites: s], s.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def get_resource(id, subject) do
       from(r in Resource, as: :resources)
       |> where([resources: r], r.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def list_policies(subject, opts \\ []) do
       from(p in Policy, as: :policies)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -297,7 +301,7 @@ defmodule PortalWeb.Policies.Index do
       if has_named_binding?(queryable, :group) do
         queryable
       else
-        join(queryable, :inner, [policies: p], g in assoc(p, :group), as: :group)
+        join(queryable, :left, [policies: p], g in assoc(p, :group), as: :group)
       end
     end
 

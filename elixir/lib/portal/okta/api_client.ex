@@ -110,7 +110,11 @@ defmodule Portal.Okta.APIClient do
   @doc """
   Makes test API calls to verify the access token works.
   """
-  @spec test_connection(t(), String.t()) :: :ok | {:error, Req.Response.t()}
+  @spec test_connection(t(), String.t()) ::
+          :ok
+          | {:error, Req.Response.t()}
+          | {:error, :empty, :apps | :users | :groups}
+          | {:error, Exception.t()}
   def test_connection(client, access_token) do
     with :ok <- test_apps(client, access_token),
          :ok <- test_users(client, access_token),
@@ -136,11 +140,11 @@ defmodule Portal.Okta.APIClient do
       "client_assertion" => client_assertion
     }
 
-    req_options =
+    req_opts =
       [base_url: client.base_url]
-      |> Keyword.merge(fetch_config(:req_options) || [])
+      |> Keyword.merge(req_opts())
 
-    Req.new(req_options)
+    Req.new(req_opts)
     |> Req.merge(url: "/oauth2/v1/introspect")
     |> Req.Request.put_header("content-type", "application/x-www-form-urlencoded")
     |> Req.post(form: form_data)
@@ -158,7 +162,7 @@ defmodule Portal.Okta.APIClient do
 
   Returns all apps in a list. For large result sets, consider using stream_apps/2 instead.
   """
-  @spec list_apps(t(), String.t()) :: {:ok, [map()]} | {:error, String.t()}
+  @spec list_apps(t(), String.t()) :: {:ok, [map()]} | {:error, Req.Response.t()}
   def list_apps(client, access_token) do
     stream_apps(client, access_token) |> collect_stream_results()
   end
@@ -266,11 +270,11 @@ defmodule Portal.Okta.APIClient do
   end
 
   defp new_request(%APIClient{} = client, access_token, nonce \\ nil) do
-    req_options =
+    req_opts =
       [base_url: client.base_url]
-      |> Keyword.merge(fetch_config(:req_options) || [])
+      |> Keyword.merge(req_opts())
 
-    Req.new(req_options)
+    Req.new(req_opts)
     |> ReqDPoP.attach(
       sign_fun: &dpop_sign(&1, client.private_key, client.kid),
       access_token: access_token,
@@ -280,7 +284,7 @@ defmodule Portal.Okta.APIClient do
 
   # Collects a stream of {:ok, item} or {:error, reason} tuples into a result.
   # Returns {:ok, [items]} if all successful, or {:error, reason} on first error.
-  @spec collect_stream_results(Enumerable.t()) :: {:ok, [term()]} | {:error, String.t()}
+  @spec collect_stream_results(Enumerable.t()) :: {:ok, [term()]} | {:error, Req.Response.t()}
   defp collect_stream_results(stream) do
     stream
     |> Enum.reduce_while({:ok, []}, fn
@@ -331,20 +335,17 @@ defmodule Portal.Okta.APIClient do
                 {ok_items, :halt}
               end
 
-            %{status: 401} ->
-              {[{:error, "Authentication Error"}], :halt}
+            %{status: status} = response when status in [401, 403] ->
+              {[{:error, response}], :halt}
 
-            %{status: 403} ->
-              {[{:error, "Authorization Error"}], :halt}
-
-            %{status: status, headers: headers, body: body} ->
+            %{status: status, headers: headers, body: body} = response ->
               Logger.warning("Unexpected response while making Okta API request",
                 status: status,
                 headers: inspect(headers),
                 response: inspect(body)
               )
 
-              {[{:error, "Unexpected response with status #{status}"}], :halt}
+              {[{:error, response}], :halt}
           end
       end,
       # After function - (nothing needed here)
@@ -398,18 +399,21 @@ defmodule Portal.Okta.APIClient do
     end
   end
 
-  defp test_endpoint(client, token, endpoint, opts) do
+  defp test_endpoint(client, token, endpoint, resource, opts) do
     headers = Keyword.get(opts, :headers, [])
     params = Keyword.get(opts, :params, [])
 
     new_request(client, token)
     |> Req.merge(url: endpoint, headers: headers, params: params)
-    |> Req.get!()
+    |> Req.get()
     |> case do
-      %{status: 200, body: [_result]} ->
+      {:ok, %{status: 200, body: [_result]}} ->
         :ok
 
-      resp ->
+      {:ok, %{status: 200, body: []}} ->
+        {:error, :empty, resource}
+
+      {:ok, resp} ->
         Logger.warning(
           "Error during Okta endpoint test",
           endpoint: endpoint,
@@ -419,15 +423,18 @@ defmodule Portal.Okta.APIClient do
         )
 
         {:error, resp}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   defp test_apps(client, token) do
-    test_endpoint(client, token, @apps_path, params: [limit: 1])
+    test_endpoint(client, token, @apps_path, :apps, params: [limit: 1])
   end
 
   defp test_users(client, token) do
-    test_endpoint(client, token, @users_path,
+    test_endpoint(client, token, @users_path, :users,
       headers: [
         {"Content-Type", "application/json; okta-response=omitCredentials,omitCredentialsLinks"}
       ],
@@ -436,12 +443,12 @@ defmodule Portal.Okta.APIClient do
   end
 
   defp test_groups(client, token) do
-    test_endpoint(client, token, @groups_path, params: [limit: 1])
+    test_endpoint(client, token, @groups_path, :groups, params: [limit: 1])
   end
 
-  defp fetch_config(key) do
+  defp req_opts do
     Portal.Config.fetch_env!(:portal, __MODULE__)
-    |> Keyword.get(key)
+    |> Keyword.fetch!(:req_opts)
   end
 end
 
@@ -452,11 +459,18 @@ defmodule Portal.Okta.ReqDPoP do
 
   @spec attach(Req.Request.t(), keyword()) :: Req.Request.t()
   def attach(%Req.Request{} = req, opts) do
-    req
-    |> Req.Request.register_options([:sign_fun, :nonce, :access_token])
-    |> Req.Request.merge_options(opts)
-    |> wrap_adapter()
-    |> Req.Request.merge_options(retry: &retry/2)
+    req =
+      req
+      |> Req.Request.register_options([:sign_fun, :nonce, :access_token])
+      |> Req.Request.merge_options(opts)
+      |> wrap_adapter()
+
+    # Only set custom retry if not already explicitly set (allows tests to disable retries)
+    if is_nil(req.options[:retry]) do
+      Req.Request.merge_options(req, retry: &retry/2)
+    else
+      req
+    end
   end
 
   defp retry(%Req.Request{} = req, %Req.Response{} = resp) do

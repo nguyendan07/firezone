@@ -4,17 +4,15 @@ defmodule PortalWeb.EmailOTPController do
   """
   use PortalWeb, :controller
 
-  alias Portal.Auth
-  alias Portal.EmailOTP
-  alias __MODULE__.DB
+  alias Portal.Authentication
+  alias __MODULE__.Database
   alias PortalWeb.Session.Redirector
 
   require Logger
 
-  @constant_execution_time Application.compile_env(:portal, :constant_execution_time, 2000)
+  @constant_execution_time Application.compile_env(:portal, :constant_execution_time, 3000)
 
-  action_fallback PortalWeb.FallbackController
-
+  @spec sign_in(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def sign_in(
         conn,
         %{
@@ -24,8 +22,8 @@ defmodule PortalWeb.EmailOTPController do
         } = params
       )
       when is_binary(email) do
-    with {:ok, account} <- DB.fetch_account_by_id_or_slug(account_id_or_slug),
-         {:ok, _provider} <- DB.fetch_provider_by_id(account, auth_provider_id) do
+    with {:ok, account} <- Database.fetch_account_by_id_or_slug(account_id_or_slug),
+         {:ok, _provider} <- Database.fetch_provider_by_id(account, auth_provider_id) do
       conn = maybe_send_email_otp(conn, account, email, params, auth_provider_id)
 
       redirect_params = sanitize(params)
@@ -46,6 +44,7 @@ defmodule PortalWeb.EmailOTPController do
     handle_error(conn, :invalid_params, params)
   end
 
+  @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, %{"secret" => entered_code} = params) do
     result =
       execute_with_constant_time(
@@ -66,10 +65,16 @@ defmodule PortalWeb.EmailOTPController do
     context_type = context_type(params)
 
     with {:ok, actor_id, passcode_id, email} <- fetch_state(conn),
-         {:ok, account} <- DB.fetch_account_by_id_or_slug(account_id_or_slug),
-         {:ok, provider} <- DB.fetch_provider_by_id(account, auth_provider_id),
+         {:ok, account} <- Database.fetch_account_by_id_or_slug(account_id_or_slug),
+         {:ok, provider} <- Database.fetch_provider_by_id(account, auth_provider_id),
+         false <- client_sign_in_restricted?(account, context_type),
          {:ok, passcode} <-
-           Auth.verify_one_time_passcode(account.id, actor_id, passcode_id, entered_code),
+           Authentication.verify_one_time_passcode(
+             account.id,
+             actor_id,
+             passcode_id,
+             entered_code
+           ),
          :ok <- check_admin(passcode.actor, context_type),
          {:ok, session_or_token} <-
            create_session_or_token(conn, passcode.actor, provider, params) do
@@ -108,8 +113,8 @@ defmodule PortalWeb.EmailOTPController do
     {actor_id, passcode_id, error} =
       execute_with_constant_time(
         fn ->
-          with {:ok, actor} <- DB.fetch_actor_by_email(account, email),
-               {:ok, otp} <- Auth.create_one_time_passcode(account, actor),
+          with {:ok, actor} <- Database.fetch_actor_by_email(account, email),
+               {:ok, otp} <- Authentication.create_one_time_passcode(account, actor),
                {:ok, _} <- send_email_otp(conn, actor, otp.code, auth_provider_id, params) do
             {actor.id, otp.id, nil}
           else
@@ -163,15 +168,26 @@ defmodule PortalWeb.EmailOTPController do
   end
 
   defp check_admin(%Portal.Actor{type: :account_admin_user}, _context_type), do: :ok
-  defp check_admin(%Portal.Actor{type: :account_user}, :client), do: :ok
+
+  defp check_admin(%Portal.Actor{type: :account_user}, t)
+       when t in [:gui_client, :headless_client],
+       do: :ok
+
   defp check_admin(_actor, _context_type), do: {:error, :not_admin}
+
+  defp client_sign_in_restricted?(account, context_type)
+       when context_type in [:gui_client, :headless_client] do
+    Portal.Billing.client_sign_in_restricted?(account)
+  end
+
+  defp client_sign_in_restricted?(_account, _context_type), do: false
 
   defp create_session_or_token(conn, actor, provider, params) do
     user_agent = conn.assigns[:user_agent]
     remote_ip = conn.remote_ip
     type = context_type(params)
     headers = conn.req_headers
-    context = Portal.Auth.Context.build(remote_ip, user_agent, headers, type)
+    context = Portal.Authentication.Context.build(remote_ip, user_agent, headers, type)
 
     # Get the provider schema module to access default values
     schema = provider.__struct__
@@ -179,7 +195,10 @@ defmodule PortalWeb.EmailOTPController do
     # Determine session lifetime based on context type
     session_lifetime_secs =
       case type do
-        :client ->
+        :gui_client ->
+          provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
+
+        :headless_client ->
           provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
 
         :portal ->
@@ -190,14 +209,14 @@ defmodule PortalWeb.EmailOTPController do
 
     case type do
       :portal ->
-        Auth.create_portal_session(
+        Authentication.create_portal_session(
           actor,
           provider.id,
           context,
           expires_at
         )
 
-      :client ->
+      :gui_client ->
         attrs = %{
           type: :client,
           secret_nonce: params["nonce"],
@@ -208,7 +227,20 @@ defmodule PortalWeb.EmailOTPController do
           expires_at: expires_at
         }
 
-        Auth.create_gui_client_token(attrs)
+        Authentication.create_gui_client_token(attrs)
+
+      :headless_client ->
+        attrs = %{
+          type: :client,
+          secret_nonce: "",
+          secret_fragment: Portal.Crypto.random_token(32, encoder: :hex32),
+          account_id: actor.account_id,
+          actor_id: actor.id,
+          auth_provider_id: provider.id,
+          expires_at: expires_at
+        }
+
+        Authentication.create_gui_client_token(attrs)
     end
   end
 
@@ -220,14 +252,26 @@ defmodule PortalWeb.EmailOTPController do
     |> Redirector.portal_signed_in(account, params)
   end
 
-  # Context: :client
+  # Context: :gui_client
   # Store a cookie and redirect to client handler which redirects to the final URL based on platform
-  defp signed_in(conn, :client, account, actor, token, params) do
-    Redirector.client_signed_in(
+  defp signed_in(conn, :gui_client, account, actor, token, params) do
+    Redirector.gui_client_signed_in(
       conn,
       account,
       actor.name,
       actor.email,
+      token,
+      params["state"]
+    )
+  end
+
+  # Context: :headless_client
+  # Show the token to the user to copy manually
+  defp signed_in(conn, :headless_client, account, actor, token, params) do
+    Redirector.headless_client_signed_in(
+      conn,
+      account,
+      actor.name,
       token,
       params["state"]
     )
@@ -247,6 +291,15 @@ defmodule PortalWeb.EmailOTPController do
 
   defp handle_error(conn, {:error, :not_admin}, params) do
     error = "This action requires admin privileges."
+    path = ~p"/#{params["account_id_or_slug"]}"
+    redirect_for_error(conn, error, path)
+  end
+
+  defp handle_error(conn, true, params) do
+    error =
+      "This account is temporarily suspended from client authentication " <>
+        "due to exceeding billing limits. Please contact your administrator to add more seats."
+
     path = ~p"/#{params["account_id_or_slug"]}"
     redirect_for_error(conn, error, path)
   end
@@ -292,7 +345,9 @@ defmodule PortalWeb.EmailOTPController do
     Map.take(params, ["as", "redirect_to", "state", "nonce"])
   end
 
-  defp context_type(%{"as" => "client"}), do: :client
+  defp context_type(%{"as" => "client"}), do: :gui_client
+  defp context_type(%{"as" => "gui-client"}), do: :gui_client
+  defp context_type(%{"as" => "headless-client"}), do: :headless_client
   defp context_type(_), do: :portal
 
   # Executes a callback in constant time to prevent timing attacks.
@@ -325,7 +380,7 @@ defmodule PortalWeb.EmailOTPController do
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.{Account, Actor, EmailOTP}
@@ -337,7 +392,7 @@ defmodule PortalWeb.EmailOTPController do
           else: from(a in Account, where: a.slug == ^id_or_slug)
 
       query
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
       |> handle_nil()
     end
@@ -346,7 +401,7 @@ defmodule PortalWeb.EmailOTPController do
       from(p in EmailOTP.AuthProvider,
         where: p.account_id == ^account.id and p.id == ^id and not p.is_disabled
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
       |> handle_nil()
     end
@@ -360,7 +415,7 @@ defmodule PortalWeb.EmailOTPController do
             a.allow_email_otp_sign_in == true
       )
       |> preload(:account)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
       |> handle_nil()
     end

@@ -64,7 +64,7 @@ export default function Page() {
                 <button
                   type="button"
                   className="bg-neutral-100 w-full text-lg px-5 py-2.5 md:text-sm md:px-3 md:py-2.5 lg:text-lg lg:px-5 lg:py-2.5 border
-                  border-1 border-neutral-500  hover:brightness-90 font-semibold tracking-tight rounded-full text-neutral-950 duration-50 transition transform"
+                  border border-neutral-500  hover:brightness-90 font-semibold tracking-tight rounded-full text-neutral-950 duration-50 transition transform"
                 >
                   Sign up
                 </button>
@@ -78,43 +78,43 @@ export default function Page() {
               className="text-sm md:text-md font-medium space-y-4"
             >
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Up to 6 users
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Access your homelab or VPC from anywhere
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Native clients for Windows, Linux, macOS, iOS, Android
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Authenticate via email or OpenID Connect (OIDC)
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Load balancing and automatic failover
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   No firewall configuration required
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Community Support
                 </span>
@@ -173,48 +173,48 @@ export default function Page() {
               className="text-sm md:text-md font-medium space-y-4"
             >
               <li className="flex space-x-2.5">
-                <FaCircleCheck className="flex-shrink-0 w-4 h-4 text-accent-450" />
+                <FaCircleCheck className="shrink-0 w-4 h-4 text-accent-450" />
                 <span className="leading-tight font-bold text-neutral-900 ">
                   Everything in Starter
                 </span>
               </li>
               <div className="flex w-full gap-3 items-center">
-                <div className="h-[1px] w-full bg-neutral-300" />
+                <div className="h-px w-full bg-neutral-300" />
                 <p className="uppercase text-neutral-900 font-medium">plus</p>
-                <div className="h-[1px] w-full bg-neutral-300" />
+                <div className="h-px w-full bg-neutral-300" />
               </div>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight font-bold text-neutral-900">
                   Up to 500 users
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Resource access logs
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Port and protocol traffic restrictions
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Conditional access policies
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Customize your account slug
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 w-4 h-4 text-primary-450" />
+                <FaCheck className="mt-0.5 shrink-0 w-4 h-4 text-primary-450" />
                 <span className="leading-tight text-neutral-900">
                   Priority email support
                 </span>
@@ -255,54 +255,54 @@ export default function Page() {
               className="text-sm md:text-md font-medium space-y-4 text-neutral-300"
             >
               <li className="flex space-x-2.5">
-                <FaCircleCheck className="flex-shrink-0 w-4 h-4 text-accent-300" />
+                <FaCircleCheck className="shrink-0 w-4 h-4 text-accent-300" />
                 <span className="leading-tight font-bold text-neutral-50">
                   Everything in Starter and Team
                 </span>
               </li>
               <div className="flex w-full gap-3 items-center">
-                <div className="h-[1px] w-full bg-neutral-700" />
+                <div className="h-px w-full bg-neutral-700" />
                 <p className="uppercase text-neutral-50 font-medium">plus</p>
-                <div className="h-[1px] w-full bg-neutral-700" />
+                <div className="h-px w-full bg-neutral-700" />
               </div>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight font-bold text-neutral-50">
                   Unlimited users
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">
                   Directory sync for Google, Entra ID, and Okta
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">
                   Dedicated Slack support channel
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">Uptime SLAs</span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">
                   Access to our SOC2 and pentest reports
                 </span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">Roadmap acceleration</span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">White-glove onboarding</span>
               </li>
               <li className="flex space-x-2.5">
-                <FaCheck className="mt-0.5 flex-shrink-0 text-primary-450 w-4 h-4" />
+                <FaCheck className="mt-0.5 shrink-0 text-primary-450 w-4 h-4" />
                 <span className="leading-tight">Annual invoicing</span>
               </li>
             </ul>
@@ -371,9 +371,9 @@ export default function Page() {
                 >
                   GitHub repository
                 </Link>
-                , and you&apos;re free to self-host Firezone for your
-                organization without restriction. However, we don&apos;t offer
-                documentation or support for self-hosting Firezone at this time.
+                {
+                  ", and you're free to self-host Firezone for your organization without restriction. However, we don't offer documentation or support for self-hosting Firezone at this time."
+                }
               </AccordionContent>
             </AccordionPanel>
             <AccordionPanel>
@@ -381,10 +381,9 @@ export default function Page() {
                 Do I need to rip and replace my current VPN to use Firezone?
               </AccordionTitle>
               <AccordionContent>
-                No. As long they&apos;re set up to access different resources,
-                you can run Firezone alongside your existing remote access
-                solutions, and switch over whenever you’re ready. There’s no
-                need for any downtime or unnecessary disruptions.
+                {
+                  "No. As long they're set up to access different resources, you can run Firezone alongside your existing remote access solutions, and switch over whenever you're ready. There's no need for any downtime or unnecessary disruptions."
+                }
               </AccordionContent>
             </AccordionPanel>
             <AccordionPanel>
@@ -412,17 +411,18 @@ export default function Page() {
               <AccordionContent>
                 <p>Yes.</p>
                 <p className="mt-2">
-                  For the <strong>Team</strong> plan, you can add or remove
-                  seats at any time. When adding seats, you&apos;ll be charged a
-                  prorated amount for the remainder of the billing cycle. When
-                  removing seats, the change will take effect at the end of the
-                  billing cycle.
+                  {"For the "}
+                  <strong>Team</strong>
+                  {
+                    " plan, you can add or remove seats at any time. When adding seats, you'll be charged a prorated amount for the remainder of the billing cycle. When removing seats, the change will take effect at the end of the billing cycle."
+                  }
                 </p>
                 <p className="mt-2">
-                  For the <strong>Enterprise</strong> plan, contact your account
-                  manager to request a seat increase. You&apos;ll then be billed
-                  for the prorated amount for the remainder of the billing
-                  cycle.
+                  {"For the "}
+                  <strong>Enterprise</strong>
+                  {
+                    " plan, contact your account manager to request a seat increase. You'll then be billed for the prorated amount for the remainder of the billing cycle."
+                  }
                 </p>
               </AccordionContent>
             </AccordionPanel>
@@ -447,7 +447,7 @@ export default function Page() {
                 For Starter and Team plans, you can downgrade by going to your
                 Account settings in your Firezone admin portal. For Enterprise
                 plans, contact your account manager for subscription updates. If
-                you&apos;d like to completely delete your account,{" "}
+                {"you'd like to completely delete your account, "}
                 <Link
                   href="mailto:support@firezone.dev"
                   className="hover:underline text-accent-500"
@@ -516,7 +516,7 @@ export default function Page() {
             <Link href="/contact/sales">
               <button
                 type="button"
-                className="w-64 text-white tracking-tight rounded duration-50 hover:ring-2 hover:ring-primary-300 transition transform shadow-lg text-lg px-5 py-2.5 bg-primary-450 font-semibold"
+                className="w-64 text-white tracking-tight rounded-sm duration-50 hover:ring-2 hover:ring-primary-300 transition transform shadow-lg text-lg px-5 py-2.5 bg-primary-450 font-semibold"
               >
                 Request a demo
               </button>

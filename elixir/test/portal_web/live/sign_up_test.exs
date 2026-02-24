@@ -498,22 +498,28 @@ defmodule PortalWeb.SignUpTest do
       assert html =~ "Your account has been created!"
       assert html =~ "Please check your email for sign in instructions"
       assert html =~ "Welcome Company"
-      assert html =~ "Account Name:"
-      assert html =~ "Account Slug:"
-      assert html =~ "Sign In URL:"
+      assert html =~ "Account Name"
+      assert html =~ "Account Slug"
+      assert html =~ "Sign In URL"
       assert html =~ "Sign In"
+      assert html =~ "Next Steps"
+      assert html =~ "Download the Firezone Client"
+      assert html =~ "https://www.firezone.dev/kb/client-apps"
+      assert html =~ "View the Quickstart Guide"
+      assert html =~ "https://www.firezone.dev/kb/quickstart"
     end
   end
 
   describe "Stripe API resilience" do
     setup do
-      # Enable retry for these tests
+      # Enable retry for these tests with fast retry delay for testing
       Portal.Config.put_env_override(Portal.Billing.Stripe.APIClient,
         endpoint: "https://api.stripe.com",
-        req_options: [
+        req_opts: [
           plug: {Req.Test, Portal.Billing.Stripe.APIClient},
           retry: :transient,
-          max_retries: 1
+          max_retries: 1,
+          retry_delay: fn _attempt -> 10 end
         ]
       )
 

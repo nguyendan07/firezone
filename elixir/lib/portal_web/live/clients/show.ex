@@ -3,12 +3,12 @@ defmodule PortalWeb.Clients.Show do
   import PortalWeb.Policies.Components
   import PortalWeb.Clients.Components
   alias Portal.{Presence.Clients, ComponentVersions}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   import Ecto.Changeset
   import Portal.Changeset
 
   def mount(%{"id" => id}, _session, socket) do
-    client = DB.get_client!(id, socket.assigns.subject)
+    client = Database.get_client!(id, socket.assigns.subject)
     client = Clients.preload_clients_presence([client]) |> List.first()
 
     if connected?(socket) do
@@ -22,7 +22,7 @@ defmodule PortalWeb.Clients.Show do
         page_title: "Client #{client.name}"
       )
       |> assign_live_table("policy_authorizations",
-        query_module: DB.PolicyAuthorizationQuery,
+        query_module: Database.PolicyAuthorizationQuery,
         sortable_fields: [],
         hide_filters: [:expiration],
         callback: &handle_policy_authorizations_update!/2
@@ -45,7 +45,7 @@ defmodule PortalWeb.Clients.Show do
       )
 
     with {:ok, policy_authorizations, metadata} <-
-           DB.list_policy_authorizations_for(
+           Database.list_policy_authorizations_for(
              socket.assigns.client,
              socket.assigns.subject,
              list_opts
@@ -116,7 +116,7 @@ defmodule PortalWeb.Clients.Show do
             <:label>Version</:label>
             <:value>
               <.version
-                current={@client.last_seen_version}
+                current={@client.latest_session && @client.latest_session.version}
                 latest={ComponentVersions.client_version(@client)}
               />
             </:value>
@@ -124,7 +124,7 @@ defmodule PortalWeb.Clients.Show do
           <.vertical_table_row>
             <:label>User agent</:label>
             <:value>
-              {@client.last_seen_user_agent}
+              {@client.latest_session && @client.latest_session.user_agent}
             </:value>
           </.vertical_table_row>
           <.vertical_table_row>
@@ -144,7 +144,9 @@ defmodule PortalWeb.Clients.Show do
           <.vertical_table_row>
             <:label>Last started</:label>
             <:value>
-              <.relative_datetime datetime={@client.last_seen_at} />
+              <.relative_datetime datetime={
+                @client.latest_session && @client.latest_session.inserted_at
+              } />
             </:value>
           </.vertical_table_row>
         </.vertical_table>
@@ -238,7 +240,7 @@ defmodule PortalWeb.Clients.Show do
           <.vertical_table_row>
             <:label>Last seen remote IP</:label>
             <:value>
-              <.last_seen schema={@client} />
+              <.last_seen schema={@client.latest_session} />
             </:value>
           </.vertical_table_row>
 
@@ -370,17 +372,22 @@ defmodule PortalWeb.Clients.Show do
     end)
   end
 
-  defp hardware_id_title(%{last_seen_user_agent: "Mac OS/" <> _}, :device_serial),
+  defp hardware_id_title(%{latest_session: %{user_agent: "Mac OS/" <> _}}, :device_serial),
     do: {"Device Serial", nil}
 
-  defp hardware_id_title(%{last_seen_user_agent: "Mac OS/" <> _}, :device_uuid),
+  defp hardware_id_title(%{latest_session: %{user_agent: "Mac OS/" <> _}}, :device_uuid),
     do: {"Device UUID", nil}
 
-  defp hardware_id_title(%{last_seen_user_agent: "iOS/" <> _}, :identifier_for_vendor),
+  defp hardware_id_title(%{latest_session: %{user_agent: "iOS/" <> _}}, :identifier_for_vendor),
     do: {"App installation ID", "This value is reset if the Firezone application is reinstalled."}
 
-  defp hardware_id_title(%{last_seen_user_agent: "Android/" <> _}, :firebase_installation_id),
-    do: {"App installation ID", "This value is reset if the Firezone application is reinstalled."}
+  defp hardware_id_title(
+         %{latest_session: %{user_agent: "Android/" <> _}},
+         :firebase_installation_id
+       ),
+       do:
+         {"App installation ID",
+          "This value is reset if the Firezone application is reinstalled."}
 
   defp hardware_id_title(_client, :device_serial),
     do: {"Device Serial", nil}
@@ -406,7 +413,7 @@ defmodule PortalWeb.Clients.Show do
     socket =
       cond do
         Map.has_key?(payload.joins, client.id) ->
-          client = DB.get_client!(client.id, socket.assigns.subject)
+          client = Database.get_client!(client.id, socket.assigns.subject)
           assign(socket, client: %{client | online?: true})
 
         Map.has_key?(payload.leaves, client.id) ->
@@ -428,7 +435,7 @@ defmodule PortalWeb.Clients.Show do
       |> change()
       |> put_default_value(:verified_at, DateTime.utc_now())
 
-    {:ok, client} = DB.verify_client(changeset, socket.assigns.subject)
+    {:ok, client} = Database.verify_client(changeset, socket.assigns.subject)
 
     client = %{
       client
@@ -447,7 +454,7 @@ defmodule PortalWeb.Clients.Show do
       |> change()
       |> put_change(:verified_at, nil)
 
-    {:ok, client} = DB.remove_client_verification(changeset, socket.assigns.subject)
+    {:ok, client} = Database.remove_client_verification(changeset, socket.assigns.subject)
 
     client = %{
       client
@@ -459,7 +466,7 @@ defmodule PortalWeb.Clients.Show do
   end
 
   def handle_event("delete", _params, socket) do
-    {:ok, _deleted_client} = DB.delete_client(socket.assigns.client, socket.assigns.subject)
+    {:ok, _deleted_client} = Database.delete_client(socket.assigns.client, socket.assigns.subject)
 
     socket =
       socket
@@ -469,17 +476,30 @@ defmodule PortalWeb.Clients.Show do
     {:noreply, socket}
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
-    alias Portal.{Presence.Clients, Safe}
+    alias Portal.{Presence.Clients, ClientSession, Safe}
     alias Portal.Client
 
     def get_client!(id, subject) do
-      from(c in Client, as: :clients)
-      |> where([clients: c], c.id == ^id)
-      |> preload([:actor, :ipv4_address, :ipv6_address])
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      client =
+        from(c in Client, as: :clients)
+        |> where([clients: c], c.id == ^id)
+        |> preload([:actor, :ipv4_address, :ipv6_address])
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      session =
+        from(s in ClientSession,
+          where: s.account_id == ^client.account_id,
+          where: s.client_id == ^client.id,
+          order_by: [desc: s.inserted_at],
+          limit: 1
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one(fallback_to_primary: true)
+
+      %{client | latest_session: session}
     end
 
     def verify_client(changeset, subject) do
@@ -527,62 +547,62 @@ defmodule PortalWeb.Clients.Show do
 
     def list_policy_authorizations_for(
           %Portal.Policy{} = policy,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_policy_id(policy.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_policy_id(policy.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Resource{} = resource,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_resource_id(resource.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_resource_id(resource.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Client{} = client,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_client_id(client.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_client_id(client.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Actor{} = actor,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_actor_id(actor.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_actor_id(actor.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Gateway{} = gateway,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_gateway_id(gateway.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_gateway_id(gateway.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     defp list_policy_authorizations(queryable, subject, opts) do
       queryable
-      |> Portal.Safe.scoped(subject)
-      |> Portal.Safe.list(DB.PolicyAuthorizationQuery, opts)
+      |> Portal.Safe.scoped(subject, :replica)
+      |> Portal.Safe.list(Database.PolicyAuthorizationQuery, opts)
     end
   end
 
-  defmodule DB.PolicyAuthorizationQuery do
+  defmodule Database.PolicyAuthorizationQuery do
     import Ecto.Query
 
     def all do

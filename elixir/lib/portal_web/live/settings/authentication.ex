@@ -11,7 +11,7 @@ defmodule PortalWeb.Settings.Authentication do
     Okta
   }
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   import Ecto.Changeset
 
@@ -24,9 +24,9 @@ defmodule PortalWeb.Settings.Authentication do
   ]
 
   @select_type_classes ~w[
-    component bg-white rounded-lg p-4 flex items-center cursor-pointer
+    component bg-white rounded-md p-4 flex items-center cursor-pointer
     border-2 transition-all duration-150
-    border-neutral-200 hover:border-accent-300 hover:bg-neutral-50 hover:shadow-sm
+    border-neutral-200 hover:border-accent-300 hover:bg-neutral-50 hover:shadow-xs
   ]
 
   @new_types ~w[google entra okta oidc]
@@ -71,7 +71,7 @@ defmodule PortalWeb.Settings.Authentication do
       )
       when type in @edit_types do
     schema = AuthProvider.module!(type)
-    provider = DB.get_provider!(schema, id, socket.assigns.subject)
+    provider = Database.get_provider!(schema, id, socket.assigns.subject)
     is_legacy = Map.get(provider, :is_legacy, false)
 
     # Legacy providers can't be verified (must be deleted and recreated)
@@ -192,7 +192,7 @@ defmodule PortalWeb.Settings.Authentication do
          "You cannot delete the provider you are currently signed in with."
        )}
     else
-      case DB.delete_provider!(provider, socket.assigns.subject) do
+      case Database.delete_provider!(provider, socket.assigns.subject) do
         {:ok, _provider} ->
           {:noreply,
            socket
@@ -228,7 +228,7 @@ defmodule PortalWeb.Settings.Authentication do
         )
       end
 
-    case DB.update_provider(changeset, socket.assigns.subject) do
+    case Database.update_provider(changeset, socket.assigns.subject) do
       {:ok, _provider} ->
         action = if new_disabled_state, do: "disabled", else: "enabled"
 
@@ -271,7 +271,7 @@ defmodule PortalWeb.Settings.Authentication do
   def handle_event("revoke_sessions", %{"id" => id}, socket) do
     provider = socket.assigns.providers |> Enum.find(fn p -> p.id == id end)
 
-    case DB.revoke_sessions_for_provider(provider, socket.assigns.subject) do
+    case Database.revoke_sessions_for_provider(provider, socket.assigns.subject) do
       {:ok, _} ->
         {:noreply,
          socket
@@ -360,7 +360,18 @@ defmodule PortalWeb.Settings.Authentication do
   end
 
   defp clear_verification_if_trigger_fields_changed(changeset) do
-    fields = [:client_id, :client_secret, :discovery_document_uri, :okta_domain]
+    schema = changeset.data.__struct__
+
+    # Provider-specific trigger fields:
+    # - Okta: okta_domain is user-editable, discovery_document_uri is computed from it
+    # - OIDC: discovery_document_uri is user-editable
+    # - Google/Entra: no user-editable OIDC config fields
+    fields =
+      case schema do
+        Okta.AuthProvider -> [:client_id, :client_secret, :okta_domain]
+        OIDC.AuthProvider -> [:client_id, :client_secret, :discovery_document_uri]
+        _ -> []
+      end
 
     if Enum.any?(fields, &get_change(changeset, &1)) do
       put_change(changeset, :is_verified, false)
@@ -371,8 +382,8 @@ defmodule PortalWeb.Settings.Authentication do
 
   defp init(socket) do
     providers =
-      DB.list_all_providers(socket.assigns.subject)
-      |> DB.enrich_with_session_counts(socket.assigns.subject)
+      Database.list_all_providers(socket.assigns.subject)
+      |> Database.enrich_with_session_counts(socket.assigns.subject)
 
     assign(socket,
       providers: providers,
@@ -602,10 +613,10 @@ defmodule PortalWeb.Settings.Authentication do
 
   defp provider_card(assigns) do
     ~H"""
-    <div class="flex flex-col bg-neutral-50 rounded-lg p-4" style="width: 28rem;">
+    <div class="flex flex-col bg-neutral-50 rounded-md p-4" style="width: 28rem;">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center flex-1 min-w-0 gap-2">
-          <.provider_icon type={@type} class="w-7 h-7 flex-shrink-0" />
+          <.provider_icon type={@type} class="w-7 h-7 shrink-0" />
           <div class="flex flex-col min-w-0">
             <span class="font-medium text-xl truncate" title={@provider.name}>
               {@provider.name}
@@ -615,10 +626,10 @@ defmodule PortalWeb.Settings.Authentication do
             </span>
           </div>
           <%= if Map.has_key?(@provider, :is_default) && @provider.is_default do %>
-            <.badge type="primary" class="flex-shrink-0">DEFAULT</.badge>
+            <.badge type="primary" class="shrink-0">DEFAULT</.badge>
           <% end %>
           <%= if Map.get(@provider, :is_legacy) do %>
-            <.badge type="warning" class="flex-shrink-0">LEGACY</.badge>
+            <.badge type="warning" class="shrink-0">LEGACY</.badge>
           <% end %>
         </div>
         <div class="flex items-center gap-1">
@@ -654,7 +665,7 @@ defmodule PortalWeb.Settings.Authentication do
             <:target>
               <button
                 type="button"
-                class="p-1 text-neutral-500 hover:text-neutral-700 rounded"
+                class="p-1 text-neutral-500 hover:text-neutral-700 rounded-sm"
               >
                 <.icon name="hero-ellipsis-horizontal" class="text-neutral-800 w-5 h-5" />
               </button>
@@ -663,7 +674,7 @@ defmodule PortalWeb.Settings.Authentication do
               <div class="flex flex-col py-1">
                 <.link
                   patch={~p"/#{@account}/settings/authentication/#{@type}/#{@provider.id}/edit"}
-                  class="px-4 py-2 text-sm text-neutral-800 rounded-lg hover:bg-neutral-100 flex items-center gap-2"
+                  class="px-4 py-2 text-sm text-neutral-800 rounded-md hover:bg-neutral-100 flex items-center gap-2"
                 >
                   <.icon name="hero-pencil" class="w-4 h-4" /> Edit
                 </.link>
@@ -672,7 +683,7 @@ defmodule PortalWeb.Settings.Authentication do
                   id={"delete-provider-#{@provider.id}"}
                   on_confirm="delete_provider"
                   on_confirm_id={@provider.id}
-                  class="w-full px-4 py-2 text-sm text-red-600 rounded-lg flex items-center gap-2 text-left border-0 bg-transparent"
+                  class="w-full px-4 py-2 text-sm text-red-600 rounded-md flex items-center gap-2 text-left border-0 bg-transparent"
                 >
                   <.icon name="hero-trash" class="w-4 h-4" /> Delete
                   <:dialog_title>Delete Authentication Provider</:dialog_title>
@@ -693,9 +704,9 @@ defmodule PortalWeb.Settings.Authentication do
         </div>
       </div>
 
-      <div class="mt-auto bg-white rounded-lg p-3 space-y-3 text-sm text-neutral-600">
+      <div class="mt-auto bg-white rounded-md p-3 space-y-3 text-sm text-neutral-600">
         <div :if={Map.get(@provider, :issuer)} class="flex items-center gap-2 min-w-0">
-          <.icon name="hero-identification" class="w-5 h-5 flex-shrink-0" title="Issuer" />
+          <.icon name="hero-identification" class="w-5 h-5 shrink-0" title="Issuer" />
           <span class="truncate font-medium" title={@provider.issuer}>{@provider.issuer}</span>
         </div>
 
@@ -958,7 +969,7 @@ defmodule PortalWeb.Settings.Authentication do
               type="text"
               readonly
               value={@redirect_uri}
-              class="block w-full rounded-l-md border-0 py-1.5 text-neutral-900 shadow-sm ring-1 ring-inset ring-neutral-300 bg-neutral-50 cursor-default sm:text-sm sm:leading-6"
+              class="block w-full rounded-l-md border-0 py-1.5 text-neutral-900 shadow-xs ring-1 ring-inset ring-neutral-300 bg-neutral-50 cursor-default sm:text-sm sm:leading-6"
             />
             <button
               type="button"
@@ -980,7 +991,7 @@ defmodule PortalWeb.Settings.Authentication do
 
         <div
           :if={@type in ["entra", "google", "okta", "oidc"] and not @is_legacy}
-          class="p-4 border-2 border-accent-200 bg-accent-50 rounded-lg"
+          class="p-4 border-2 border-accent-200 bg-accent-50 rounded-md"
         >
           <.flash :if={@verification_error} kind={:error}>
             {@verification_error}
@@ -1020,7 +1031,7 @@ defmodule PortalWeb.Settings.Authentication do
     ~H"""
     <div
       :if={verified?(@form)}
-      class="flex items-center text-green-700 bg-green-100 px-4 py-2 rounded-md"
+      class="flex items-center text-green-700 bg-green-100 px-4 py-2 rounded-sm"
     >
       <.icon name="hero-check-circle" class="h-5 w-5 mr-2" />
       <span class="font-medium">Verified</span>
@@ -1086,12 +1097,12 @@ defmodule PortalWeb.Settings.Authentication do
   end
 
   defp submit_provider(%{assigns: %{live_action: :new, form: %{source: changeset}}} = socket) do
-    DB.insert_provider(changeset, socket.assigns.subject)
+    Database.insert_provider(changeset, socket.assigns.subject)
     |> handle_submit(socket)
   end
 
   defp submit_provider(%{assigns: %{live_action: :edit, form: %{source: changeset}}} = socket) do
-    DB.update_provider(changeset, socket.assigns.subject)
+    Database.update_provider(changeset, socket.assigns.subject)
     |> handle_submit(socket)
   end
 
@@ -1133,8 +1144,6 @@ defmodule PortalWeb.Settings.Authentication do
   defp titleize("entra"), do: "Microsoft Entra"
   defp titleize("okta"), do: "Okta"
   defp titleize("oidc"), do: "OpenID Connect"
-  defp titleize("email_otp"), do: "Email OTP"
-  defp titleize("userpass"), do: "Username & Password"
 
   defp maybe_initialize_with_parent(changeset, account_id) do
     if is_nil(get_field(changeset, :id)) do
@@ -1297,7 +1306,7 @@ defmodule PortalWeb.Settings.Authentication do
       |> Enum.find(fn provider -> provider.id == provider_id end)
 
     with true <- provider_type(provider) not in ["email_otp", "userpass"],
-         {:ok, _result} <- DB.set_default_provider(provider, socket.assigns) do
+         {:ok, _result} <- Database.set_default_provider(provider, socket.assigns) do
       socket =
         socket
         |> put_flash(:success, "Default authentication provider set to #{provider.name}")
@@ -1329,7 +1338,7 @@ defmodule PortalWeb.Settings.Authentication do
   end
 
   defp clear_default_provider(socket) do
-    with {:ok, _result} <- DB.clear_default_provider(socket.assigns) do
+    with {:ok, _result} <- Database.clear_default_provider(socket.assigns) do
       socket =
         socket
         |> put_flash(:success, "Default authentication provider cleared")
@@ -1370,27 +1379,27 @@ defmodule PortalWeb.Settings.Authentication do
     "#{days}d"
   end
 
-  defmodule DB do
+  defmodule Database do
     alias Portal.{AuthProvider, EmailOTP, Userpass, OIDC, Entra, Google, Okta, Safe}
     import Ecto.Query
     import Ecto.Changeset
 
     def list_all_providers(subject) do
       [
-        EmailOTP.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
-        Userpass.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
-        Google.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
-        Entra.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
-        Okta.AuthProvider |> Safe.scoped(subject) |> Safe.all(),
-        OIDC.AuthProvider |> Safe.scoped(subject) |> Safe.all()
+        EmailOTP.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Userpass.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Google.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Entra.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all(),
+        Okta.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all(),
+        OIDC.AuthProvider |> Safe.scoped(subject, :replica) |> Safe.all()
       ]
       |> List.flatten()
     end
 
     def get_provider!(schema, id, subject) do
       from(p in schema, where: p.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def insert_provider(changeset, subject) do
@@ -1409,8 +1418,8 @@ defmodule PortalWeb.Settings.Authentication do
       # Delete the parent auth_provider, which will CASCADE delete the child and tokens
       parent =
         from(p in AuthProvider, where: p.id == ^provider.id)
-        |> Safe.scoped(subject)
-        |> Safe.one!()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
 
       parent |> Safe.scoped(subject) |> Safe.delete()
     end
@@ -1458,7 +1467,7 @@ defmodule PortalWeb.Settings.Authentication do
           group_by: ct.auth_provider_id,
           select: {ct.auth_provider_id, count(ct.id)}
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> Map.new()
 
@@ -1468,7 +1477,7 @@ defmodule PortalWeb.Settings.Authentication do
           group_by: ps.auth_provider_id,
           select: {ps.auth_provider_id, count(ps.id)}
         )
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> Map.new()
 

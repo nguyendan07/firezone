@@ -32,6 +32,12 @@ defmodule PortalWeb.Policies.Components do
 
   attr(:policy, :map, required: true)
 
+  def policy_name(%{policy: %{group: nil}} = assigns) do
+    ~H"""
+    <span class="text-amber-600">(Group deleted)</span> → {@policy.resource.name}
+    """
+  end
+
   def policy_name(assigns) do
     ~H"{@policy.group.name} → {@policy.resource.name}"
   end
@@ -368,7 +374,7 @@ defmodule PortalWeb.Policies.Components do
           <span class="flex items-center">
             <.icon name="hero-map-pin" class="w-5 h-5 mr-2" /> Client location
           </span>
-          <span class="shadow bg-white w-6 h-6 flex items-center justify-center rounded-full">
+          <span class="shadow-sm bg-white w-6 h-6 flex items-center justify-center rounded-full">
             <.icon
               id="policy_conditions_remote_ip_location_region_chevron"
               name="hero-chevron-down"
@@ -455,7 +461,7 @@ defmodule PortalWeb.Policies.Components do
           <span class="flex items-center">
             <.icon name="hero-globe-alt" class="w-5 h-5 mr-2" /> IP address
           </span>
-          <span class="shadow bg-white w-6 h-6 flex items-center justify-center rounded-full">
+          <span class="shadow-sm bg-white w-6 h-6 flex items-center justify-center rounded-full">
             <.icon id="policy_conditions_remote_ip_chevron" name="hero-chevron-down" class="w-5 h-5" />
           </span>
         </legend>
@@ -538,7 +544,7 @@ defmodule PortalWeb.Policies.Components do
           <span class="flex items-center">
             <.icon name="hero-identification" class="w-5 h-5 mr-2" /> Authentication provider
           </span>
-          <span class="shadow bg-white w-6 h-6 flex items-center justify-center rounded-full">
+          <span class="shadow-sm bg-white w-6 h-6 flex items-center justify-center rounded-full">
             <.icon
               id="policy_conditions_auth_provider_id_chevron"
               name="hero-chevron-down"
@@ -633,7 +639,7 @@ defmodule PortalWeb.Policies.Components do
           <span class="flex items-center">
             <.icon name="hero-shield-check" class="w-5 h-5 mr-2" /> Client verification
           </span>
-          <span class="shadow bg-white w-6 h-6 flex items-center justify-center rounded-full">
+          <span class="shadow-sm bg-white w-6 h-6 flex items-center justify-center rounded-full">
             <.icon
               id="policy_conditions_client_verified_chevron"
               name="hero-chevron-down"
@@ -711,7 +717,7 @@ defmodule PortalWeb.Policies.Components do
           <span class="flex items-center">
             <.icon name="hero-clock" class="w-5 h-5 mr-2" /> Current time
           </span>
-          <span class="shadow bg-white w-6 h-6 flex items-center justify-center rounded-full">
+          <span class="shadow-sm bg-white w-6 h-6 flex items-center justify-center rounded-full">
             <.icon
               id="policy_conditions_current_utc_datetime_chevron"
               name="hero-chevron-down"
@@ -810,7 +816,7 @@ defmodule PortalWeb.Policies.Components do
     """
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Portal.Repo.Query
     alias Portal.{Safe, Userpass, EmailOTP, OIDC, Google, Entra, Okta}
@@ -887,8 +893,8 @@ defmodule PortalWeb.Policies.Components do
             directory_type: d.type
           }
         )
-        |> Safe.scoped(subject)
-        |> Safe.one!()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
 
       {:ok, group_option(group)}
     end
@@ -987,62 +993,62 @@ defmodule PortalWeb.Policies.Components do
 
     def list_policy_authorizations_for(
           %Portal.Policy{} = policy,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_policy_id(policy.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_policy_id(policy.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Resource{} = resource,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_resource_id(resource.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_resource_id(resource.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Client{} = client,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_client_id(client.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_client_id(client.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Actor{} = actor,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_actor_id(actor.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_actor_id(actor.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     def list_policy_authorizations_for(
           %Portal.Gateway{} = gateway,
-          %Portal.Auth.Subject{} = subject,
+          %Portal.Authentication.Subject{} = subject,
           opts
         ) do
-      DB.PolicyAuthorizationQuery.all()
-      |> DB.PolicyAuthorizationQuery.by_gateway_id(gateway.id)
+      Database.PolicyAuthorizationQuery.all()
+      |> Database.PolicyAuthorizationQuery.by_gateway_id(gateway.id)
       |> list_policy_authorizations(subject, opts)
     end
 
     defp list_policy_authorizations(queryable, subject, opts) do
       queryable
-      |> Portal.Safe.scoped(subject)
-      |> Portal.Safe.list(DB.PolicyAuthorizationQuery, opts)
+      |> Portal.Safe.scoped(subject, :replica)
+      |> Portal.Safe.list(Database.PolicyAuthorizationQuery, opts)
     end
   end
 
-  defmodule DB.PolicyAuthorizationQuery do
+  defmodule Database.PolicyAuthorizationQuery do
     import Ecto.Query
 
     def all do

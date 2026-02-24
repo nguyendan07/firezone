@@ -46,7 +46,7 @@ export default function Page() {
             </Banner>
             <h1
               className={
-                "mb-8 text-5xl sm:text-6xl md:text-7xl text-center drop-shadow-[inset_0_2px_0_0_rgba(255,255,255,100)] font-medium tracking-tight leading-tight bg-gradient-to-b from-white from-70% to-slate-200 text-transparent bg-clip-text"
+                "mb-8 text-5xl sm:text-6xl md:text-7xl text-center drop-shadow-[inset_0_2px_0_0_rgba(255,255,255,100)] font-medium tracking-tight leading-none bg-gradient-to-b from-white from-70% to-slate-200 text-transparent bg-clip-text"
               }
             >
               Upgrade your VPN to zero-trust access
@@ -70,7 +70,7 @@ export default function Page() {
               <div className=" flex items-center w-full sm:w-fit">
                 <button
                   type="button"
-                  className="tracking-tight group shadow-primary-700 text-lg sm:w-48 w-full inline-flex shadow-lg justify-center items-center md:py-3 py-2 px-5 font-semibold text-center text-white rounded bg-primary-450 hover:ring-1 hover:ring-primary-450 duration-50 transform transition"
+                  className="tracking-tight group shadow-primary-700 text-lg sm:w-48 w-full inline-flex shadow-lg justify-center items-center md:py-3 py-2 px-5 font-semibold text-center text-white rounded-sm bg-primary-450 hover:ring-1 hover:ring-primary-450 duration-50 transform transition"
                 >
                   <Link href="/contact/sales">Book a demo</Link>
                   <HiArrowLongRight className="group-hover:translate-x-1 transition duration-50 group-hover:scale-110 transform ml-2 -mr-1 w-7 h-7" />
@@ -278,7 +278,7 @@ export default function Page() {
                   />
                 </div>
               </div>
-              <pre className="mt-8 text-xs p-2 bg-neutral-950 rounded shadow text-neutral-50 text-wrap">
+              <pre className="mt-8 text-xs p-2 bg-neutral-950 rounded-sm shadow-sm text-neutral-50 text-wrap">
                 <code>
                   <strong>FIREZONE_TOKEN</strong>=&lt;your-token&gt; \<br /> ./
                   <strong>firezone-gateway</strong>
@@ -287,9 +287,9 @@ export default function Page() {
             </div>
             <div className="mt-auto text-center md:text-left">
               <p className="text-lg text-neutral-800">
-                Gateways are lightweight Linux binaries you deploy anywhere you
-                need access. Just configure a token with your preferred tool and
-                you&apos;re done.
+                {
+                  "Gateways are lightweight Linux binaries you deploy anywhere you need access. Just configure a token with your preferred tool and you're done."
+                }
               </p>
               <p className="mt-4">
                 <ActionLink
@@ -320,9 +320,9 @@ export default function Page() {
 
         <div className="mx-auto px-4 max-w-screen-md">
           <p className="text-lg text-center -mt-3 text-neutral-800 text-pretty">
-            How can you trust a zero-trust solution if you can&apos;t see its
-            source? We build Firezone in the open so anyone can make sure it
-            does exactly what we claim it does, and nothing more.
+            {
+              "How can you trust a zero-trust solution if you can't see its source? We build Firezone in the open so anyone can make sure it does exactly what we claim it does, and nothing more."
+            }
           </p>
         </div>
 

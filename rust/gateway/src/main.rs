@@ -33,6 +33,8 @@ mod eventloop;
 
 const RELEASE: &str = concat!("gateway@", env!("CARGO_PKG_VERSION"));
 
+const DEFAULT_MAX_PARTITION_TIME: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -94,6 +96,7 @@ fn has_necessary_permissions() -> bool {
 
 async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
     logging::setup_global_subscriber(
+        make_directives(std::env::var("RUST_LOG").ok(), cli.flow_logs),
         layer::Identity::default(),
         match cli.log_format {
             LogFormat::Json => true,
@@ -196,16 +199,23 @@ async fn try_main(cli: Cli, telemetry: &mut Telemetry) -> Result<()> {
         Arc::new(tcp_socket_factory),
         Arc::new(UdpSocketFactory::default()),
         nameservers,
+        cli.flow_logs,
     );
+    let max_partition_time = cli
+        .max_partition_time
+        .map(|d| d.into())
+        .unwrap_or(DEFAULT_MAX_PARTITION_TIME);
+
     let portal = PhoenixChannel::disconnected(
         login,
         token,
         get_user_agent("gateway", env!("CARGO_PKG_VERSION")),
         PHOENIX_TOPIC,
         (),
-        || {
+        move || {
             ExponentialBackoffBuilder::default()
-                .with_max_elapsed_time(Some(Duration::from_secs(60 * 15)))
+                .with_max_interval(Duration::from_secs(60))
+                .with_max_elapsed_time(Some(max_partition_time))
                 .build()
         },
         Arc::new(tcp_socket_factory),
@@ -322,6 +332,10 @@ struct Cli {
     #[arg(long, env = "FIREZONE_LOG_FORMAT", default_value_t = LogFormat::Human)]
     log_format: LogFormat,
 
+    /// Enable logging of tunneled UDP and TCP flows.
+    #[arg(long, env = "FIREZONE_FLOW_LOGS", default_value_t = false)]
+    flow_logs: bool,
+
     /// Where to export metrics to.
     ///
     /// This configuration option is private API and has no stability guarantees.
@@ -350,6 +364,11 @@ struct Cli {
     /// Do not try to increase the `core.rmem_max` and `core.wmem_max` kernel parameters.
     #[arg(long, env = "FIREZONE_NO_INC_BUF", default_value_t = false)]
     no_inc_buf: bool,
+
+    /// Maximum length of time to retry connecting to the portal if we're having internet issues or
+    /// it's down. Accepts human times. e.g. "5m" or "1h" or "30d".
+    #[arg(short, long, env = "FIREZONE_MAX_PARTITION_TIME")]
+    max_partition_time: Option<humantime::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -451,6 +470,16 @@ impl ValidateChecksumAdapter {
     }
 }
 
+fn make_directives(rust_log: Option<String>, flow_logs: bool) -> String {
+    let rust_log = rust_log.unwrap_or_else(|| "info".to_string());
+
+    if flow_logs {
+        return format!("{rust_log},flow_logs=trace");
+    }
+
+    rust_log
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +506,19 @@ mod tests {
         unsafe {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
         }
+    }
+
+    #[test]
+    fn adds_flow_logs_directive_to_default() {
+        let directives = make_directives(None, true);
+
+        assert_eq!(directives, "info,flow_logs=trace");
+    }
+
+    #[test]
+    fn adds_flow_logs_directive_to_custom() {
+        let directives = make_directives(Some("info,tunnel=trace".to_owned()), true);
+
+        assert_eq!(directives, "info,tunnel=trace,flow_logs=trace");
     }
 }

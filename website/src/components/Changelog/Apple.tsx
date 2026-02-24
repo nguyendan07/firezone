@@ -25,6 +25,57 @@ export default function Apple() {
     <Entries downloadLinks={downloadLinks} title="macOS / iOS">
       {/* When you cut a release, remove any solved issues from the "known issues" lists over in `client-apps`. This must not be done when the issue's PR merges. */}
       <Unreleased>
+        <ChangeItem pull="12279">
+          Bumps minimum iOS version from 15.6 to 16.0 to enable SwiftUI
+          NavigationStack and NavigationSplitView API.
+        </ChangeItem>
+        <ChangeItem pull="12251">
+          Gracefully handles WebSocket closes from the portal instead of logging
+          a deserialization error.
+        </ChangeItem>
+        <ChangeItem pull="11988">
+          Fixes a crash if the currently active log file gets deleted.
+        </ChangeItem>
+        <ChangeItem pull="11779">
+          Notifies the user when a connection to a resource cannot be
+          established.
+        </ChangeItem>
+        <ChangeItem pull="12248">
+          Re-establishes the WebSocket connection to the control plane if it
+          becomes unresponsive.
+        </ChangeItem>
+      </Unreleased>
+      <Entry version="1.5.13" date={new Date("2026-01-30")}>
+        <ChangeItem pull="11901">
+          Fixes an issue where the tunnel may not come up after a fresh install
+          of the Firezone client.
+        </ChangeItem>
+        <ChangeItem pull="11892">
+          Exports logs in plain text format instead of JSONL for easier reading.
+        </ChangeItem>
+        <ChangeItem pull="11834">
+          Fixes an issue where the tunnel might hang or crash on iOS immediately
+          after signing in.
+        </ChangeItem>
+        <ChangeItem pull="11659">
+          Prevents unbounded log growth by enforcing a 100 MB log size cap with
+          automatic cleanup of oldest files.
+        </ChangeItem>
+        <ChangeItem pull="11804">
+          Fixes an issue where connections would flap between relayed and
+          direct, causing WireGuard connection timeouts.
+        </ChangeItem>
+        <ChangeItem pull="11891">
+          Fixes an issue where cached IPv6 addresses for a resource got returned
+          for IPv4-only DNS resources if the setting was only changed after a
+          DNS query had already been processed.
+        </ChangeItem>
+      </Entry>
+      <Entry version="1.5.12" date={new Date("2026-01-20")}>
+        <ChangeItem pull="11735">
+          Fixes an issue on iOS where the system resolvers could not be reliably
+          read, causing DNS queries to fail system-wide.
+        </ChangeItem>
         <ChangeItem pull="11625">
           Fails faster when the initial connection to the control plane cannot
           be established, allowing the user to retry sooner.
@@ -58,7 +109,7 @@ export default function Apple() {
           responses. For example, this allows Firezone to automatically sign-in
           even if Internet Access is gated by a captive portal.
         </ChangeItem>
-      </Unreleased>
+      </Entry>
       <Entry version="1.5.11" date={new Date("2025-12-23")}>
         <ChangeItem pull="11141">
           Fixes an issue where spurious resource updates would result in
@@ -125,10 +176,9 @@ export default function Apple() {
           resolve for a few seconds after showing up in the Resource List.
         </ChangeItem>
         <ChangeItem pull="10104">
-          Fixes an issue where DNS resources would resolve to a different IP
-          after signing out and back into Firezone. This would break
-          connectivity for long-running services that don&apos;t re-resolve DNS,
-          like SSH sessions or mongoose.
+          {
+            "Fixes an issue where DNS resources would resolve to a different IP after signing out and back into Firezone. This would break connectivity for long-running services that don't re-resolve DNS, like SSH sessions or mongoose."
+          }
         </ChangeItem>
       </Entry>
       <Entry version="1.5.7" date={new Date("2025-08-07")}>
@@ -493,15 +543,16 @@ export default function Apple() {
       </Entry>
       <Entry version="1.3.6" date={new Date("2024-10-02")}>
         <ChangeItem pull="6831">
-          Ensures Firefox doesn&apos;t attempt to use DNS over HTTPS when
-          Firezone is active.
+          {
+            "Ensures Firefox doesn't attempt to use DNS over HTTPS when Firezone is active."
+          }
         </ChangeItem>
         <ChangeItem pull="6845">
           Fixes connectivity issues on idle connections by entering an
           always-on, low-power mode instead of closing them.
         </ChangeItem>
         <ChangeItem pull="6857">
-          MacOS: sends hardware&apos;s UUID for device verification.
+          {"MacOS: sends hardware's UUID for device verification."}
         </ChangeItem>
         <ChangeItem pull="6857">
           iOS: sends Id for vendor for device verification.
@@ -535,8 +586,9 @@ export default function Apple() {
       </Entry>
       <Entry version="1.3.2" date={new Date("2024-09-18")}>
         <ChangeItem pull="6632">
-          (macOS) Fixes a bug where the addressDescription wasn&apos;t fully
-          displayed in the macOS menu bar if it exceeded a certain length.
+          {
+            "(macOS) Fixes a bug where the addressDescription wasn't fully displayed in the macOS menu bar if it exceeded a certain length."
+          }
         </ChangeItem>
         <ChangeItem pull="6679">
           (macOS) Displays a notification when a new version is available.
@@ -544,9 +596,9 @@ export default function Apple() {
       </Entry>
       <Entry version="1.3.1" date={new Date("2024-09-05")}>
         <ChangeItem pull="6521">
-          Gracefully handles cases where the device&apos;s local interface
-          IPv4/IPv6 address or local network gateway changes while the client is
-          connected.
+          {
+            "Gracefully handles cases where the device's local interface IPv4/IPv6 address or local network gateway changes while the client is connected."
+          }
         </ChangeItem>
         <ChangeItem pull="6518">
           Minor improvements to the look of the internet resource and makes the
@@ -575,9 +627,9 @@ export default function Apple() {
           Adds the ability to mark Resources as favorites.
         </ChangeItem>
         <ChangeItem pull="6361">
-          Connections to Gateways are now sticky for the duration of the
-          Client&apos;s session. This fixes potential issues maintaining
-          long-lived TCP connections to Gateways in a high-availability setup.
+          {
+            "Connections to Gateways are now sticky for the duration of the Client's session. This fixes potential issues maintaining long-lived TCP connections to Gateways in a high-availability setup."
+          }
         </ChangeItem>
       </Entry>
       <Entry version="1.1.5" date={new Date("2024-08-13")}>
@@ -608,9 +660,9 @@ export default function Apple() {
       </Entry>
       <Entry version="1.1.2" date={new Date("2024-07-03")}>
         <li className="pl-2">
-          Prevents Firezone&apos;s stub resolver from intercepting DNS record
-          types besides A, AAAA, and PTR. These are now forwarded to your
-          upstream DNS resolver.
+          {
+            "Prevents Firezone's stub resolver from intercepting DNS record types besides A, AAAA, and PTR. These are now forwarded to your upstream DNS resolver."
+          }
         </li>
       </Entry>
       <Entry version="1.1.1" date={new Date("2024-06-29")}>

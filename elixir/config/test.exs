@@ -12,10 +12,20 @@ partition_suffix =
   end
 
 config :portal, sql_sandbox: true
+# Replica is not used in tests; use the primary DB instead
+config :portal, replica_repo: Portal.Repo
+
+# Use ephemeral port for health server to avoid conflicts between test runs
+config :portal, Portal.Health, health_port: 0
 
 config :portal, run_manual_migrations: true
 
 config :portal, Portal.Repo,
+  database: "firezone_test#{partition_suffix}",
+  pool: Ecto.Adapters.SQL.Sandbox,
+  queue_target: 1000
+
+config :portal, Portal.Repo.Replica,
   database: "firezone_test#{partition_suffix}",
   pool: Ecto.Adapters.SQL.Sandbox,
   queue_target: 1000
@@ -65,18 +75,29 @@ config :portal, Portal.Billing,
   enabled: true,
   secret_key: "sk_test_123",
   webhook_signing_secret: "whsec_test_123",
-  default_price_id: "price_test_123"
+  default_price_id: "price_test_123",
+  plan_product_ids: [
+    # Starter
+    "prod_test_starter",
+    # Team
+    "prod_test_team",
+    # Enterprise
+    "prod_test_enterprise"
+  ],
+  # Adhoc Device
+  adhoc_device_product_id: "prod_test_adhoc_device"
 
 config :portal, Portal.Billing.Stripe.APIClient,
   endpoint: "https://api.stripe.com",
-  req_options: [
+  req_opts: [
     plug: {Req.Test, Portal.Billing.Stripe.APIClient},
     retry: false
   ]
 
 config :portal, Portal.Okta.APIClient,
-  req_options: [
-    plug: {Req.Test, Portal.Okta.APIClient}
+  req_opts: [
+    plug: {Req.Test, Portal.Okta.APIClient},
+    retry: false
   ]
 
 config :portal, Portal.Entra.APIClient,
@@ -84,23 +105,18 @@ config :portal, Portal.Entra.APIClient,
   client_secret: "test_client_secret",
   endpoint: "https://graph.microsoft.com",
   token_base_url: "https://login.microsoftonline.com",
-  req_options: [
+  req_opts: [
     plug: {Req.Test, Portal.Entra.APIClient},
     retry: false
   ]
 
 config :portal, Portal.Telemetry, enabled: false
 
+config :opentelemetry_experimental, sdk_disabled: true
+
 config :portal, Portal.ConnectivityChecks, enabled: false
-
-config :portal, platform_adapter: Portal.GoogleCloudPlatform
-
-config :portal, Portal.GoogleCloudPlatform,
-  service_account_email: "foo@iam.example.com",
-  req_options: [
-    plug: {Req.Test, Portal.GoogleCloudPlatform},
-    retry: false
-  ]
+config :portal, Portal.ClientSession.Buffer, enabled: false
+config :portal, Portal.GatewaySession.Buffer, enabled: false
 
 config :portal, Portal.ComponentVersions,
   fetch_from_url: false,
@@ -115,12 +131,36 @@ config :portal, Portal.ComponentVersions,
 config :portal, Portal.Google.APIClient,
   endpoint: "https://admin.googleapis.com",
   token_endpoint: "https://oauth2.googleapis.com/token",
-  req_options: [
+  req_opts: [
     retry: false,
     plug: {Req.Test, Portal.Google.APIClient}
   ]
 
-config :portal, Portal.Telemetry.Reporter.GoogleCloudMetrics, project_id: "fz-test"
+# Auth provider configs with Req.Test for OIDC mocking
+config :portal, Portal.Google.AuthProvider,
+  req_opts: [
+    retry: false,
+    plug: {Req.Test, PortalWeb.OIDC}
+  ]
+
+config :portal, Portal.Okta.AuthProvider,
+  req_opts: [
+    retry: false,
+    plug: {Req.Test, PortalWeb.OIDC}
+  ]
+
+config :portal, Portal.Entra.AuthProvider,
+  client_id: "test_auth_provider_client_id",
+  req_opts: [
+    retry: false,
+    plug: {Req.Test, PortalWeb.OIDC}
+  ]
+
+config :portal, Portal.OIDC.AuthProvider,
+  req_opts: [
+    retry: false,
+    plug: {Req.Test, PortalWeb.OIDC}
+  ]
 
 config :portal, web_external_url: "http://localhost:13100"
 
@@ -131,12 +171,14 @@ config :portal, Oban, testing: :manual
 ##### PortalWeb Endpoint ######
 ###############################
 
+# Use ephemeral port for HTTP server to avoid conflicts between test runs
+# Keep url port for URL generation in tests
 config :portal, PortalWeb.Endpoint,
-  http: [port: 13_100],
+  http: [port: 0],
   url: [port: 13_100],
   server: true
 
-config :portal, PortalWeb.Plugs.SecureHeaders,
+config :portal, PortalWeb.Plugs.PutCSPHeader,
   csp_policy: [
     "default-src 'self' 'nonce-${nonce}' https://firezone.statuspage.io",
     "img-src 'self' data: https://www.gravatar.com https://firezone.statuspage.io",
@@ -145,13 +187,15 @@ config :portal, PortalWeb.Plugs.SecureHeaders,
   ]
 
 config :portal, :constant_execution_time, 1
+config :portal, replica_repo: Portal.Repo
 
 ###############################
 ##### PortalAPI Endpoint ######
 ###############################
 
+# Use ephemeral port for HTTP server to avoid conflicts between test runs
 config :portal, PortalAPI.Endpoint,
-  http: [port: 13_101],
+  http: [port: 0],
   url: [port: 13_101],
   server: true
 
@@ -167,6 +211,11 @@ config :portal, Portal.Mailer, adapter: Portal.Mailer.TestAdapter
 config :logger, level: :info
 
 config :argon2_elixir, t_cost: 1, m_cost: 8
+
+config :geolix,
+  databases: [
+    %{id: :city, adapter: Geolix.Adapter.Fake, data: %{}}
+  ]
 
 config :wallaby,
   driver: Wallaby.Chrome,

@@ -5,12 +5,7 @@
 //
 
 import Foundation
-import Sentry
 import UserNotifications
-
-#if os(macOS)
-  import AppKit
-#endif
 
 // SessionNotification helps with showing iOS local notifications
 // when the session ends.
@@ -23,8 +18,8 @@ public enum NotificationIndentifier: String {
 }
 
 @MainActor
-public class SessionNotification: NSObject {
-  public var signInHandler = {}
+public class SessionNotification: NSObject, SessionNotificationProtocol {
+  public var signInHandler: () async -> Void = {}
   private let notificationCenter = UNUserNotificationCenter.current()
 
   override public init() {
@@ -54,7 +49,7 @@ public class SessionNotification: NSObject {
     #endif
   }
 
-  func askUserForNotificationPermissions() async throws -> UNAuthorizationStatus {
+  public func askUserForNotificationPermissions() async throws -> UNAuthorizationStatus {
     // Ask the user for permission.
     try await notificationCenter.requestAuthorization(options: [.sound, .alert])
 
@@ -62,11 +57,44 @@ public class SessionNotification: NSObject {
     return await loadAuthorizationStatus()
   }
 
-  func loadAuthorizationStatus() async -> UNAuthorizationStatus {
+  public func loadAuthorizationStatus() async -> UNAuthorizationStatus {
     let settings = await notificationCenter.notificationSettings()
 
     return settings.authorizationStatus
   }
+
+  /// Shows a notification for an unreachable resource
+  ///
+  /// - Parameters:
+  ///   - title: The notification title
+  ///   - body: The notification body text
+  public func showResourceNotification(title: String, body: String) async {
+    // Check if we have permission to show notifications
+    let settings = await notificationCenter.notificationSettings()
+    guard settings.authorizationStatus == .authorized else {
+      Log.log("Cannot show notification - not authorized")
+      return
+    }
+
+    let content = UNMutableNotificationContent()
+    content.title = title
+    content.body = body
+    content.sound = .default
+
+    let request = UNNotificationRequest(
+      identifier: UUID().uuidString,
+      content: content,
+      trigger: nil  // Show immediately
+    )
+
+    do {
+      try await notificationCenter.add(request)
+      Log.log("Notification shown: \(title)")
+    } catch {
+      Log.warning("Failed to show notification: \(error)")
+    }
+  }
+
   #if os(iOS)
     // In iOS, use User Notifications.
     // This gets called from the tunnel side.
@@ -99,28 +127,11 @@ public class SessionNotification: NSObject {
     // In macOS, use a Cocoa alert.
     // This gets called from the app side.
     @MainActor
-    func showSignedOutAlertmacOS(_ message: String?) async {
-      let alert = NSAlert()
-      alert.messageText = "Your Firezone session has ended"
-      alert.informativeText = """
-        Please sign in again to reconnect.
-
-        \(message ?? "")
-        """
-      alert.addButton(withTitle: "Sign In")
-      alert.addButton(withTitle: "Cancel")
-      NSApp.activate(ignoringOtherApps: true)
-
-      await withCheckedContinuation { continuation in
-        SentrySDK.pauseAppHangTracking()
-        defer { SentrySDK.resumeAppHangTracking() }
-        let response = alert.runModal()
-
-        if response == NSApplication.ModalResponse.alertFirstButtonReturn {
-          Log.log("\(#function): 'Sign In' clicked in notification")
-          signInHandler()
-        }
-        continuation.resume()
+    public func showSignedOutAlertMacOS(_ message: String?) async {
+      let signInClicked = await MacOSAlert.showSignedOutAlert(message)
+      if signInClicked {
+        Log.log("\(#function): 'Sign In' clicked in notification")
+        await signInHandler()
       }
     }
   #endif
@@ -141,7 +152,7 @@ public class SessionNotification: NSObject {
       {
         // User clicked on 'Sign In' in the notification
         Task { @MainActor in
-          signInHandler()
+          await signInHandler()
         }
       }
 

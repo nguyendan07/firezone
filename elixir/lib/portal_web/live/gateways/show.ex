@@ -1,11 +1,11 @@
 defmodule PortalWeb.Gateways.Show do
   use PortalWeb, :live_view
   alias Portal.Presence
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(%{"id" => id}, _session, socket) do
-    gateway = DB.get_gateway!(id, socket.assigns.subject)
-    gateway = DB.preload_gateways_presence([gateway]) |> List.first()
+    gateway = Database.get_gateway!(id, socket.assigns.subject)
+    gateway = Database.preload_gateways_presence([gateway]) |> List.first()
 
     if connected?(socket) do
       :ok = Presence.Gateways.Site.subscribe(gateway.site_id)
@@ -67,13 +67,15 @@ defmodule PortalWeb.Gateways.Show do
               Last started
             </:label>
             <:value>
-              <.relative_datetime datetime={@gateway.last_seen_at} />
+              <.relative_datetime datetime={
+                @gateway.latest_session && @gateway.latest_session.inserted_at
+              } />
             </:value>
           </.vertical_table_row>
           <.vertical_table_row>
             <:label>Last seen remote IP</:label>
             <:value>
-              <.last_seen schema={@gateway} />
+              <.last_seen schema={@gateway.latest_session} />
             </:value>
           </.vertical_table_row>
           <!--
@@ -85,13 +87,13 @@ defmodule PortalWeb.Gateways.Show do
           <.vertical_table_row>
             <:label>Version</:label>
             <:value>
-              {@gateway.last_seen_version}
+              {@gateway.latest_session && @gateway.latest_session.version}
             </:value>
           </.vertical_table_row>
           <.vertical_table_row>
             <:label>User agent</:label>
             <:value>
-              {@gateway.last_seen_user_agent}
+              {@gateway.latest_session && @gateway.latest_session.user_agent}
             </:value>
           </.vertical_table_row>
           <.vertical_table_row>
@@ -151,7 +153,7 @@ defmodule PortalWeb.Gateways.Show do
     socket =
       cond do
         Map.has_key?(payload.joins, gateway.id) ->
-          gateway = DB.get_gateway!(gateway.id, socket.assigns.subject)
+          gateway = Database.get_gateway!(gateway.id, socket.assigns.subject)
           assign(socket, gateway: %{gateway | online?: true})
 
         Map.has_key?(payload.leaves, gateway.id) ->
@@ -165,7 +167,7 @@ defmodule PortalWeb.Gateways.Show do
   end
 
   def handle_event("delete", _params, socket) do
-    {:ok, _gateway} = DB.delete_gateway(socket.assigns.gateway, socket.assigns.subject)
+    {:ok, _gateway} = Database.delete_gateway(socket.assigns.gateway, socket.assigns.subject)
 
     socket =
       socket
@@ -175,17 +177,35 @@ defmodule PortalWeb.Gateways.Show do
     {:noreply, socket}
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Gateway
+    alias Portal.GatewaySession
 
     def get_gateway!(id, subject) do
-      from(g in Gateway, as: :gateways)
-      |> where([gateways: g], g.id == ^id)
-      |> preload([:site, :ipv4_address, :ipv6_address])
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      gateway =
+        from(g in Gateway, as: :gateways)
+        |> where([gateways: g], g.id == ^id)
+        |> preload([:site, :ipv4_address, :ipv6_address])
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      preload_latest_session(gateway)
+    end
+
+    defp preload_latest_session(gateway) do
+      session =
+        from(s in GatewaySession,
+          where: s.gateway_id == ^gateway.id,
+          where: s.account_id == ^gateway.account_id,
+          order_by: [desc: s.inserted_at],
+          limit: 1
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one()
+
+      %{gateway | latest_session: session}
     end
 
     def delete_gateway(gateway, subject) do

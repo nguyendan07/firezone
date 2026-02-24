@@ -4,14 +4,15 @@ defmodule PortalAPI.Client.Channel do
 
   alias Portal.{
     Cache,
+    Channels,
     Changes.Change,
     PubSub,
     Gateway,
     Presence,
-    Auth
+    Authentication
   }
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
   require OpenTelemetry.Tracer
 
@@ -49,6 +50,7 @@ defmodule PortalAPI.Client.Channel do
       Cache.Client.recompute_connectable_resources(
         nil,
         socket.assigns.client,
+        socket.assigns.session,
         socket.assigns.subject
       )
 
@@ -62,15 +64,16 @@ defmodule PortalAPI.Client.Channel do
     # Track client's presence
     :ok = Presence.Clients.connect(socket.assigns.client, socket.assigns.subject.credential.id)
 
-    # Subscribe to all account updates
-    :ok = PubSub.Account.subscribe(socket.assigns.client.account_id)
+    # Register for targeted messages from gateway channels
+    :ok = Channels.register_client(socket.assigns.client.id)
+    :ok = PubSub.Changes.subscribe(socket.assigns.client.account_id)
 
     push(socket, "init", %{
       resources: Views.Resource.render_many(resources),
       relays:
         Views.Relay.render_many(
           relays,
-          socket.assigns.client.public_key,
+          socket.assigns.session.public_key,
           socket.assigns.subject.expires_at
         ),
       interface:
@@ -121,6 +124,7 @@ defmodule PortalAPI.Client.Channel do
       Cache.Client.recompute_connectable_resources(
         socket.assigns.cache,
         socket.assigns.client,
+        socket.assigns.session,
         socket.assigns.subject
       )
 
@@ -149,50 +153,88 @@ defmodule PortalAPI.Client.Channel do
         },
         socket
       ) do
+    # Cancel any existing debounce timer to implement true debouncing
+    # (only the last event in a burst triggers the check)
+    if timer_ref = socket.assigns[:relay_presence_timer_ref] do
+      Process.cancel_timer(timer_ref)
+    end
+
+    # Use a unique reference to identify this timer. When handling the message,
+    # we check if it matches the current ref to prevent processing stale messages
+    # that were already in the mailbox when the timer was cancelled.
+    ref = make_ref()
     debounce_ms = Portal.Config.get_env(:portal, :relay_presence_debounce_ms, 1_000)
-    Process.send_after(self(), :check_relay_presence, debounce_ms)
+    timer_ref = Process.send_after(self(), {:check_relay_presence, ref}, debounce_ms)
+
+    socket =
+      socket
+      |> assign(:relay_presence_timer_ref, timer_ref)
+      |> assign(:relay_presence_ref, ref)
+
     {:noreply, socket}
   end
 
   # Debounced relay presence check - queries the CRDT state after the debounce period.
   # cached_relay_ids is a MapSet of relay IDs we've sent to the client.
   # Presence is keyed by relay ID.
-  def handle_info(:check_relay_presence, socket) do
-    cached_relay_ids = socket.assigns[:cached_relay_ids] || MapSet.new()
-
-    # Check current presence state - this is the authoritative CRDT-merged state
-    # Presence is keyed by relay ID
-    current_relay_ids = Presence.Relays.Global.list() |> Map.keys() |> MapSet.new()
-
-    # Find which cached relays are now disconnected (ID no longer in presence)
-    disconnected_ids =
-      cached_relay_ids
-      |> Enum.reject(&MapSet.member?(current_relay_ids, &1))
-      |> Enum.to_list()
-
-    # Send relays_presence if any cached relays are disconnected OR if we have fewer than 2 relays
-    # and more are now available
-    needs_update =
-      disconnected_ids != [] or
-        (MapSet.size(cached_relay_ids) < 2 and MapSet.size(current_relay_ids) > 0)
-
-    if needs_update do
-      {:ok, relays} = select_relays(socket)
-      socket = cache_relays(socket, relays)
-
-      push(socket, "relays_presence", %{
-        disconnected_ids: disconnected_ids,
-        connected:
-          Views.Relay.render_many(
-            relays,
-            socket.assigns.client.public_key,
-            socket.assigns.subject.expires_at
-          )
-      })
-
+  def handle_info({:check_relay_presence, ref}, socket) do
+    # Only process if the ref matches the current active timer.
+    # This prevents processing stale messages that were already in the mailbox
+    # when Process.cancel_timer/1 was called.
+    if ref != socket.assigns[:relay_presence_ref] do
       {:noreply, socket}
     else
-      {:noreply, socket}
+      # Clear the timer references since we're processing now
+      socket =
+        socket
+        |> assign(:relay_presence_timer_ref, nil)
+        |> assign(:relay_presence_ref, nil)
+
+      cached_relay_ids = socket.assigns[:cached_relay_ids] || MapSet.new()
+
+      # Query presence ONCE - use this single snapshot for both determining
+      # disconnected relays and selecting connected relays. This avoids a race
+      # condition where CRDT state changes between queries during rapid
+      # disconnect/reconnect cycles.
+      {:ok, all_online_relays} = Presence.Relays.all_connected_relays()
+      online_relay_ids = MapSet.new(all_online_relays, & &1.id)
+
+      # Find which cached relays are now truly offline (ID no longer in presence)
+      disconnected_ids =
+        cached_relay_ids
+        |> Enum.reject(&MapSet.member?(online_relay_ids, &1))
+        |> Enum.to_list()
+
+      # Send relays_presence if any cached relays are disconnected OR if we have fewer than 2 relays
+      # and more are now available
+      needs_update =
+        disconnected_ids != [] or
+          (MapSet.size(cached_relay_ids) < 2 and MapSet.size(online_relay_ids) > 0)
+
+      if needs_update do
+        # Select best relays from the SAME snapshot we used for disconnected_ids
+        location = {
+          socket.assigns.subject.context.remote_ip_location_lat,
+          socket.assigns.subject.context.remote_ip_location_lon
+        }
+
+        relays = load_balance_relays(location, all_online_relays)
+        socket = cache_relays(socket, relays)
+
+        push(socket, "relays_presence", %{
+          disconnected_ids: disconnected_ids,
+          connected:
+            Views.Relay.render_many(
+              relays,
+              socket.assigns.session.public_key,
+              socket.assigns.subject.expires_at
+            )
+        })
+
+        {:noreply, socket}
+      else
+        {:noreply, socket}
+      end
     end
   end
 
@@ -201,11 +243,7 @@ defmodule PortalAPI.Client.Channel do
   #############################################################
 
   # This the list of ICE candidates gathered by the gateway and relayed to the client
-  def handle_info(
-        {{:ice_candidates, client_id}, gateway_id, candidates},
-        %{assigns: %{client: %{id: id}}} = socket
-      )
-      when client_id == id do
+  def handle_info({:ice_candidates, gateway_id, candidates}, socket) do
     push(socket, "ice_candidates", %{
       gateway_id: gateway_id,
       candidates: candidates
@@ -214,11 +252,7 @@ defmodule PortalAPI.Client.Channel do
     {:noreply, socket}
   end
 
-  def handle_info(
-        {{:invalidate_ice_candidates, client_id}, gateway_id, candidates},
-        %{assigns: %{client: %{id: id}}} = socket
-      )
-      when client_id == id do
+  def handle_info({:invalidate_ice_candidates, gateway_id, candidates}, socket) do
     push(socket, "invalidate_ice_candidates", %{
       gateway_id: gateway_id,
       candidates: candidates
@@ -252,27 +286,47 @@ defmodule PortalAPI.Client.Channel do
          gateway_ipv6, preshared_key, ice_credentials},
         socket
       ) do
-    reply_payload = %{
-      resource_id: Ecto.UUID.load!(rid_bytes),
-      preshared_key: preshared_key,
-      client_ice_credentials: ice_credentials.client,
-      # TODO: conditionally rename to site_id based on client version
-      # apple: >= 1.5.11
-      # headless: >= 1.5.6
-      # android: >= 1.5.8
-      # gui: >= 1.5.10
-      # See https://github.com/firezone/firezone/commit/9d8b55212aea418264a272109776e795f5eda6ce
-      gateway_group_id: site_id,
-      gateway_id: gateway_id,
-      gateway_public_key: gateway_public_key,
-      gateway_ipv4: gateway_ipv4,
-      gateway_ipv6: gateway_ipv6,
-      gateway_ice_credentials: ice_credentials.gateway
-    }
+    resource_id = Ecto.UUID.load!(rid_bytes)
+    pending_flows = Map.get(socket.assigns, :pending_flows, %{})
 
-    push(socket, "flow_created", reply_payload)
+    if Map.has_key?(pending_flows, resource_id) do
+      reply_payload = %{
+        resource_id: resource_id,
+        preshared_key: preshared_key,
+        client_ice_credentials: ice_credentials.client,
+        # TODO: conditionally rename to site_id based on client version
+        # apple: >= 1.5.11
+        # headless: >= 1.5.6
+        # android: >= 1.5.8
+        # gui: >= 1.5.10
+        # See https://github.com/firezone/firezone/commit/9d8b55212aea418264a272109776e795f5eda6ce
+        gateway_group_id: site_id,
+        gateway_id: gateway_id,
+        gateway_public_key: gateway_public_key,
+        gateway_ipv4: gateway_ipv4,
+        gateway_ipv6: gateway_ipv6,
+        gateway_ice_credentials: ice_credentials.gateway
+      }
 
-    {:noreply, socket}
+      push(socket, "flow_created", reply_payload)
+
+      socket = cancel_pending_flow(socket, resource_id)
+      {:noreply, socket}
+    else
+      # Flow already timed out — ignore late gateway response
+      {:noreply, socket}
+    end
+  end
+
+  def handle_info({:flow_creation_timeout, resource_id}, socket) do
+    pending_flows = Map.get(socket.assigns, :pending_flows, %{})
+
+    if Map.has_key?(pending_flows, resource_id) do
+      push(socket, "flow_creation_failed", %{resource_id: resource_id, reason: :offline})
+      {:noreply, assign(socket, :pending_flows, Map.delete(pending_flows, resource_id))}
+    else
+      {:noreply, socket}
+    end
   end
 
   # Catch-all for messages we don't handle
@@ -298,54 +352,88 @@ defmodule PortalAPI.Client.Channel do
            Cache.Client.authorize_resource(
              socket.assigns.cache,
              socket.assigns.client,
+             socket.assigns.session,
              resource_id,
              socket.assigns.subject
            ),
          {:ok, gateways} when gateways != [] <-
-           DB.all_compatible_gateways_for_client_and_resource(
-             socket.assigns.client,
+           Database.all_compatible_gateways_for_client_and_resource(
+             socket.assigns.client_version,
              resource,
-             socket.assigns.subject
+             socket.assigns.subject.account.id
            ) do
       location = {
-        socket.assigns.client.last_seen_remote_ip_location_lat,
-        socket.assigns.client.last_seen_remote_ip_location_lon
+        socket.assigns.subject.context.remote_ip_location_lat,
+        socket.assigns.subject.context.remote_ip_location_lon
       }
 
       gateway = Gateway.load_balance_gateways(location, gateways, connected_gateway_ids)
+      gateway_public_key = gateway.latest_session.public_key
 
-      # TODO: Optimization
-      # Move this to a Task.start that completes after broadcasting authorize_flow
-      {:ok, policy_authorization} =
-        create_policy_authorization(
+      policy_authorization_id = Ecto.UUID.generate()
+
+      preshared_key =
+        generate_preshared_key(
+          socket.assigns.client,
+          socket.assigns.session.public_key,
+          gateway,
+          gateway_public_key
+        )
+
+      ice_credentials =
+        generate_ice_credentials(
+          socket.assigns.session.public_key,
           socket.assigns.client,
           gateway,
-          resource_id,
-          policy_id,
-          membership_id,
-          socket.assigns.subject,
-          expires_at
+          gateway_public_key
         )
 
-      preshared_key = generate_preshared_key(socket.assigns.client, gateway)
-      ice_credentials = generate_ice_credentials(socket.assigns.client, gateway)
+      message =
+        {:authorize_policy, {self(), socket_ref(socket)},
+         %{
+           client:
+             PortalAPI.Gateway.Views.Client.render(
+               socket.assigns.client,
+               socket.assigns.session.public_key,
+               preshared_key,
+               socket.assigns.subject.context.user_agent
+             ),
+           subject: PortalAPI.Gateway.Views.Subject.render(socket.assigns.subject),
+           resource: PortalAPI.Gateway.Views.Resource.render(resource),
+           policy_authorization_id: policy_authorization_id,
+           authorization_expires_at: expires_at,
+           ice_credentials: ice_credentials,
+           preshared_key: preshared_key
+         }}
 
-      :ok =
-        PubSub.Account.broadcast(
-          socket.assigns.client.account_id,
-          {{:authorize_policy, gateway.id}, {self(), socket_ref(socket)},
-           %{
-             client: socket.assigns.client,
-             resource: resource,
-             policy_authorization_id: policy_authorization.id,
-             authorization_expires_at: expires_at,
-             ice_credentials: ice_credentials,
-             preshared_key: preshared_key,
-             subject: socket.assigns.subject
-           }}
-        )
+      async_create_policy_authorization(
+        policy_authorization_id,
+        socket.assigns.client,
+        gateway,
+        resource_id,
+        policy_id,
+        membership_id,
+        socket.assigns.subject,
+        expires_at
+      )
 
-      {:noreply, socket}
+      case Channels.send_to_gateway(gateway.id, message) do
+        :ok ->
+          timer_ref =
+            Process.send_after(
+              self(),
+              {:flow_creation_timeout, resource_id},
+              flow_creation_timeout()
+            )
+
+          pending_flows = Map.get(socket.assigns, :pending_flows, %{})
+          socket = assign(socket, :pending_flows, Map.put(pending_flows, resource_id, timer_ref))
+          {:noreply, socket}
+
+        {:error, :not_found} ->
+          push(socket, "flow_creation_failed", %{resource_id: resource_id, reason: :offline})
+          {:noreply, socket}
+      end
     else
       {:error, :not_found} ->
         push(socket, "flow_creation_failed", %{
@@ -371,6 +459,14 @@ defmodule PortalAPI.Client.Channel do
         })
 
         {:noreply, socket}
+
+      {:error, :version_mismatch} ->
+        push(socket, "flow_creation_failed", %{
+          resource_id: resource_id,
+          reason: :version_mismatch
+        })
+
+        {:noreply, socket}
     end
   end
 
@@ -384,24 +480,23 @@ defmodule PortalAPI.Client.Channel do
   def handle_in("prepare_connection", %{"resource_id" => resource_id} = attrs, socket) do
     connected_gateway_ids = Map.get(attrs, "connected_gateway_ids", [])
 
-    # TODO: Optimization
-    # Gateway selection and flow authorization shouldn't need to hit the DB
     with {:ok, resource, _membership_id, _policy_id, _expires_at} <-
            Cache.Client.authorize_resource(
              socket.assigns.cache,
              socket.assigns.client,
+             socket.assigns.session,
              resource_id,
              socket.assigns.subject
            ),
          {:ok, gateways} when gateways != [] <-
-           DB.all_compatible_gateways_for_client_and_resource(
-             socket.assigns.client,
+           Database.all_compatible_gateways_for_client_and_resource(
+             socket.assigns.client_version,
              resource,
-             socket.assigns.subject
+             socket.assigns.subject.account.id
            ) do
       location = {
-        socket.assigns.client.last_seen_remote_ip_location_lat,
-        socket.assigns.client.last_seen_remote_ip_location_lon
+        socket.assigns.subject.context.remote_ip_location_lat,
+        socket.assigns.subject.context.remote_ip_location_lon
       }
 
       gateway = Gateway.load_balance_gateways(location, gateways, connected_gateway_ids)
@@ -412,7 +507,7 @@ defmodule PortalAPI.Client.Channel do
            resource_id: resource_id,
            site_id: gateway.site_id,
            gateway_id: gateway.id,
-           gateway_remote_ip: gateway.last_seen_remote_ip
+           gateway_remote_ip: gateway.latest_session && gateway.latest_session.remote_ip
          }}
 
       {:reply, reply, socket}
@@ -422,6 +517,9 @@ defmodule PortalAPI.Client.Channel do
 
       {:ok, []} ->
         {:reply, {:error, %{reason: :offline}}, socket}
+
+      {:error, :version_mismatch} ->
+        {:reply, {:error, %{reason: :version_mismatch}}, socket}
 
       {:error, {:forbidden, violated_properties: violated_properties}} ->
         {:reply, {:error, %{reason: :forbidden, violated_properties: violated_properties}},
@@ -445,49 +543,51 @@ defmodule PortalAPI.Client.Channel do
            Cache.Client.authorize_resource(
              socket.assigns.cache,
              socket.assigns.client,
+             socket.assigns.session,
              resource_id,
              socket.assigns.subject
            ),
          {:ok, gateway} <-
-           DB.fetch_gateway_by_id(gateway_id, socket.assigns.subject)
-           |> then(fn
-             {:ok, gw} ->
-               {:ok, Presence.Gateways.preload_gateways_presence([gw]) |> List.first()}
+           Presence.Gateways.fetch_gateway(socket.assigns.subject.account.id, gateway_id),
+         true <- resource.site != nil and resource.site.id == Ecto.UUID.dump!(gateway.site_id) do
+      policy_authorization_id = Ecto.UUID.generate()
 
-             error ->
-               error
-           end),
-         true <- resource.site != nil and resource.site.id == Ecto.UUID.dump!(gateway.site_id),
-         true <- gateway.online? do
-      # TODO: Optimization
-      {:ok, policy_authorization} =
-        create_policy_authorization(
-          socket.assigns.client,
-          gateway,
-          resource_id,
-          policy_id,
-          membership_id,
-          socket.assigns.subject,
-          expires_at
-        )
+      async_create_policy_authorization(
+        policy_authorization_id,
+        socket.assigns.client,
+        gateway,
+        resource_id,
+        policy_id,
+        membership_id,
+        socket.assigns.subject,
+        expires_at
+      )
 
-      :ok =
-        PubSub.Account.broadcast(
-          socket.assigns.client.account_id,
-          {{:allow_access, gateway.id}, {self(), socket_ref(socket)},
-           %{
-             client: socket.assigns.client,
-             resource: resource,
-             policy_authorization_id: policy_authorization.id,
-             authorization_expires_at: expires_at,
-             client_payload: payload
-           }}
-        )
+      case Channels.send_to_gateway(
+             gateway.id,
+             {:allow_access, {self(), socket_ref(socket)},
+              %{
+                client_id: socket.assigns.client.id,
+                client_ipv4: socket.assigns.client.ipv4_address.address,
+                client_ipv6: socket.assigns.client.ipv6_address.address,
+                resource: resource,
+                policy_authorization_id: policy_authorization_id,
+                authorization_expires_at: expires_at,
+                client_payload: payload
+              }}
+           ) do
+        :ok ->
+          {:noreply, socket}
 
-      {:noreply, socket}
+        {:error, :not_found} ->
+          {:reply, {:error, %{reason: :offline}}, socket}
+      end
     else
       {:error, :not_found} ->
         {:reply, {:error, %{reason: :not_found}}, socket}
+
+      {:error, :offline} ->
+        {:reply, {:error, %{reason: :offline}}, socket}
 
       {:error, {:forbidden, violated_properties: violated_properties}} ->
         {:reply, {:error, %{reason: :forbidden, violated_properties: violated_properties}},
@@ -516,50 +616,54 @@ defmodule PortalAPI.Client.Channel do
            Cache.Client.authorize_resource(
              socket.assigns.cache,
              socket.assigns.client,
+             socket.assigns.session,
              resource_id,
              socket.assigns.subject
            ),
          {:ok, gateway} <-
-           DB.fetch_gateway_by_id(gateway_id, socket.assigns.subject)
-           |> then(fn
-             {:ok, gw} ->
-               {:ok, Presence.Gateways.preload_gateways_presence([gw]) |> List.first()}
+           Presence.Gateways.fetch_gateway(socket.assigns.subject.account.id, gateway_id),
+         true <- resource.site != nil and resource.site.id == Ecto.UUID.dump!(gateway.site_id) do
+      policy_authorization_id = Ecto.UUID.generate()
 
-             error ->
-               error
-           end),
-         true <- resource.site != nil and resource.site.id == Ecto.UUID.dump!(gateway.site_id),
-         true <- gateway.online? do
-      # TODO: Optimization
-      {:ok, policy_authorization} =
-        create_policy_authorization(
-          socket.assigns.client,
-          gateway,
-          resource_id,
-          policy_id,
-          membership_id,
-          socket.assigns.subject,
-          expires_at
-        )
+      async_create_policy_authorization(
+        policy_authorization_id,
+        socket.assigns.client,
+        gateway,
+        resource_id,
+        policy_id,
+        membership_id,
+        socket.assigns.subject,
+        expires_at
+      )
 
-      :ok =
-        PubSub.Account.broadcast(
-          socket.assigns.client.account_id,
-          {{:request_connection, gateway.id}, {self(), socket_ref(socket)},
-           %{
-             client: socket.assigns.client,
-             resource: resource,
-             policy_authorization_id: policy_authorization.id,
-             authorization_expires_at: expires_at,
-             client_payload: client_payload,
-             client_preshared_key: preshared_key
-           }}
-        )
+      case Channels.send_to_gateway(
+             gateway.id,
+             {:request_connection, {self(), socket_ref(socket)},
+              %{
+                client:
+                  PortalAPI.Gateway.Views.Client.render_legacy(
+                    socket.assigns.client,
+                    socket.assigns.session.public_key,
+                    client_payload,
+                    preshared_key
+                  ),
+                resource: resource,
+                policy_authorization_id: policy_authorization_id,
+                authorization_expires_at: expires_at
+              }}
+           ) do
+        :ok ->
+          {:noreply, socket}
 
-      {:noreply, socket}
+        {:error, :not_found} ->
+          {:reply, {:error, %{reason: :offline}}, socket}
+      end
     else
       {:error, :not_found} ->
         {:reply, {:error, %{reason: :not_found}}, socket}
+
+      {:error, :offline} ->
+        {:reply, {:error, %{reason: :offline}}, socket}
 
       {:error, {:forbidden, violated_properties: violated_properties}} ->
         {:reply, {:error, %{reason: :forbidden, violated_properties: violated_properties}},
@@ -576,13 +680,12 @@ defmodule PortalAPI.Client.Channel do
         %{"candidates" => candidates, "gateway_ids" => gateway_ids},
         socket
       ) do
-    :ok =
-      Enum.each(gateway_ids, fn gateway_id ->
-        PubSub.Account.broadcast(
-          socket.assigns.client.account_id,
-          {{:ice_candidates, gateway_id}, socket.assigns.client.id, candidates}
-        )
-      end)
+    Enum.each(gateway_ids, fn gateway_id ->
+      Channels.send_to_gateway(
+        gateway_id,
+        {:ice_candidates, socket.assigns.client.id, candidates}
+      )
+    end)
 
     {:noreply, socket}
   end
@@ -592,13 +695,12 @@ defmodule PortalAPI.Client.Channel do
         %{"candidates" => candidates, "gateway_ids" => gateway_ids},
         socket
       ) do
-    :ok =
-      Enum.each(gateway_ids, fn gateway_id ->
-        PubSub.Account.broadcast(
-          socket.assigns.client.account_id,
-          {{:invalidate_ice_candidates, gateway_id}, socket.assigns.client.id, candidates}
-        )
-      end)
+    Enum.each(gateway_ids, fn gateway_id ->
+      Channels.send_to_gateway(
+        gateway_id,
+        {:invalidate_ice_candidates, socket.assigns.client.id, candidates}
+      )
+    end)
 
     {:noreply, socket}
   end
@@ -614,8 +716,8 @@ defmodule PortalAPI.Client.Channel do
     {:ok, relays} = Presence.Relays.all_connected_relays(except_ids)
 
     location = {
-      socket.assigns.client.last_seen_remote_ip_location_lat,
-      socket.assigns.client.last_seen_remote_ip_location_lon
+      socket.assigns.subject.context.remote_ip_location_lat,
+      socket.assigns.subject.context.remote_ip_location_lon
     }
 
     relays = load_balance_relays(location, relays)
@@ -628,20 +730,20 @@ defmodule PortalAPI.Client.Channel do
     assign(socket, :cached_relay_ids, cached_relay_ids)
   end
 
-  defp generate_preshared_key(client, gateway) do
-    Portal.Crypto.psk(client, gateway)
+  defp generate_preshared_key(client, client_public_key, gateway, gateway_public_key) do
+    Portal.Crypto.psk(client, client_public_key, gateway, gateway_public_key)
   end
 
   # Ice credentials must stay the same for all connections between client and gateway as long as they
   # do not loose their state, so we can leverage public_key which is reset on each restart of the client
   # or gateway.
-  defp generate_ice_credentials(client, gateway) do
+  defp generate_ice_credentials(client_public_key, client, gateway, gateway_public_key) do
     ice_credential_seed =
       [
         client.id,
-        client.public_key,
+        client_public_key,
         gateway.id,
-        gateway.public_key
+        gateway_public_key
       ]
       |> Enum.join(":")
 
@@ -710,6 +812,7 @@ defmodule PortalAPI.Client.Channel do
     Cache.Client.add_membership(
       socket.assigns.cache,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -727,6 +830,7 @@ defmodule PortalAPI.Client.Channel do
       socket.assigns.cache,
       membership,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -759,6 +863,7 @@ defmodule PortalAPI.Client.Channel do
       Cache.Client.recompute_connectable_resources(
         socket.assigns.cache,
         socket.assigns.client,
+        socket.assigns.session,
         socket.assigns.subject
       )
       |> push_resource_updates(socket)
@@ -792,6 +897,7 @@ defmodule PortalAPI.Client.Channel do
       socket.assigns.cache,
       site,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -807,6 +913,7 @@ defmodule PortalAPI.Client.Channel do
       socket.assigns.cache,
       policy,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -867,6 +974,7 @@ defmodule PortalAPI.Client.Channel do
       socket.assigns.cache,
       policy,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -886,6 +994,7 @@ defmodule PortalAPI.Client.Channel do
       socket.assigns.cache,
       resource,
       socket.assigns.client,
+      socket.assigns.session,
       socket.assigns.subject
     )
     |> push_resource_updates(socket)
@@ -909,62 +1018,51 @@ defmodule PortalAPI.Client.Channel do
     {:noreply, assign(socket, cache: cache)}
   end
 
-  defmodule DB do
-    import Ecto.Query
-    alias Portal.{Safe, Gateway}
-
-    def fetch_gateway_by_id(id, subject) do
-      result =
-        from(g in Gateway, as: :gateways)
-        |> where([gateways: g], g.id == ^id)
-        |> Safe.scoped(subject)
-        |> Safe.one()
-
-      case result do
-        nil -> {:error, :not_found}
-        {:error, :unauthorized} -> {:error, :unauthorized}
-        gateway -> {:ok, gateway}
-      end
-    end
-
+  defmodule Database do
     def all_compatible_gateways_for_client_and_resource(
-          %Portal.Client{} = client,
+          client_version,
           resource,
-          subject
+          account_id
         ) do
       resource_site_id = site_id_from_resource(resource)
 
-      connected_gateway_ids =
-        Presence.Gateways.Account.list(subject.account.id)
-        |> Map.keys()
+      site_gateways =
+        Presence.Gateways.all_connected_gateways(account_id)
+        |> Enum.filter(&(&1.site_id == resource_site_id))
 
-      gateways =
-        from(g in Gateway, as: :gateways)
-        |> where([gateways: g], g.id in ^connected_gateway_ids and g.site_id == ^resource_site_id)
-        |> Safe.scoped(subject)
-        |> Safe.all()
-        |> case do
-          {:error, :unauthorized} -> []
-          gateways -> filter_compatible_gateways(gateways, resource, client.last_seen_version)
-        end
+      compatible_gateways =
+        filter_compatible_gateways(site_gateways, resource, client_version)
 
-      {:ok, gateways}
+      cond do
+        compatible_gateways != [] ->
+          {:ok, compatible_gateways}
+
+        site_gateways != [] ->
+          {:error, :version_mismatch}
+
+        true ->
+          {:ok, []}
+      end
     end
 
     # Filters gateways by the resource type, gateway version, and client version.
+    defp filter_compatible_gateways(gateways, _resource, nil), do: gateways
+
     defp filter_compatible_gateways(gateways, resource, client_version) do
       case Version.parse(client_version) do
         {:ok, version} ->
           gateways
           |> Enum.filter(fn gateway ->
-            case Version.parse(gateway.last_seen_version) do
+            gateway_version_str = gateway.latest_session && gateway.latest_session.version
+
+            case gateway_version_str && Version.parse(gateway_version_str) do
               {:ok, gateway_version} ->
                 Version.match?(gateway_version, ">= #{version.major}.#{version.minor - 1}.0") and
                   Version.match?(gateway_version, "< #{version.major}.#{version.minor + 2}.0") and
                   not is_nil(
                     Portal.Resource.adapt_resource_for_version(
                       resource,
-                      gateway.last_seen_version
+                      gateway_version_str
                     )
                   )
 
@@ -1009,9 +1107,8 @@ defmodule PortalAPI.Client.Channel do
   defp nils_last(_, nil), do: true
   defp nils_last(a, b), do: a <= b
 
-  # Inline functions from Portal.PolicyAuthorizations
-
-  defp create_policy_authorization(
+  defp async_create_policy_authorization(
+         policy_authorization_id,
          %Portal.Client{
            id: client_id,
            account_id: account_id,
@@ -1019,46 +1116,93 @@ defmodule PortalAPI.Client.Channel do
          },
          %Portal.Gateway{
            id: gateway_id,
-           last_seen_remote_ip: gateway_remote_ip,
            account_id: account_id
-         },
+         } = gateway,
          resource_id,
          policy_id,
          membership_id,
-         %Auth.Subject{
+         %Authentication.Subject{
            account: %{id: account_id},
            actor: %{id: actor_id},
            credential: %{id: token_id},
-           context: %Auth.Context{
+           context: %Authentication.Context{
              remote_ip: client_remote_ip,
              user_agent: client_user_agent
            }
          } = subject,
          expires_at
        ) do
-    changeset =
-      create_policy_authorization_changeset(%{
-        token_id: token_id,
-        policy_id: policy_id,
-        client_id: client_id,
-        gateway_id: gateway_id,
-        resource_id: resource_id,
-        membership_id: membership_id,
-        account_id: account_id,
-        client_remote_ip: client_remote_ip,
-        client_user_agent: client_user_agent,
-        gateway_remote_ip: gateway_remote_ip,
-        expires_at: expires_at
-      })
+    gateway_remote_ip = gateway.latest_session && gateway.latest_session.remote_ip
+
+    attrs = %{
+      id: policy_authorization_id,
+      token_id: token_id,
+      policy_id: policy_id,
+      client_id: client_id,
+      gateway_id: gateway_id,
+      resource_id: resource_id,
+      membership_id: membership_id,
+      account_id: account_id,
+      client_remote_ip: client_remote_ip,
+      client_user_agent: client_user_agent,
+      gateway_remote_ip: gateway_remote_ip,
+      expires_at: expires_at
+    }
+
+    Task.start(fn -> do_create_policy_authorization(attrs, subject) end)
+  end
+
+  @doc false
+  def do_create_policy_authorization(attrs, subject) do
+    changeset = create_policy_authorization_changeset(attrs)
 
     Portal.Safe.scoped(changeset, subject)
     |> Portal.Safe.insert()
+    |> case do
+      {:ok, _} ->
+        :ok
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        Logger.error("Failed to create policy authorization",
+          policy_authorization_id: attrs.id,
+          reason: :changeset_error,
+          changeset_errors: inspect(changeset.errors),
+          policy_id: attrs.policy_id,
+          client_id: attrs.client_id,
+          gateway_id: attrs.gateway_id,
+          resource_id: attrs.resource_id,
+          membership_id: attrs.membership_id
+        )
+
+      {:error, reason} ->
+        Logger.error("Failed to create policy authorization",
+          policy_authorization_id: attrs.id,
+          reason: inspect(reason),
+          policy_id: attrs.policy_id,
+          client_id: attrs.client_id,
+          gateway_id: attrs.gateway_id,
+          resource_id: attrs.resource_id,
+          membership_id: attrs.membership_id
+        )
+    end
+  rescue
+    exception ->
+      Logger.error("Failed to create policy authorization",
+        policy_authorization_id: attrs.id,
+        reason: Exception.message(exception),
+        stacktrace: Exception.format_stacktrace(__STACKTRACE__),
+        policy_id: attrs.policy_id,
+        client_id: attrs.client_id,
+        gateway_id: attrs.gateway_id,
+        resource_id: attrs.resource_id,
+        membership_id: attrs.membership_id
+      )
   end
 
   defp create_policy_authorization_changeset(attrs) do
     import Ecto.Changeset
 
-    fields = ~w[token_id policy_id client_id gateway_id resource_id membership_id
+    fields = ~w[id token_id policy_id client_id gateway_id resource_id membership_id
                 account_id
                 expires_at
                 client_remote_ip client_user_agent
@@ -1068,5 +1212,22 @@ defmodule PortalAPI.Client.Channel do
     |> cast(attrs, fields)
     |> validate_required(fields -- [:membership_id])
     |> Portal.PolicyAuthorization.changeset()
+  end
+
+  defp cancel_pending_flow(socket, resource_id) do
+    pending_flows = Map.get(socket.assigns, :pending_flows, %{})
+
+    case Map.pop(pending_flows, resource_id) do
+      {nil, _} ->
+        socket
+
+      {timer_ref, remaining} ->
+        Process.cancel_timer(timer_ref)
+        assign(socket, :pending_flows, remaining)
+    end
+  end
+
+  defp flow_creation_timeout do
+    Portal.Config.get_env(:portal, :flow_creation_timeout_ms, :timer.seconds(15))
   end
 end

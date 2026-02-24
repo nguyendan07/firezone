@@ -1,7 +1,7 @@
 defmodule Portal.Changes.Hooks.Policies do
   @behaviour Portal.Changes.Hooks
   alias Portal.{Changes.Change, Policy, PubSub}
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   import Portal.SchemaHelpers
 
   @impl true
@@ -9,7 +9,7 @@ defmodule Portal.Changes.Hooks.Policies do
     policy = struct_from_params(Policy, data)
     change = %Change{lsn: lsn, op: :insert, struct: policy}
 
-    PubSub.Account.broadcast(policy.account_id, change)
+    PubSub.Changes.broadcast(policy.account_id, change)
   end
 
   @impl true
@@ -20,7 +20,7 @@ defmodule Portal.Changes.Hooks.Policies do
     # TODO: Potentially revisit whether this should be handled here
     #       or handled closer to where the PubSub message is received.
     policy = struct_from_params(Policy, old_data)
-    DB.delete_policy_authorizations_for_policy(policy)
+    Database.delete_policy_authorizations_for_policy(policy)
 
     on_delete(lsn, old_data)
   end
@@ -28,6 +28,18 @@ defmodule Portal.Changes.Hooks.Policies do
   # Enable - process as insert
   def on_update(lsn, %{"disabled_at" => disabled_at}, %{"disabled_at" => nil} = data)
       when not is_nil(disabled_at) do
+    on_insert(lsn, data)
+  end
+
+  # Group was deleted - process as delete
+  def on_update(lsn, %{"group_id" => group_id} = old_data, %{"group_id" => nil} = _data)
+      when not is_nil(group_id) do
+    on_delete(lsn, old_data)
+  end
+
+  # Group was reconnected - process as insert
+  def on_update(lsn, %{"group_id" => nil} = _old_data, %{"group_id" => group_id} = data)
+      when not is_nil(group_id) do
     on_insert(lsn, data)
   end
 
@@ -44,10 +56,10 @@ defmodule Portal.Changes.Hooks.Policies do
     if old_policy.conditions != policy.conditions or
          old_policy.group_id != policy.group_id or
          old_policy.resource_id != policy.resource_id do
-      DB.delete_policy_authorizations_for_policy(old_policy)
+      Database.delete_policy_authorizations_for_policy(old_policy)
     end
 
-    PubSub.Account.broadcast(policy.account_id, change)
+    PubSub.Changes.broadcast(policy.account_id, change)
   end
 
   @impl true
@@ -55,10 +67,10 @@ defmodule Portal.Changes.Hooks.Policies do
     policy = struct_from_params(Policy, old_data)
     change = %Change{lsn: lsn, op: :delete, old_struct: policy}
 
-    PubSub.Account.broadcast(policy.account_id, change)
+    PubSub.Changes.broadcast(policy.account_id, change)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Safe, Policy, PolicyAuthorization}
 

@@ -2,8 +2,8 @@
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
+import dev.firezone.android.tunnel.TunnelNotification
 import dev.firezone.android.tunnel.TunnelService
-import dev.firezone.android.tunnel.TunnelStatusNotification
 import java.net.InetAddress
 
 class NetworkMonitor(
@@ -18,7 +18,7 @@ class NetworkMonitor(
     ) {
         if (tunnelService.tunnelState != TunnelService.Companion.State.UP) {
             tunnelService.tunnelState = TunnelService.Companion.State.UP
-            tunnelService.updateStatusNotification(TunnelStatusNotification.Connected)
+            tunnelService.startConnectedNotification()
         }
 
         if (lastDns != linkProperties.dnsServers) {

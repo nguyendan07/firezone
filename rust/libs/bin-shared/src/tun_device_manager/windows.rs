@@ -3,7 +3,7 @@ use crate::tun_device_manager::TunIpStack;
 use crate::windows::TUNNEL_UUID;
 use crate::windows::error::{NOT_FOUND, NOT_SUPPORTED, OBJECT_EXISTS};
 use anyhow::{Context as _, Result};
-use ip_network::{IpNetwork, Ipv4Network, Ipv6Network};
+use ip_network::IpNetwork;
 use ip_packet::{IpPacket, IpPacketBuf};
 use logging::err_with_src;
 use ring::digest;
@@ -111,20 +111,12 @@ impl TunDeviceManager {
     }
 
     #[expect(clippy::unused_async, reason = "Must match Linux API")]
-    pub async fn set_routes(
-        &mut self,
-        v4: impl IntoIterator<Item = Ipv4Network>,
-        v6: impl IntoIterator<Item = Ipv6Network>,
-    ) -> Result<()> {
+    pub async fn set_routes(&mut self, routes: impl IntoIterator<Item = IpNetwork>) -> Result<()> {
         let iface_idx = self
             .iface_idx
             .context("Cannot set routes without having created TUN device")?;
 
-        let new_routes = HashSet::from_iter(
-            v4.into_iter()
-                .map(IpNetwork::from)
-                .chain(v6.into_iter().map(IpNetwork::from)),
-        );
+        let new_routes = HashSet::from_iter(routes);
 
         for old_route in self.routes.difference(&new_routes) {
             remove_route(*old_route, iface_idx);
@@ -302,9 +294,14 @@ impl Tun {
 
         set_iface_config(luid, mtu).context("Failed to set interface config")?;
 
+        let capacity = std::env::var("FIREZONE_WINTUN_RINGBUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(RING_BUFFER_SIZE);
+
         let session = Arc::new(
             adapter
-                .start_session(RING_BUFFER_SIZE)
+                .start_session(capacity)
                 .context("Failed to start session")?,
         );
         let (outbound_tx, outbound_rx) = mpsc::channel(QUEUE_SIZE);
@@ -402,24 +399,32 @@ fn start_send_thread(
     // See <https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499->.
     const ERROR_BUFFER_OVERFLOW: i32 = 0x6F;
 
+    /// How many attempts we make at passing the IP packet to WinTUN.
+    ///
+    /// 1000 attempts where we suspend for 100 microseconds results in a total wait of 100ms.
+    /// That delay will hopefully throttle the remote's congestion controller to stop sending us that many packets.
+    const MAX_ATTEMPTS: u32 = 1000 + SPIN_ATTEMPTS;
+    /// How many times we busy-loop before suspending the thread temporarily.
+    const SPIN_ATTEMPTS: u32 = 10;
+
     std::thread::Builder::new()
         .name("TUN send".into())
-        .spawn(move || loop {
+        .spawn(move || 'next_packet: loop {
             let Some(packet) = packet_rx.blocking_recv() else {
                 tracing::debug!(
                     "Stopping TUN send worker thread because the packet channel closed"
                 );
-                break;
+                break 'next_packet;
             };
 
             let bytes = packet.packet();
 
             let Ok(len) = bytes.len().try_into() else {
                 tracing::warn!("Packet too large; length does not fit into u16");
-                continue;
+                continue 'next_packet;
             };
 
-            loop {
+            'next_attempt: for attempt in 0..MAX_ATTEMPTS {
                 let Some(session) = session.upgrade() else {
                     tracing::debug!(
                         "Stopping TUN send worker thread because the `wintun::Session` was dropped"
@@ -434,21 +439,35 @@ fn start_send_thread(
                         // space in the ring buffer.
                         session.send_packet(pkt);
 
-                        break;
+                        if attempt > 0 {
+                            tracing::trace!(%attempt, "Sent packet with delay");
+                        }
+
+                        continue 'next_packet;
                     }
                     Err(wintun::Error::Io(e))
                         if e.raw_os_error()
                             .is_some_and(|code| code == ERROR_BUFFER_OVERFLOW) =>
                     {
-                        tracing::debug!("WinTUN ring buffer is full");
-                        std::thread::sleep(Duration::from_millis(10)); // Suspend for a bit to avoid busy-looping.
+                        if attempt == 0 {
+                            tracing::trace!("WinTUN ring buffer is full");
+                        }
+
+                        if attempt < SPIN_ATTEMPTS {
+                            std::hint::spin_loop(); // Spin around and try again, as quickly as possible for minimum latency.
+                            continue 'next_attempt;
+                        }
+
+                        std::thread::sleep(Duration::from_micros(100));
                     }
                     Err(e) => {
                         tracing::error!("Failed to allocate WinTUN packet: {e}");
-                        break;
+                        continue 'next_packet;
                     }
                 }
             }
+
+            tracing::warn!(num_attempts = %MAX_ATTEMPTS, "Exhausted all attempts to pass IP packet to WinTUN");
         })
 }
 
@@ -676,7 +695,7 @@ fn file_length(f: &std::fs::File) -> Result<usize> {
 ///
 /// e.g. `C:\Users\User\AppData\Local\dev.firezone.client\data\wintun.dll`
 fn wintun_dll_path() -> Result<PathBuf> {
-    let path = crate::known_dirs::platform::app_local_data_dir()?
+    let path = known_dirs::platform::app_local_data_dir()?
         .join("data")
         .join("wintun.dll");
     Ok(path)

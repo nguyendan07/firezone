@@ -3,20 +3,23 @@ defmodule Portal.Repo.Seeds do
   Seeds the database with initial data.
   """
   import Ecto.Changeset
+  import Ecto.Query
 
   alias Portal.{
     Repo,
-    Auth,
+    Authentication,
     AuthProvider,
     Account,
     Actor,
     Client,
+    ClientSession,
     Crypto,
     EmailOTP,
     Entra,
     ExternalIdentity,
     PolicyAuthorization,
     Gateway,
+    GatewaySession,
     Google,
     Group,
     Membership,
@@ -143,29 +146,52 @@ defmodule Portal.Repo.Seeds do
     site = Repo.get_by!(Site, id: site_id)
     external_id = attrs["external_id"] || attrs[:external_id]
 
+    public_key = attrs["public_key"] || attrs[:public_key]
+
     # First create the gateway
     gateway =
       %Gateway{
         site_id: site_id,
         account_id: site.account_id,
         name: attrs["name"] || attrs[:name],
-        external_id: external_id,
-        public_key: attrs["public_key"] || attrs[:public_key],
-        last_seen_user_agent: context.user_agent,
-        last_seen_remote_ip: context.remote_ip,
-        last_seen_version: version,
-        last_seen_at: DateTime.utc_now()
+        external_id: external_id
       }
       |> Repo.insert!()
 
     # Then create tunnel IP addresses with gateway FK
     create_tunnel_ip_addresses(site.account_id, gateway_id: gateway.id)
 
+    # Find the latest gateway token for the site
+    gateway_token =
+      Repo.one!(
+        from(t in Portal.GatewayToken,
+          where: t.site_id == ^site_id and t.account_id == ^site.account_id,
+          order_by: [desc: t.inserted_at],
+          limit: 1
+        )
+      )
+
+    # Create a gateway session
+    %GatewaySession{
+      account_id: site.account_id,
+      gateway_id: gateway.id,
+      gateway_token_id: gateway_token.id,
+      public_key: public_key,
+      user_agent: context.user_agent,
+      remote_ip: context.remote_ip,
+      remote_ip_location_region: "US-CA",
+      remote_ip_location_city: "San Francisco",
+      remote_ip_location_lat: 37.7749,
+      remote_ip_location_lon: -122.4194,
+      version: version
+    }
+    |> Repo.insert!()
+
     {:ok, Repo.preload(gateway, [:ipv4_address, :ipv6_address])}
   end
 
   # Helper function to create client directly without context module
-  defp create_client(attrs, subject, user_agent) do
+  defp create_client(attrs, subject, client_token_id, user_agent) do
     # Extract version from user agent (e.g., "iOS/12.7 (iPhone) connlib/0.7.412" -> "0.7.412")
     version =
       user_agent |> String.split(" connlib/") |> List.last() |> String.split(" ") |> List.first()
@@ -173,22 +199,30 @@ defmodule Portal.Repo.Seeds do
     external_id = attrs["external_id"] || attrs[:external_id]
 
     # First create the client
+    public_key = attrs["public_key"] || attrs[:public_key]
+
     client =
       %Client{
         account_id: subject.account.id,
         actor_id: subject.actor.id,
         name: attrs["name"] || attrs[:name],
         external_id: external_id,
-        public_key: attrs["public_key"] || attrs[:public_key],
         identifier_for_vendor: attrs["identifier_for_vendor"] || attrs[:identifier_for_vendor],
         device_uuid: attrs["device_uuid"] || attrs[:device_uuid],
-        device_serial: attrs["device_serial"] || attrs[:device_serial],
-        last_seen_user_agent: user_agent,
-        last_seen_remote_ip: subject.context.remote_ip,
-        last_seen_version: version,
-        last_seen_at: DateTime.utc_now()
+        device_serial: attrs["device_serial"] || attrs[:device_serial]
       }
       |> Repo.insert!()
+
+    # Create a client session
+    Repo.insert!(%ClientSession{
+      account_id: subject.account.id,
+      client_id: client.id,
+      client_token_id: client_token_id,
+      public_key: public_key,
+      user_agent: user_agent,
+      remote_ip: subject.context.remote_ip,
+      version: version
+    })
 
     # Then create tunnel IP addresses with client FK
     create_tunnel_ip_addresses(subject.account.id, client_id: client.id)
@@ -221,7 +255,6 @@ defmodule Portal.Repo.Seeds do
       |> put_change(:id, "c89bcc8c-9392-4dae-a40d-888aef6d28e0")
       |> put_change(:features, %{
         policy_conditions: true,
-        multi_site_resources: true,
         traffic_filters: true,
         idp_sync: true,
         rest_api: true,
@@ -320,12 +353,16 @@ defmodule Portal.Repo.Seeds do
       |> Repo.insert!()
 
     # Create auth providers for main account
-    system_subject = %Auth.Subject{
+    system_subject = %Authentication.Subject{
       account: account,
       actor: %Actor{type: :system, id: Ecto.UUID.generate(), name: "System"},
-      credential: %Auth.Credential{type: :token, id: Ecto.UUID.generate()},
+      credential: %Authentication.Credential{type: :token, id: Ecto.UUID.generate()},
       expires_at: DateTime.utc_now() |> DateTime.add(1, :hour),
-      context: %Auth.Context{type: :client, remote_ip: {127, 0, 0, 1}, user_agent: "seeds/1"}
+      context: %Authentication.Context{
+        type: :client,
+        remote_ip: {127, 0, 0, 1},
+        user_agent: "seeds/1"
+      }
     }
 
     {:ok, _email_provider} =
@@ -378,12 +415,16 @@ defmodule Portal.Repo.Seeds do
       )
 
     # Create auth providers for other_account
-    other_system_subject = %Auth.Subject{
+    other_system_subject = %Authentication.Subject{
       account: other_account,
       actor: %Actor{type: :system, id: Ecto.UUID.generate(), name: "System"},
-      credential: %Auth.Credential{type: :portal_session, id: Ecto.UUID.generate()},
+      credential: %Authentication.Credential{type: :portal_session, id: Ecto.UUID.generate()},
       expires_at: DateTime.utc_now() |> DateTime.add(1, :hour),
-      context: %Auth.Context{type: :portal, remote_ip: {127, 0, 0, 1}, user_agent: "seeds/1"}
+      context: %Authentication.Context{
+        type: :portal,
+        remote_ip: {127, 0, 0, 1},
+        user_agent: "seeds/1"
+      }
     }
 
     {:ok, _other_email_provider} =
@@ -493,7 +534,7 @@ defmodule Portal.Repo.Seeds do
           name: actor.name
         })
 
-      context = %Auth.Context{
+      context = %Authentication.Context{
         type: :client,
         user_agent: "Windows/10.0.22631 seeds/1",
         remote_ip: {172, 28, 0, 100},
@@ -513,7 +554,7 @@ defmodule Portal.Repo.Seeds do
           secret_hash: "placeholder"
         })
 
-      {:ok, subject} = Auth.build_subject(token, context)
+      {:ok, subject} = Authentication.build_subject(token, context)
 
       count = Enum.random([1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 240])
 
@@ -543,14 +584,20 @@ defmodule Portal.Repo.Seeds do
             actor_id: subject.actor.id,
             name: "My #{client_name} #{i}",
             external_id: external_id,
-            public_key: :crypto.strong_rand_bytes(32) |> Base.encode64(),
-            identifier_for_vendor: Ecto.UUID.generate(),
-            last_seen_user_agent: user_agent,
-            last_seen_remote_ip: subject.context.remote_ip,
-            last_seen_version: version,
-            last_seen_at: DateTime.utc_now()
+            identifier_for_vendor: Ecto.UUID.generate()
           }
           |> Repo.insert!()
+
+        # Create a client session
+        Repo.insert!(%ClientSession{
+          account_id: subject.account.id,
+          client_id: client.id,
+          client_token_id: token.id,
+          public_key: :crypto.strong_rand_bytes(32) |> Base.encode64(),
+          user_agent: user_agent,
+          remote_ip: subject.context.remote_ip,
+          version: version
+        })
 
         # Then create tunnel IP addresses with client FK
         create_tunnel_ip_addresses(subject.account.id, client_id: client.id)
@@ -590,7 +637,7 @@ defmodule Portal.Repo.Seeds do
       |> Ecto.Changeset.change(password_hash: password_hash)
       |> Repo.update!()
 
-    _unprivileged_actor_context = %Auth.Context{
+    _unprivileged_actor_context = %Authentication.Context{
       type: :client,
       user_agent: "iOS/18.1.0 connlib/1.3.5",
       remote_ip: {172, 28, 0, 100},
@@ -613,26 +660,39 @@ defmodule Portal.Repo.Seeds do
         expires_at: DateTime.utc_now() |> DateTime.add(7, :day)
       })
 
+    # Create client token for admin actor so we can create client sessions
+    {:ok, admin_client_token} =
+      Repo.insert(%ClientToken{
+        auth_provider_id: userpass_provider.id,
+        account_id: account.id,
+        actor_id: admin_actor.id,
+        secret_nonce: Ecto.UUID.generate(),
+        secret_fragment: Ecto.UUID.generate(),
+        secret_salt: Ecto.UUID.generate(),
+        secret_hash: Ecto.UUID.generate(),
+        expires_at: DateTime.utc_now() |> DateTime.add(7, :day)
+      })
+
     # For seeds, create a system subject for admin operations
     # In real usage, subjects are created during sign-in flow
-    admin_subject = %Auth.Subject{
+    admin_subject = %Authentication.Subject{
       account: account,
       actor: admin_actor,
-      credential: %Auth.Credential{type: :portal_session, id: Ecto.UUID.generate()},
+      credential: %Authentication.Credential{type: :portal_session, id: Ecto.UUID.generate()},
       expires_at: DateTime.utc_now() |> DateTime.add(1, :hour),
-      context: %Auth.Context{
+      context: %Authentication.Context{
         type: :portal,
         remote_ip: {127, 0, 0, 1},
         user_agent: "seeds/1"
       }
     }
 
-    unprivileged_subject = %Auth.Subject{
+    unprivileged_subject = %Authentication.Subject{
       account: account,
       actor: unprivileged_actor,
-      credential: %Auth.Credential{type: :token, id: unprivileged_client_token.id},
+      credential: %Authentication.Credential{type: :token, id: unprivileged_client_token.id},
       expires_at: unprivileged_client_token.expires_at,
-      context: %Auth.Context{
+      context: %Authentication.Context{
         type: :client,
         remote_ip: {127, 0, 0, 1},
         user_agent: "seeds/1"
@@ -650,7 +710,8 @@ defmodule Portal.Repo.Seeds do
       }
       |> Repo.insert!()
 
-    service_account_actor_encoded_token = "n" <> Auth.encode_fragment!(service_account_token)
+    service_account_actor_encoded_token =
+      "n" <> Authentication.encode_fragment!(service_account_token)
 
     # Email tokens are generated during sign-in flow, not pre-generated
     unprivileged_actor_email_token = "<generated during sign-in>"
@@ -680,6 +741,7 @@ defmodule Portal.Repo.Seeds do
           identifier_for_vendor: "APPL-#{Ecto.UUID.generate()}"
         },
         unprivileged_subject,
+        unprivileged_client_token.id,
         "iOS/12.7 (iPhone) connlib/0.7.412"
       )
 
@@ -692,6 +754,7 @@ defmodule Portal.Repo.Seeds do
           identifier_for_vendor: "GOOG-#{Ecto.UUID.generate()}"
         },
         unprivileged_subject,
+        unprivileged_client_token.id,
         "Android/14 connlib/0.7.412"
       )
 
@@ -704,6 +767,7 @@ defmodule Portal.Repo.Seeds do
           device_uuid: "WIN-#{Ecto.UUID.generate()}"
         },
         unprivileged_subject,
+        unprivileged_client_token.id,
         "Windows/10.0.22631 connlib/0.7.412"
       )
 
@@ -716,6 +780,7 @@ defmodule Portal.Repo.Seeds do
           device_uuid: "UB-#{Ecto.UUID.generate()}"
         },
         unprivileged_subject,
+        unprivileged_client_token.id,
         "Ubuntu/22.4.0 connlib/0.7.412"
       )
 
@@ -729,6 +794,7 @@ defmodule Portal.Repo.Seeds do
           device_uuid: "#{Ecto.UUID.generate()}"
         },
         admin_subject,
+        admin_client_token.id,
         "Mac OS/14.5 connlib/0.7.412"
       )
 
@@ -941,7 +1007,7 @@ defmodule Portal.Repo.Seeds do
       |> Repo.insert!()
 
     relay_encoded_token =
-      Auth.encode_fragment!(relay_token)
+      Authentication.encode_fragment!(relay_token)
 
     IO.puts("Created relay token:")
     IO.puts("  Token: #{relay_encoded_token}")
@@ -969,7 +1035,7 @@ defmodule Portal.Repo.Seeds do
       }
       |> Repo.insert!()
 
-    gateway_encoded_token = Auth.encode_fragment!(gateway_token)
+    gateway_encoded_token = Authentication.encode_fragment!(gateway_token)
 
     IO.puts("Created sites:")
     IO.puts("  #{site.name} token: #{gateway_encoded_token}")
@@ -984,7 +1050,7 @@ defmodule Portal.Repo.Seeds do
           name: "gw-#{Crypto.random_token(5, encoder: :user_friendly)}",
           public_key: :crypto.strong_rand_bytes(32) |> Base.encode64()
         },
-        %Auth.Context{
+        %Authentication.Context{
           type: :gateway,
           user_agent: "iOS/12.7 (iPhone) connlib/0.7.412",
           remote_ip: %Postgrex.INET{address: {189, 172, 73, 153}}
@@ -1000,7 +1066,7 @@ defmodule Portal.Repo.Seeds do
           name: "gw-#{Crypto.random_token(5, encoder: :user_friendly)}",
           public_key: :crypto.strong_rand_bytes(32) |> Base.encode64()
         },
-        %Auth.Context{
+        %Authentication.Context{
           type: :gateway,
           user_agent: "iOS/12.7 (iPhone) connlib/0.7.412",
           remote_ip: %Postgrex.INET{address: {164, 112, 78, 62}}
@@ -1017,7 +1083,7 @@ defmodule Portal.Repo.Seeds do
             name: "gw-#{Crypto.random_token(5, encoder: :user_friendly)}",
             public_key: :crypto.strong_rand_bytes(32) |> Base.encode64()
           },
-          %Auth.Context{
+          %Authentication.Context{
             type: :gateway,
             user_agent: "iOS/12.7 (iPhone) connlib/0.7.412",
             remote_ip: %Postgrex.INET{address: {164, 112, 78, 62 + i}}
@@ -1029,14 +1095,12 @@ defmodule Portal.Repo.Seeds do
     gateway_name = "#{site.name}-#{gateway1.name}"
     IO.puts("  #{gateway_name}:")
     IO.puts("    External UUID: #{gateway1.external_id}")
-    IO.puts("    Public Key: #{gateway1.public_key}")
     IO.puts("    IPv4: #{gateway1.ipv4_address.address} IPv6: #{gateway1.ipv6_address.address}")
     IO.puts("")
 
     gateway_name = "#{site.name}-#{gateway2.name}"
     IO.puts("  #{gateway_name}:")
-    IO.puts("    External UUID: #{gateway1.external_id}")
-    IO.puts("    Public Key: #{gateway2.public_key}")
+    IO.puts("    External UUID: #{gateway2.external_id}")
     IO.puts("    IPv4: #{gateway2.ipv4_address.address} IPv6: #{gateway2.ipv6_address.address}")
     IO.puts("")
 

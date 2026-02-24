@@ -2,35 +2,36 @@ defmodule Portal.Entra.SyncError do
   @moduledoc """
   Wrapper exception for Entra directory sync failures.
 
-  This exception wraps the underlying cause and adds the directory_id
+  This exception wraps the underlying error and adds the directory_id
   and sync step that are extracted by the Oban telemetry reporter and sent to Sentry.
 
-  The `reason` field is a human-readable message, while `cause` preserves
-  the complete underlying error (e.g., Req.Response, Req.TransportError, Postgrex.Error).
+  The `error` field preserves structured error context for classification and debugging.
   """
 
-  defexception [:message, :reason, :cause, :directory_id, :step]
+  defexception [:message, :error, :directory_id, :step]
 
   @impl true
   def exception(opts) do
-    reason = Keyword.fetch!(opts, :reason)
-    cause = Keyword.get(opts, :cause, reason)
+    error = Keyword.get(opts, :error)
     directory_id = Keyword.fetch!(opts, :directory_id)
     step = Keyword.fetch!(opts, :step)
 
-    message = build_message(reason, directory_id, step)
+    message = build_message(error, directory_id, step)
 
     %__MODULE__{
       message: message,
-      reason: reason,
-      cause: cause,
+      error: error,
       directory_id: directory_id,
       step: step
     }
   end
 
-  defp build_message(reason, directory_id, step) when is_binary(reason) do
-    "Entra sync failed for directory #{directory_id} at #{step}: #{reason}"
+  defp build_message(error, directory_id, step) when is_binary(error) do
+    "Entra sync failed for directory #{directory_id} at #{step}: #{error}"
+  end
+
+  defp build_message({tag, msg}, directory_id, step) when is_atom(tag) and is_binary(msg) do
+    "Entra sync failed for directory #{directory_id} at #{step}: #{tag}: #{msg}"
   end
 
   defp build_message(%{status: status, body: body}, directory_id, step) when is_integer(status) do
@@ -41,7 +42,7 @@ defmodule Portal.Entra.SyncError do
     "Entra sync failed for directory #{directory_id} at #{step}: #{Exception.message(exception)}"
   end
 
-  defp build_message(reason, directory_id, step) do
-    "Entra sync failed for directory #{directory_id} at #{step}: #{inspect(reason)}"
+  defp build_message(error, directory_id, step) do
+    "Entra sync failed for directory #{directory_id} at #{step}: #{inspect(error)}"
   end
 end

@@ -1,8 +1,8 @@
 defmodule Portal.Billing do
-  alias Portal.Auth
+  alias Portal.Authentication
   alias Portal.Billing.EventHandler
   alias Portal.Billing.Stripe.APIClient
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   # Configuration helpers
@@ -15,7 +15,103 @@ defmodule Portal.Billing do
     fetch_config!(:webhook_signing_secret)
   end
 
+  def plan_product_ids do
+    fetch_config!(:plan_product_ids)
+  end
+
+  def adhoc_device_product_id do
+    fetch_config!(:adhoc_device_product_id)
+  end
+
   # Limits and Features
+
+  @doc """
+  Returns true if any billing limit is exceeded.
+  """
+  @spec any_limit_exceeded?(Portal.Account.t()) :: boolean()
+  def any_limit_exceeded?(%Portal.Account{} = account) do
+    account.users_limit_exceeded or
+      account.seats_limit_exceeded or
+      account.service_accounts_limit_exceeded or
+      account.sites_limit_exceeded or
+      account.admins_limit_exceeded
+  end
+
+  @doc """
+  Builds a human-readable warning message from the exceeded limit flags.
+  Returns nil if no limits are exceeded.
+
+  When counts are provided, displays each exceeded limit in the format:
+  "label (count / limit)"
+  """
+  @spec build_limits_exceeded_message(Portal.Account.t(), map()) :: String.t() | nil
+  def build_limits_exceeded_message(%Portal.Account{} = account, counts \\ %{}) do
+    limits =
+      []
+      |> maybe_add_with_counts(
+        "users",
+        account.users_limit_exceeded,
+        counts[:users],
+        account.limits && account.limits.users_count
+      )
+      |> maybe_add_with_counts(
+        "monthly active users",
+        account.seats_limit_exceeded,
+        counts[:active_users],
+        account.limits && account.limits.monthly_active_users_count
+      )
+      |> maybe_add_with_counts(
+        "service accounts",
+        account.service_accounts_limit_exceeded,
+        counts[:service_accounts],
+        account.limits && account.limits.service_accounts_count
+      )
+      |> maybe_add_with_counts(
+        "sites",
+        account.sites_limit_exceeded,
+        counts[:sites],
+        account.limits && account.limits.sites_count
+      )
+      |> maybe_add_with_counts(
+        "account admins",
+        account.admins_limit_exceeded,
+        counts[:admins],
+        account.limits && account.limits.account_admin_users_count
+      )
+
+    case limits do
+      [] -> nil
+      limits -> Enum.join(limits, "\n")
+    end
+  end
+
+  defp maybe_add_with_counts(list, label, true, count, limit)
+       when is_integer(count) and is_integer(limit) do
+    list ++ ["#{label} (#{count} / #{limit})"]
+  end
+
+  defp maybe_add_with_counts(list, label, true, _count, _limit) do
+    list ++ [label]
+  end
+
+  defp maybe_add_with_counts(list, _label, false, _count, _limit), do: list
+
+  @doc """
+  Returns the plan type for the account based on the Stripe product name.
+  Returns :enterprise, :team, :starter, or :unknown.
+  """
+  @spec plan_type(Portal.Account.t()) :: :enterprise | :team | :starter | :unknown
+  def plan_type(%Portal.Account{metadata: %{stripe: %{product_name: product_name}}})
+      when is_binary(product_name) do
+    cond do
+      String.starts_with?(product_name, "Enterprise") -> :enterprise
+      product_name == "Team" -> :team
+      product_name == "Starter" -> :starter
+      true -> :unknown
+    end
+  end
+
+  def plan_type(%Portal.Account{}), do: :unknown
 
   def users_limit_exceeded?(%Portal.Account{} = account, users_count) do
     not is_nil(account.limits.users_count) and
@@ -28,8 +124,8 @@ defmodule Portal.Billing do
   end
 
   def can_create_users?(%Portal.Account{} = account) do
-    users_count = DB.count_users_for_account(account)
-    active_users_count = DB.count_1m_active_users_for_account(account)
+    users_count = Database.count_users_for_account(account)
+    active_users_count = Database.count_1m_active_users_for_account(account)
 
     cond do
       not Portal.Account.active?(account) ->
@@ -52,7 +148,7 @@ defmodule Portal.Billing do
   end
 
   def can_create_service_accounts?(%Portal.Account{} = account) do
-    service_accounts_count = DB.count_service_accounts_for_account(account)
+    service_accounts_count = Database.count_service_accounts_for_account(account)
 
     Portal.Account.active?(account) and
       (is_nil(account.limits.service_accounts_count) or
@@ -65,7 +161,7 @@ defmodule Portal.Billing do
   end
 
   def can_create_sites?(%Portal.Account{} = account) do
-    sites_count = DB.count_sites_for_account(account)
+    sites_count = Database.count_sites_for_account(account)
 
     Portal.Account.active?(account) and
       (is_nil(account.limits.sites_count) or
@@ -78,7 +174,7 @@ defmodule Portal.Billing do
   end
 
   def can_create_admin_users?(%Portal.Account{} = account) do
-    account_admins_count = DB.count_account_admin_users_for_account(account)
+    account_admins_count = Database.count_account_admin_users_for_account(account)
 
     Portal.Account.active?(account) and
       (is_nil(account.limits.account_admin_users_count) or
@@ -91,7 +187,7 @@ defmodule Portal.Billing do
   end
 
   def can_create_api_clients?(%Portal.Account{} = account) do
-    api_clients_count = DB.count_api_clients_for_account(account)
+    api_clients_count = Database.count_api_clients_for_account(account)
 
     Portal.Account.active?(account) and
       (is_nil(account.limits.api_clients_count) or
@@ -104,11 +200,71 @@ defmodule Portal.Billing do
   end
 
   def can_create_api_tokens?(%Portal.Account{} = account, %Portal.Actor{} = actor) do
-    api_tokens_count = DB.count_api_tokens_for_actor(actor)
+    api_tokens_count = Database.count_api_tokens_for_actor(actor)
 
     Portal.Account.active?(account) and
       (is_nil(account.limits.api_tokens_per_client_count) or
          api_tokens_count < account.limits.api_tokens_per_client_count)
+  end
+
+  @doc """
+  Checks if a UI client sign-in should be blocked for the given account.
+
+  Returns `true` if sign-in should be blocked (users limit exceeded),
+  `false` otherwise.
+
+  Note: seats_limit_exceeded is a soft limit - it doesn't block sign-ins.
+  A warning is logged by CheckAccountLimits worker when first exceeded.
+  """
+  @spec client_sign_in_restricted?(Portal.Account.t()) :: boolean()
+  def client_sign_in_restricted?(%Portal.Account{} = account) do
+    account.users_limit_exceeded
+  end
+
+  @doc """
+  Checks if an API client connection should be blocked for the given account.
+
+  Returns `true` if connection should be blocked (users or service accounts
+  limits exceeded), `false` otherwise.
+
+  Note: seats_limit_exceeded is a soft limit - it doesn't block connections.
+  A warning is logged by CheckAccountLimits worker when first exceeded.
+  """
+  @spec client_connect_restricted?(Portal.Account.t()) :: boolean()
+  def client_connect_restricted?(%Portal.Account{} = account) do
+    account.users_limit_exceeded or account.service_accounts_limit_exceeded
+  end
+
+  @doc """
+  Evaluates account limits and updates the limit exceeded flags accordingly.
+
+  This should be called after subscription updates to immediately reflect
+  any changes in limits (e.g., when seats are added/removed).
+  """
+  @spec evaluate_account_limits(Portal.Account.t()) ::
+          {:ok, Portal.Account.t()} | {:error, term()}
+  def evaluate_account_limits(%Portal.Account{} = account) do
+    if account_provisioned?(account) do
+      limit_flags = %{
+        users_limit_exceeded:
+          users_limit_exceeded?(account, Database.count_users_for_account(account)),
+        seats_limit_exceeded:
+          seats_limit_exceeded?(account, Database.count_1m_active_users_for_account(account)),
+        service_accounts_limit_exceeded:
+          service_accounts_limit_exceeded?(
+            account,
+            Database.count_service_accounts_for_account(account)
+          ),
+        sites_limit_exceeded:
+          sites_limit_exceeded?(account, Database.count_sites_for_account(account)),
+        admins_limit_exceeded:
+          admins_limit_exceeded?(account, Database.count_account_admin_users_for_account(account))
+      }
+
+      Database.update_account_limit_flags(account, limit_flags)
+    else
+      {:ok, account}
+    end
   end
 
   # API wrappers
@@ -128,17 +284,8 @@ defmodule Portal.Billing do
         customer_id: customer_id,
         billing_email: customer_email
       })
-      |> DB.update()
+      |> Database.update()
     else
-      {:ok, {status, body}} ->
-        :ok =
-          Logger.error("Cannot create Stripe customer",
-            status: status,
-            body: inspect(body)
-          )
-
-        {:error, :retry_later}
-
       {:error, reason} ->
         :ok =
           Logger.error("Cannot create Stripe customer",
@@ -195,15 +342,6 @@ defmodule Portal.Billing do
            APIClient.fetch_customer(secret_key, customer_id) do
       {:ok, account_id}
     else
-      {:ok, {status, body}} ->
-        :ok =
-          Logger.error("Cannot fetch Stripe customer",
-            status: status,
-            body: inspect(body)
-          )
-
-        {:error, :retry_later}
-
       {:ok, params} ->
         :ok =
           Logger.info("Stripe customer does not have account_id in metadata",
@@ -237,17 +375,8 @@ defmodule Portal.Billing do
            APIClient.create_subscription(secret_key, customer_id, default_price_id) do
       account
       |> update_account_metadata_changeset(%{subscription_id: subscription_id})
-      |> DB.update()
+      |> Database.update()
     else
-      {:ok, {status, body}} ->
-        :ok =
-          Logger.error("Cannot create Stripe subscription",
-            status: status,
-            body: inspect(body)
-          )
-
-        {:error, :retry_later}
-
       {:error, reason} ->
         :ok =
           Logger.error("Cannot create Stripe subscription",
@@ -297,22 +426,22 @@ defmodule Portal.Billing do
   defp ensure_internet_site_and_resource_exist(%Portal.Account{} = account) do
     # Ensure Internet site exists
     site =
-      case DB.fetch_internet_site(account) do
+      case Database.fetch_internet_site(account) do
         {:ok, site} ->
           site
 
         {:error, :not_found} ->
-          {:ok, site} = DB.create_internet_site(account)
+          {:ok, site} = Database.create_internet_site(account)
           site
       end
 
     # Ensure Internet resource exists
-    case DB.fetch_internet_resource(account) do
+    case Database.fetch_internet_resource(account) do
       {:ok, _resource} ->
         {:ok, account}
 
       {:error, :not_found} ->
-        {:ok, _resource} = DB.create_internet_resource(account, site)
+        {:ok, _resource} = Database.create_internet_resource(account, site)
         {:ok, account}
     end
   end
@@ -347,7 +476,11 @@ defmodule Portal.Billing do
     end
   end
 
-  def billing_portal_url(%Portal.Account{} = account, return_url, %Auth.Subject{} = subject) do
+  def billing_portal_url(
+        %Portal.Account{} = account,
+        return_url,
+        %Authentication.Subject{} = subject
+      ) do
     secret_key = fetch_config!(:secret_key)
 
     # Only account admins can manage billing
@@ -368,7 +501,12 @@ defmodule Portal.Billing do
   end
 
   def handle_events(events) when is_list(events) do
-    Enum.each(events, &EventHandler.handle_event/1)
+    Enum.reduce_while(events, :ok, fn event, :ok ->
+      case EventHandler.handle_event(event) do
+        {:ok, _event} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp fetch_config!(key) do
@@ -394,8 +532,9 @@ defmodule Portal.Billing do
     |> cast_embed(:metadata)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
+    import Ecto.Changeset
     alias Portal.Safe
     alias Portal.Account
     alias Portal.Actor
@@ -407,13 +546,28 @@ defmodule Portal.Billing do
       |> Safe.update()
     end
 
+    def update_account_limit_flags(%Account{} = account, attrs) do
+      fields = [
+        :users_limit_exceeded,
+        :seats_limit_exceeded,
+        :service_accounts_limit_exceeded,
+        :sites_limit_exceeded,
+        :admins_limit_exceeded
+      ]
+
+      account
+      |> cast(attrs, fields)
+      |> Safe.unscoped()
+      |> Safe.update()
+    end
+
     def count_users_for_account(%Account{} = account) do
       from(a in Actor,
         where: a.account_id == ^account.id,
         where: is_nil(a.disabled_at),
         where: a.type in [:account_admin_user, :account_user]
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -423,7 +577,7 @@ defmodule Portal.Billing do
         where: is_nil(a.disabled_at),
         where: a.type == :service_account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -433,14 +587,18 @@ defmodule Portal.Billing do
         where: is_nil(a.disabled_at),
         where: a.type == :account_admin_user
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
     def count_1m_active_users_for_account(%Account{} = account) do
       from(c in Client, as: :clients)
       |> where([clients: c], c.account_id == ^account.id)
-      |> where([clients: c], c.last_seen_at > ago(1, "month"))
+      |> join(:inner, [clients: c], s in Portal.ClientSession,
+        on: s.client_id == c.id and s.account_id == c.account_id,
+        as: :session
+      )
+      |> where([session: s], s.inserted_at > ago(1, "month"))
       |> join(:inner, [clients: c], a in Actor,
         on: c.actor_id == a.id and c.account_id == a.account_id,
         as: :actor
@@ -449,7 +607,7 @@ defmodule Portal.Billing do
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
       |> select([clients: c], c.actor_id)
       |> distinct(true)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -458,7 +616,7 @@ defmodule Portal.Billing do
         where: g.account_id == ^account.id,
         where: g.managed_by == :account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -468,7 +626,7 @@ defmodule Portal.Billing do
         where: is_nil(a.disabled_at),
         where: a.type == :api_client
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -477,7 +635,7 @@ defmodule Portal.Billing do
         where: t.actor_id == ^actor.id,
         where: t.account_id == ^actor.account_id
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -488,8 +646,8 @@ defmodule Portal.Billing do
           where: s.name == "Internet",
           where: s.managed_by == :system
         )
-        |> Safe.unscoped()
-        |> Safe.one()
+        |> Safe.unscoped(:replica)
+        |> Safe.one(fallback_to_primary: true)
 
       case result do
         nil -> {:error, :not_found}
@@ -513,8 +671,8 @@ defmodule Portal.Billing do
           where: r.account_id == ^account.id,
           where: r.type == :internet
         )
-        |> Safe.unscoped()
-        |> Safe.one()
+        |> Safe.unscoped(:replica)
+        |> Safe.one(fallback_to_primary: true)
 
       case result do
         nil -> {:error, :not_found}

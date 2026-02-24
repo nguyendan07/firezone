@@ -9,18 +9,13 @@ use std::{
 use anyhow::{Context as _, Result};
 use boringtun::noise::Index;
 use rand::Rng;
-use str0m::ice::IceAgent;
 
 use crate::{
     ConnectionStats, Event,
-    node::{
-        Connection, ConnectionState, InitialConnection, add_local_candidate,
-        allocations::Allocations, new_ice_candidate_event,
-    },
+    node::{Connection, allocations::Allocations},
 };
 
 pub struct Connections<TId, RId> {
-    initial: BTreeMap<TId, InitialConnection<RId>>,
     established: BTreeMap<TId, Connection<RId>>,
 
     established_by_wireguard_session_index: BTreeMap<usize, TId>,
@@ -33,7 +28,6 @@ pub struct Connections<TId, RId> {
 impl<TId, RId> Default for Connections<TId, RId> {
     fn default() -> Self {
         Self {
-            initial: Default::default(),
             established: Default::default(),
             established_by_wireguard_session_index: Default::default(),
             disconnected_ids: Default::default(),
@@ -51,10 +45,6 @@ where
     const RECENT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub(crate) fn handle_timeout(&mut self, events: &mut VecDeque<Event<TId>>, now: Instant) {
-        for (id, _) in self.initial.extract_if(.., |_, conn| conn.is_failed) {
-            events.push_back(Event::ConnectionFailed(id));
-        }
-
         for (id, conn) in self.established.extract_if(.., |_, conn| conn.is_failed()) {
             events.push_back(Event::ConnectionFailed(id));
 
@@ -77,10 +67,6 @@ where
             .retain(|_, v| now.duration_since(*v) < Self::RECENT_DISCONNECT_TIMEOUT);
     }
 
-    pub(crate) fn remove_initial(&mut self, id: &TId) -> Option<InitialConnection<RId>> {
-        self.initial.remove(id)
-    }
-
     pub(crate) fn remove_established(&mut self, id: &TId, now: Instant) -> Option<Connection<RId>> {
         let connection = self.established.remove(id)?;
 
@@ -96,10 +82,6 @@ where
         Some(connection)
     }
 
-    pub(crate) fn contains_initial(&self, id: &TId) -> bool {
-        self.initial.contains_key(id)
-    }
-
     pub(crate) fn check_relays_available(
         &mut self,
         allocations: &Allocations<RId>,
@@ -107,19 +89,6 @@ where
         rng: &mut impl Rng,
         now: Instant,
     ) {
-        for (_, c) in self.iter_initial_mut() {
-            if allocations.contains(&c.relay) {
-                continue;
-            }
-
-            let Some((new_rid, _)) = allocations.sample(rng) else {
-                continue;
-            };
-
-            tracing::info!(old_rid = ?c.relay, %new_rid, "Updating relay");
-            c.relay = new_rid;
-        }
-
         for (cid, c) in self.iter_established_mut() {
             if allocations.contains(&c.relay.id) {
                 continue; // Our relay is still there, no problems.
@@ -138,27 +107,14 @@ where
 
             c.relay.id = rid;
 
-            for candidate in allocation
-                .current_relay_candidates()
-                .filter_map(|candidate| add_local_candidate(&mut c.agent, candidate))
-            {
-                pending_events.push_back(new_ice_candidate_event(cid, candidate));
+            for candidate in allocation.current_relay_candidates() {
+                c.add_local_candidate(cid, &candidate, pending_events, now);
             }
-
-            c.state.on_candidate(cid, &mut c.agent, now);
         }
     }
 
     pub(crate) fn stats(&self) -> impl Iterator<Item = (TId, ConnectionStats)> + '_ {
         self.established.iter().map(move |(id, c)| (*id, c.stats))
-    }
-
-    pub(crate) fn insert_initial(
-        &mut self,
-        id: TId,
-        connection: InitialConnection<RId>,
-    ) -> Option<InitialConnection<RId>> {
-        self.initial.insert(id, connection)
     }
 
     pub(crate) fn insert_established(
@@ -178,52 +134,20 @@ where
         existing
     }
 
-    pub(crate) fn agent_and_state_mut(
-        &mut self,
-        id: TId,
-    ) -> Option<(&mut IceAgent, Option<&mut ConnectionState>, RId)> {
-        let maybe_initial_connection = self
-            .initial
-            .get_mut(&id)
-            .map(|i| (&mut i.agent, None, i.relay));
-        let maybe_established_connection = self
-            .established
-            .get_mut(&id)
-            .map(|c| (&mut c.agent, Some(&mut c.state), c.relay.id));
-
-        maybe_initial_connection.or(maybe_established_connection)
-    }
-
-    pub(crate) fn agents_and_state_by_relay_mut(
+    pub(crate) fn iter_mut_by_relay(
         &mut self,
         id: RId,
-    ) -> impl Iterator<Item = (TId, &mut IceAgent, Option<&mut ConnectionState>)> + '_ {
-        let initial_connections = self
-            .initial
+    ) -> impl Iterator<Item = (TId, &mut Connection<RId>)> + '_ {
+        self.established
             .iter_mut()
-            .filter_map(move |(cid, i)| (i.relay == id).then_some((*cid, &mut i.agent, None)));
-        let established_connections = self.established.iter_mut().filter_map(move |(cid, c)| {
-            (c.relay.id == id).then_some((*cid, &mut c.agent, Some(&mut c.state)))
-        });
-
-        initial_connections.chain(established_connections)
+            .filter_map(move |(cid, c)| (c.relay.id == id).then_some((*cid, c)))
     }
 
-    pub(crate) fn agents_mut(&mut self) -> impl Iterator<Item = (TId, &mut IceAgent)> {
-        let initial_agents = self.initial.iter_mut().map(|(id, c)| (*id, &mut c.agent));
-        let negotiated_agents = self
-            .established
-            .iter_mut()
-            .map(|(id, c)| (*id, &mut c.agent));
-
-        initial_agents.chain(negotiated_agents)
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (TId, &mut Connection<RId>)> {
+        self.established.iter_mut().map(|(id, c)| (*id, c))
     }
 
-    pub(crate) fn get_established_mut(
-        &mut self,
-        id: &TId,
-        now: Instant,
-    ) -> Result<&mut Connection<RId>> {
+    pub(crate) fn get_mut(&mut self, id: &TId, now: Instant) -> Result<&mut Connection<RId>> {
         let connection = self
             .established
             .get_mut(id)
@@ -272,12 +196,6 @@ where
         Ok((*id, conn))
     }
 
-    pub(crate) fn iter_initial_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (TId, &mut InitialConnection<RId>)> {
-        self.initial.iter_mut().map(|(id, conn)| (*id, conn))
-    }
-
     pub(crate) fn iter_established(&self) -> impl Iterator<Item = (TId, &Connection<RId>)> {
         self.established.iter().map(|(id, conn)| (*id, conn))
     }
@@ -289,17 +207,16 @@ where
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.initial.len() + self.established.len()
+        self.established.len()
     }
 
     pub(crate) fn clear(&mut self) {
-        self.initial.clear();
         self.established.clear();
         self.established_by_wireguard_session_index.clear();
     }
 
     pub(crate) fn iter_ids(&self) -> impl Iterator<Item = TId> + '_ {
-        self.initial.keys().chain(self.established.keys()).copied()
+        self.established.keys().copied()
     }
 
     pub(crate) fn all_idle(&self) -> bool {
@@ -308,7 +225,6 @@ where
 
     pub(crate) fn poll_timeout(&mut self) -> Option<(Instant, &'static str)> {
         iter::empty()
-            .chain(self.initial.values_mut().filter_map(|c| c.poll_timeout()))
             .chain(
                 self.established
                     .values_mut()
@@ -430,8 +346,12 @@ mod tests {
     use bufferpool::BufferPool;
     use rand::random;
     use ringbuffer::AllocRingBuffer;
+    use str0m::ice::IceAgent;
 
-    use crate::node::{ConnectionState, SelectedRelay};
+    use crate::{
+        IceConfig,
+        node::{ConnectionState, SelectedRelay},
+    };
 
     use super::*;
 
@@ -462,7 +382,7 @@ mod tests {
 
         let (id, idx, key) = insert_dummy_connection(&mut connections);
 
-        connections.get_established_mut(&id, now).unwrap().state = ConnectionState::Failed;
+        connections.get_mut(&id, now).unwrap().state = ConnectionState::Failed;
         connections.handle_timeout(&mut VecDeque::default(), now);
         now += Duration::from_secs(1);
 
@@ -495,7 +415,7 @@ mod tests {
     ) {
         // Get by ID
         let err = connections
-            .get_established_mut(&id, now)
+            .get_mut(&id, now)
             .unwrap_err()
             .downcast::<UnknownConnection>()
             .unwrap();
@@ -526,7 +446,7 @@ mod tests {
         let new_local = Index::new_local(idx);
 
         Connection {
-            agent: IceAgent::new(),
+            agent: IceAgent::new(str0m::IceCreds::new(), &crate::CRYPTO_PROVIDER),
             index: new_local,
             tunnel: Tunn::new_at(
                 private,
@@ -558,6 +478,8 @@ mod tests {
             first_handshake_completed_at: None,
             buffer: Default::default(),
             buffer_pool: BufferPool::new(0, "test"),
+            default_ice_config: IceConfig::client_default(),
+            idle_ice_config: IceConfig::client_idle(),
         }
     }
 

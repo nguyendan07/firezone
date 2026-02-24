@@ -1,18 +1,15 @@
 defmodule PortalWeb.Settings.DNS do
   use PortalWeb, :live_view
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(_params, _session, socket) do
-    account = DB.get_account_by_id!(socket.assigns.account.id, socket.assigns.subject)
+    account = Database.get_account_by_id!(socket.assigns.account.id, socket.assigns.subject)
     # Ensure config has proper defaults
     account = %{account | config: Portal.Accounts.Config.ensure_defaults(account.config)}
-
-    doh_disabled = System.get_env("DISABLE_DOH_RESOLVERS") == "true"
 
     socket =
       socket
       |> assign(page_title: "DNS")
-      |> assign(doh_disabled: doh_disabled)
       |> init(account)
 
     {:ok, socket}
@@ -101,8 +98,8 @@ defmodule PortalWeb.Settings.DNS do
                       />
                       <label for="dns-type--system" class={~w[
                         inline-flex items-center justify-between w-full
-                        p-5 text-gray-500 bg-white border border-gray-200
-                        rounded cursor-pointer peer-checked:border-accent-500
+                        p-5 text-neutral-500 bg-white border border-neutral-200
+                        rounded-sm cursor-pointer peer-checked:border-accent-500
                         peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100
                       ]}>
                         <div class="block">
@@ -122,20 +119,16 @@ defmodule PortalWeb.Settings.DNS do
                         field={dns_form[:type]}
                         value="secure"
                         checked={"#{dns_form[:type].value}" == "secure"}
-                        disabled={@doh_disabled}
                         required
                       />
                       <label
                         for="dns-type--secure"
                         class={[
                           "inline-flex items-center justify-between w-full",
-                          "p-5 text-gray-500 bg-white border border-gray-200",
-                          "rounded cursor-pointer peer-checked:border-accent-500",
-                          "peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100",
-                          @doh_disabled && "opacity-50 cursor-not-allowed",
-                          "relative group"
+                          "p-5 text-neutral-500 bg-white border border-neutral-200",
+                          "rounded-sm cursor-pointer peer-checked:border-accent-500",
+                          "peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100"
                         ]}
-                        title={@doh_disabled && "Coming soon"}
                       >
                         <div class="block">
                           <div class="w-full font-semibold mb-3">
@@ -158,8 +151,8 @@ defmodule PortalWeb.Settings.DNS do
                       />
                       <label for="dns-type--custom" class={~w[
                         inline-flex items-center justify-between w-full
-                        p-5 text-gray-500 bg-white border border-gray-200
-                        rounded cursor-pointer peer-checked:border-accent-500
+                        p-5 text-neutral-500 bg-white border border-neutral-200
+                        rounded-sm cursor-pointer peer-checked:border-accent-500
                         peer-checked:text-accent-500 hover:text-gray-600 hover:bg-gray-100
                       ]}>
                         <div class="block">
@@ -191,7 +184,11 @@ defmodule PortalWeb.Settings.DNS do
                   />
                   <p class="mt-4 text-sm text-neutral-500">
                     <strong>Note:</strong>
-                    Secure DNS is only supported on very recent Clients. Ensure your users are using the latest version to benefit from Secure DNS.
+                    Secure DNS is only supported on recent Clients. See the
+                    <.website_link path="/kb/deploy/dns" fragment="secure-dns">
+                      DNS configuration documentation
+                    </.website_link>
+                    for supported client versions.
                   </p>
                 </div>
 
@@ -223,7 +220,7 @@ defmodule PortalWeb.Settings.DNS do
                       />
 
                       <div class="flex gap-4 items-start mb-2">
-                        <div class="flex-grow">
+                        <div class="grow">
                           <.input
                             label="IP Address"
                             field={address_form[:address]}
@@ -318,18 +315,18 @@ defmodule PortalWeb.Settings.DNS do
   defp update_account_config(account, attrs, subject) do
     account
     |> change_account_config(attrs)
-    |> DB.update(subject)
+    |> Database.update(subject)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Account
 
     def get_account_by_id!(id, subject) do
       from(a in Account, where: a.id == ^id)
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
 
     def update(changeset, subject) do

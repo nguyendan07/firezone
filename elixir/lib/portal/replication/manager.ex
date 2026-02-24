@@ -19,36 +19,40 @@ defmodule Portal.Replication.Manager do
   @impl true
   def init(connection_module) do
     Process.flag(:trap_exit, true)
+    config = Application.fetch_env!(:portal, connection_module)
+    pg_key = {connection_module, config[:region] || ""}
     send(self(), :connect)
-    {:ok, %{retries: 0, connection_pid: nil, connection_module: connection_module}}
+
+    {:ok,
+     %{retries: 0, connection_pid: nil, connection_module: connection_module, pg_key: pg_key}}
   end
 
-  # Try to find an existing connection process or start a new one, with edge cases handled
-  # to minimize false starts. During deploys, the new nodes will merge into the existing
-  # cluster state and we want to minimize the window of time where we're not processing
-  # messages.
+  # Try to find an existing connection process via pg groups, or start a new one.
+  # When we link to an existing process (local or remote), we'll receive an EXIT
+  # message if it dies, allowing us to immediately try to take over the slot.
 
   @impl true
-  def handle_info(:connect, %{connection_module: connection_module, connection_pid: nil} = state) do
+  def handle_info(:connect, %{connection_pid: nil} = state) do
     Process.send_after(self(), :connect, @retry_interval)
 
-    # First, try to link to an existing connection process
-    case :global.whereis_name(connection_module) do
-      :undefined ->
-        # No existing process found, attempt to start one
-        start_connection(state)
-
-      pid when is_pid(pid) ->
+    # Check if another node already has the connection
+    case :pg.get_members(state.pg_key) do
+      [pid | _] ->
+        # Found existing connection, link to it for failover
         link_existing_pid(pid, state)
+
+      [] ->
+        # No existing connection, try to start one
+        start_connection(state)
     end
   end
 
   def handle_info(
         {:EXIT, pid, _reason},
-        %{connection_module: connection_module, connection_pid: pid} = state
+        %{connection_pid: pid} = state
       ) do
     Logger.info(
-      "#{connection_module}: Replication connection died unexpectedly, restarting immediately",
+      "#{inspect(state.pg_key)}: Replication connection died unexpectedly, restarting immediately",
       died_pid: inspect(pid),
       died_node: node(pid)
     )
@@ -66,6 +70,16 @@ defmodule Portal.Replication.Manager do
   def handle_info(:connect, state) do
     {:noreply, state}
   end
+
+  @impl true
+  def terminate(_reason, %{connection_pid: pid}) when is_pid(pid) do
+    # Send shutdown message to the replication connection so it disconnects
+    # gracefully without trying to reconnect
+    send(pid, :shutdown)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
 
   defp start_connection(%{connection_module: connection_module} = state) do
     case connection_module.start_link(replication_child_spec(connection_module)) do

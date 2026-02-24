@@ -3,7 +3,6 @@
 pub use ::logging::*;
 
 use anyhow::{Context as _, Result, bail};
-use bin_shared::known_dirs;
 use serde::Serialize;
 use std::{
     fs,
@@ -13,12 +12,13 @@ use std::{
 use tokio::task::spawn_blocking;
 use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 
-/// If you don't store `Handles` in a variable, the file logger handle will drop immediately,
-/// resulting in empty log files.
+/// If you don't store `Handles` in a variable, the file logger and cleanup thread will
+/// stop immediately, resulting in empty log files and no log rotation.
 #[must_use]
 pub struct Handles {
     pub logger: logging::file::Handle,
     pub reloader: FilterReloadHandle,
+    pub cleanup: logging::CleanupHandle,
 }
 
 struct LogPath {
@@ -92,9 +92,22 @@ pub fn setup_gui(directives: &str) -> Result<Handles> {
         "`gui-client` started logging"
     );
 
+    // Start background log cleanup thread
+    let log_dirs = log_paths()
+        .context("Can't compute log paths for cleanup")?
+        .into_iter()
+        .map(|lp| lp.src)
+        .collect();
+    let cleanup = logging::start_log_cleanup_thread(
+        log_dirs,
+        logging::DEFAULT_MAX_SIZE_MB,
+        logging::DEFAULT_CLEANUP_INTERVAL,
+    )?;
+
     Ok(Handles {
         logger,
         reloader: stdout_reloader.merge(file_reloader).merge(system_reloader),
+        cleanup,
     })
 }
 
@@ -179,8 +192,8 @@ pub(crate) fn get_log_filter() -> Result<String> {
         return Ok(filter);
     }
 
-    if let Ok(filter) = std::fs::read_to_string(bin_shared::known_dirs::tunnel_log_filter()?)
-        .map(|s| s.trim().to_string())
+    if let Ok(filter) =
+        std::fs::read_to_string(known_dirs::tunnel_log_filter()?).map(|s| s.trim().to_string())
     {
         return Ok(filter);
     }

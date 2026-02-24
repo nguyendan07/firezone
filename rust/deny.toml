@@ -25,7 +25,26 @@
 targets = [
     # The triple can be any string, but only the target triples built in to
     # rustc (as of 1.40) can be checked against actual config expressions
-    #"x86_64-unknown-linux-musl",
+
+    # Windows
+    "x86_64-pc-windows-msvc",
+
+    # Linux
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "armv7-unknown-linux-musleabihf",
+
+    # Apple
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+
+    # Android
+    "armv7-linux-androideabi",
+    "aarch64-linux-android",
+    "x86_64-linux-android",
+    "i686-linux-android",
+
     # You can also specify which target_features you promise are enabled for a
     # particular target. target_features are currently not validated against
     # the actual valid features supported by the target architecture.
@@ -239,22 +258,18 @@ deny = [
 skip = [
     "base64",
     "bitflags",
-    "convert_case",
-    "dispatch2",          # rfd (tauri) uses 0.2.0, other deps use 0.3.0
     "cargo-platform",
     "cargo_metadata",
-    "core-foundation",
-    "core-graphics",
-    "core-graphics-types",
+    "convert_case",
     "derive_more",
     "foldhash",
     "getrandom",
     "hashbrown",
     "heck",
     "indexmap",
-    "itertools",
     "libloading",
     "linux-raw-sys",
+    "nom",
     "object",
     "phf",
     "phf_codegen",
@@ -266,8 +281,7 @@ skip = [
     "rand",
     "rand_chacha",
     "rand_core",
-    "raw-window-handle",
-    "redox_users",
+    "reqwest",
     "rustix",
     "serde_spanned",
     "siphasher",
@@ -275,23 +289,14 @@ skip = [
     "syn",
     "thiserror",
     "thiserror-impl",
-    "tokio-tungstenite",  # goose uses 0.27.0, phoenix-channel uses 0.28.0
     "toml",
     "toml_datetime",
     "toml_edit",
-    "tungstenite",        # goose uses 0.27.0, phoenix-channel uses 0.28.0
-    "wasi",
     "webpki-roots",
+    "which",
     "windows-link",
     "windows-sys",
     "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
     "windows_x86_64_msvc",
     "winnow",
     "winreg",

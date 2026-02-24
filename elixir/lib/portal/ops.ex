@@ -1,5 +1,5 @@
 defmodule Portal.Ops do
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   alias Portal.Banner
 
   @doc """
@@ -60,8 +60,8 @@ defmodule Portal.Ops do
   To delete an account you need to disable it first by cancelling its subscription in Stripe.
   """
   def delete_disabled_account(id) do
-    DB.get_disabled_account!(id)
-    |> DB.delete()
+    Database.get_disabled_account!(id)
+    |> Database.delete()
 
     :ok
   end
@@ -69,16 +69,15 @@ defmodule Portal.Ops do
   def set_banner(message) do
     clear_banner()
 
-    %Banner{}
-    |> Banner.changeset(message: message)
-    |> DB.insert()
+    %Banner{message: message}
+    |> Database.insert()
   end
 
   def clear_banner do
-    DB.delete_all(Banner)
+    Database.delete_all(Banner)
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Account, Safe}
 
@@ -87,12 +86,12 @@ defmodule Portal.Ops do
         where: a.id == ^id,
         where: not is_nil(a.disabled_at)
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one!()
     end
 
-    def insert(changeset) do
-      changeset
+    def insert(banner) do
+      banner
       |> Safe.unscoped()
       |> Safe.insert()
     end
@@ -103,8 +102,8 @@ defmodule Portal.Ops do
       |> Safe.delete_all()
     end
 
-    def delete(record) do
-      record
+    def delete(banner) do
+      banner
       |> Safe.unscoped()
       |> Safe.delete()
     end

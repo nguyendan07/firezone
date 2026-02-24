@@ -18,11 +18,11 @@ function relay2() {
     docker compose exec -T relay-2 "$@"
 }
 
-function client_curl_resource() {
+function client_curl() {
     client curl --connect-timeout 10 --fail "$1" >/dev/null
 }
 
-function client_ping_resource() {
+function client_ping() {
     client timeout 30 \
         sh -c "until ping -W 1 -c 1 $1 &>/dev/null; do true; done"
 }
@@ -46,7 +46,7 @@ site = Portal.Repo.get_by!(Portal.Site, account_id: account_id, name: \"$site_na
 [client_id | _] = Portal.Presence.Clients.Account.list(account_id) |> Map.keys()
 resource = Portal.Repo.get_by!(Portal.Resource, account_id: account_id, name: \"$resource_name\")
 
-Portal.PubSub.Account.broadcast(account_id, {{:reject_access, gateway_id}, client_id, resource.id})
+Portal.Channels.reject_access(gateway_id, client_id, resource.id)
 "
 }
 

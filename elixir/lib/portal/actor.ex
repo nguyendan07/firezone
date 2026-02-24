@@ -21,7 +21,7 @@ defmodule Portal.Actor do
     field :name, :string
 
     has_many :identities, Portal.ExternalIdentity, references: :id
-    has_many :clients, Portal.Client, preload_order: [desc: :last_seen_at], references: :id
+    has_many :clients, Portal.Client, preload_order: [desc: :inserted_at], references: :id
     has_many :client_tokens, Portal.ClientToken, references: :id
     has_many :one_time_passcodes, Portal.OneTimePasscode, references: :id
     has_many :memberships, Portal.Membership, on_replace: :delete, references: :id
@@ -36,14 +36,15 @@ defmodule Portal.Actor do
     timestamps()
   end
 
-  def changeset(changeset) do
+  def changeset(%Ecto.Changeset{} = changeset) do
     changeset
     |> validate_required(~w[name type]a)
     |> trim_change(~w[name email]a)
-    |> validate_length(:name, max: 512)
+    |> validate_length(:name, max: 255)
     |> normalize_email(:email)
     |> validate_email(:email)
     |> assoc_constraint(:account)
+    |> assoc_constraint(:directory, name: :actors_created_by_directory_id_fkey)
     |> unique_constraint(:email, name: :actors_account_id_email_index)
     |> check_constraint(:type, name: :type_is_valid)
   end

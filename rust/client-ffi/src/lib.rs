@@ -10,6 +10,8 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow};
 use backoff::ExponentialBackoffBuilder;
+use ip_network::IpNetwork;
+use itertools::Itertools as _;
 use logging::sentry_layer;
 use phoenix_channel::{LoginUrl, PhoenixChannel, get_user_agent};
 use platform::RELEASE;
@@ -125,6 +127,12 @@ pub enum Event {
     },
     ResourcesUpdated {
         resources: Vec<Resource>,
+    },
+    AllGatewaysOffline {
+        resource_id: String,
+    },
+    GatewayVersionMismatch {
+        resource_id: String,
     },
     Disconnected {
         error: Arc<DisconnectError>,
@@ -380,23 +388,20 @@ impl Session {
                     .map(|ip| ip.to_string())
                     .collect();
 
-                let ipv4_routes: Vec<Cidr> = config
-                    .ipv4_routes
-                    .into_iter()
-                    .map(|network| Cidr {
-                        address: network.network_address().to_string(),
-                        prefix: network.netmask(),
-                    })
-                    .collect();
-
-                let ipv6_routes: Vec<Cidr> = config
-                    .ipv6_routes
-                    .into_iter()
-                    .map(|network| Cidr {
-                        address: network.network_address().to_string(),
-                        prefix: network.netmask(),
-                    })
-                    .collect();
+                let (ipv4_routes, ipv6_routes) =
+                    config
+                        .routes
+                        .into_iter()
+                        .partition_map(|route| match route {
+                            IpNetwork::V4(v4) => itertools::Either::Left(Cidr {
+                                address: v4.network_address().to_string(),
+                                prefix: v4.netmask(),
+                            }),
+                            IpNetwork::V6(v6) => itertools::Either::Right(Cidr {
+                                address: v6.network_address().to_string(),
+                                prefix: v6.netmask(),
+                            }),
+                        });
 
                 Some(Event::TunInterfaceUpdated {
                     ipv4: config.ip.v4.to_string(),
@@ -411,6 +416,16 @@ impl Session {
                 let resources: Vec<Resource> = resources.into_iter().map(Into::into).collect();
 
                 Some(Event::ResourcesUpdated { resources })
+            }
+            client_shared::Event::AllGatewaysOffline { resource_id } => {
+                Some(Event::AllGatewaysOffline {
+                    resource_id: resource_id.to_string(),
+                })
+            }
+            client_shared::Event::GatewayVersionMismatch { resource_id } => {
+                Some(Event::GatewayVersionMismatch {
+                    resource_id: resource_id.to_string(),
+                })
             }
             client_shared::Event::Disconnected(error) => Some(Event::Disconnected {
                 error: Arc::new(DisconnectError(error)),
@@ -589,6 +604,39 @@ fn install_rustls_crypto_provider() {
     if existing.is_err() {
         tracing::debug!("Skipping install of crypto provider because we already have one.");
     }
+}
+
+/// Enforces a size cap on log directories by deleting oldest files first.
+///
+/// # Returns
+/// Number of bytes deleted (best-effort, never fails)
+#[uniffi::export]
+pub fn enforce_log_size_cap(log_dirs: Vec<String>, max_size_mb: u32) -> u64 {
+    let paths: Vec<std::path::PathBuf> = log_dirs.iter().map(std::path::PathBuf::from).collect();
+    let path_refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+
+    logging::cleanup::enforce_size_cap(&path_refs, max_size_mb)
+}
+
+/// Default maximum total log size in MB across all log directories.
+#[uniffi::export]
+pub fn log_cleanup_default_max_size_mb() -> u32 {
+    logging::DEFAULT_MAX_SIZE_MB
+}
+
+/// Default interval between log cleanup runs in seconds (1 hour).
+#[uniffi::export]
+pub fn log_cleanup_default_interval_secs() -> u64 {
+    logging::DEFAULT_CLEANUP_INTERVAL.as_secs()
+}
+
+/// Hashes a device ID using SHA256 and returns the hex-encoded result.
+///
+/// This is exposed via FFI so that clients an produce
+/// the exact same hash as connlib, without reimplementing the algorithm.
+#[uniffi::export]
+pub fn hash_device_id(id: String) -> String {
+    telemetry::hash_device_id(id)
 }
 
 impl From<connlib_model::ResourceView> for Resource {

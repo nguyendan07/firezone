@@ -2,10 +2,9 @@ defmodule PortalAPI.MembershipController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
   alias PortalAPI.Pagination
-  alias __MODULE__.DB
+  alias PortalAPI.Error
+  alias __MODULE__.Database
   import Ecto.Changeset
-
-  action_fallback PortalAPI.FallbackController
 
   tags ["Memberships"]
 
@@ -29,14 +28,16 @@ defmodule PortalAPI.MembershipController do
       ok: {"Membership Response", "application/json", PortalAPI.Schemas.Membership.ListResponse}
     ]
 
-  # List members for a given Group
+  @spec index(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def index(conn, %{"group_id" => group_id} = params) do
     list_opts =
       Pagination.params_to_list_opts(params)
       |> Keyword.put(:filter, group_id: group_id)
 
-    with {:ok, actors, metadata} <- DB.list_actors(conn.assigns.subject, list_opts) do
+    with {:ok, actors, metadata} <- Database.list_actors(conn.assigns.subject, list_opts) do
       render(conn, :index, actors: actors, metadata: metadata)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -58,25 +59,25 @@ defmodule PortalAPI.MembershipController do
          PortalAPI.Schemas.Membership.MembershipResponse}
     ]
 
+  @spec update_put(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def update_put(
         conn,
         %{"group_id" => group_id, "memberships" => attrs}
       ) do
     subject = conn.assigns.subject
 
-    with {:ok, group} <- DB.fetch_group(group_id, subject),
-         true <- is_nil(group.directory_id) and group.type == :static,
+    with {:ok, group} <- Database.fetch_group(group_id, subject),
+         :ok <- validate_group_editable(group),
          changeset <- update_group_memberships_changeset(group, attrs),
-         {:ok, group} <- DB.update_group(changeset, subject) do
+         {:ok, group} <- Database.update_group(changeset, subject) do
       render(conn, :memberships, memberships: group.memberships)
     else
-      false -> {:error, :not_editable}
-      error -> error
+      error -> Error.handle(conn, error)
     end
   end
 
-  def update_put(_conn, _params) do
-    {:error, :bad_request}
+  def update_put(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
   end
 
   operation :update_patch,
@@ -97,7 +98,7 @@ defmodule PortalAPI.MembershipController do
          PortalAPI.Schemas.Membership.MembershipResponse}
     ]
 
-  # Update Memberships
+  @spec update_patch(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def update_patch(
         conn,
         %{"group_id" => group_id, "memberships" => params}
@@ -106,20 +107,27 @@ defmodule PortalAPI.MembershipController do
     remove = Map.get(params, "remove", [])
     subject = conn.assigns.subject
 
-    with {:ok, group} <- DB.fetch_group(group_id, subject),
-         true <- is_nil(group.directory_id) and group.type == :static,
+    with {:ok, group} <- Database.fetch_group(group_id, subject),
+         :ok <- validate_group_editable(group),
          membership_attrs <- prepare_membership_attrs(group, add, remove),
          changeset <- update_group_memberships_changeset(group, membership_attrs),
-         {:ok, group} <- DB.update_group(changeset, subject) do
+         {:ok, group} <- Database.update_group(changeset, subject) do
       render(conn, :memberships, memberships: group.memberships)
     else
-      false -> {:error, :not_editable}
-      error -> error
+      error -> Error.handle(conn, error)
     end
   end
 
-  def update_patch(_conn, _params) do
-    {:error, :bad_request}
+  def update_patch(conn, _params) do
+    Error.handle(conn, {:error, :bad_request})
+  end
+
+  defp validate_group_editable(group) do
+    if is_nil(group.directory_id) and group.type == :static do
+      :ok
+    else
+      {:error, :forbidden, reason: "Group is not editable"}
+    end
   end
 
   defp update_group_memberships_changeset(group, attrs) do
@@ -156,20 +164,20 @@ defmodule PortalAPI.MembershipController do
       else: Enum.map(membership_ids, &%{"actor_id" => &1, "account_id" => group.account_id})
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
     def list_actors(subject, opts) do
       from(a in Portal.Actor, as: :actors)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
     def fetch_group(id, subject) do
       from(g in Portal.Group, where: g.id == ^id)
       |> preload(:memberships)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.one()
       |> case do
         nil -> {:error, :not_found}

@@ -11,7 +11,7 @@ use crate::{
     proptest::*,
 };
 use crate::{client::DnsResource, messages::gateway};
-use connlib_model::{GatewayId, Site};
+use connlib_model::{ClientId, GatewayId, Site};
 use connlib_model::{ResourceId, SiteId};
 use dns_types::DomainName;
 use ip_network::IpNetwork;
@@ -31,9 +31,7 @@ use std::{
 /// Stub implementation of the portal.
 #[derive(Clone, derive_more::Debug)]
 pub(crate) struct StubPortal {
-    client_tunnel_ipv4: Ipv4Addr,
-    client_tunnel_ipv6: Ipv6Addr,
-
+    clients: BTreeMap<ClientId, (Ipv4Addr, Ipv6Addr)>,
     gateways_by_site: BTreeMap<SiteId, BTreeSet<(GatewayId, Ipv4Addr, Ipv6Addr)>>,
 
     #[debug(skip)]
@@ -44,17 +42,25 @@ pub(crate) struct StubPortal {
     dns_resources: BTreeMap<ResourceId, client::DnsResource>,
     internet_resource: client::InternetResource,
 
+    search_domain: Option<DomainName>,
+    upstream_do53: Vec<UpstreamDo53>,
+    upstream_doh: Vec<UpstreamDoH>,
+
     #[debug(skip)]
     gateway_selector: Selector,
 }
 
 impl StubPortal {
     pub(crate) fn new(
+        clients: BTreeSet<ClientId>,
         gateways_by_site: BTreeMap<SiteId, BTreeSet<GatewayId>>,
         gateway_selector: Selector,
         cidr_resources: BTreeSet<client::CidrResource>,
         dns_resources: BTreeSet<client::DnsResource>,
         internet_resource: client::InternetResource,
+        search_domain: Option<DomainName>,
+        upstream_do53: Vec<UpstreamDo53>,
+        upstream_doh: Vec<UpstreamDoH>,
     ) -> Self {
         let cidr_resources = cidr_resources
             .into_iter()
@@ -98,8 +104,15 @@ impl StubPortal {
         let mut tunnel_ip4s = tunnel_ip4s();
         let mut tunnel_ip6s = tunnel_ip6s();
 
-        let client_tunnel_ipv4 = tunnel_ip4s.next().unwrap();
-        let client_tunnel_ipv6 = tunnel_ip6s.next().unwrap();
+        let clients = clients
+            .into_iter()
+            .map(|id| {
+                let client_tunnel_ipv4 = tunnel_ip4s.next().unwrap();
+                let client_tunnel_ipv6 = tunnel_ip6s.next().unwrap();
+
+                (id, (client_tunnel_ipv4, client_tunnel_ipv6))
+            })
+            .collect();
 
         let gateways_by_site = gateways_by_site
             .into_iter()
@@ -119,8 +132,7 @@ impl StubPortal {
             .collect();
 
         Self {
-            client_tunnel_ipv4,
-            client_tunnel_ipv6,
+            clients,
             gateways_by_site,
             gateway_selector,
             sites_by_resource: BTreeMap::from_iter(
@@ -129,6 +141,9 @@ impl StubPortal {
             cidr_resources,
             dns_resources,
             internet_resource,
+            search_domain,
+            upstream_do53,
+            upstream_doh,
         }
     }
 
@@ -147,6 +162,34 @@ impl StubPortal {
                 self.internet_resource.clone(),
             )))
             .collect()
+    }
+
+    pub(crate) fn dns_resources(&self) -> Vec<client::DnsResource> {
+        self.dns_resources.values().cloned().collect()
+    }
+
+    pub(crate) fn search_domain(&self) -> Option<DomainName> {
+        self.search_domain.clone()
+    }
+
+    pub(crate) fn set_search_domain(&mut self, search_domain: Option<DomainName>) {
+        self.search_domain = search_domain;
+    }
+
+    pub(crate) fn upstream_do53(&self) -> &[UpstreamDo53] {
+        &self.upstream_do53
+    }
+
+    pub(crate) fn set_upstream_do53(&mut self, upstream_do53: Vec<UpstreamDo53>) {
+        self.upstream_do53 = upstream_do53;
+    }
+
+    pub(crate) fn upstream_doh(&self) -> &[UpstreamDoH] {
+        &self.upstream_doh
+    }
+
+    pub(crate) fn set_upstream_doh(&mut self, upstream_doh: Vec<UpstreamDoH>) {
+        self.upstream_doh = upstream_doh;
     }
 
     /// Picks, which gateway and site we should connect to for the given resource.
@@ -285,43 +328,23 @@ impl StubPortal {
             .prop_map(BTreeMap::from_iter)
     }
 
-    pub(crate) fn client<S1, S2, S3>(
+    pub(crate) fn clients<S1>(
         &self,
         system_dns: S1,
-        upstream_do53: S2,
-        upstream_doh: S3,
-    ) -> impl Strategy<Value = Host<RefClient>> + use<S1, S2, S3>
+    ) -> impl Strategy<Value = BTreeMap<ClientId, Host<RefClient>>> + use<S1>
     where
-        S1: Strategy<Value = Vec<IpAddr>>,
-        S2: Strategy<Value = Vec<UpstreamDo53>>,
-        S3: Strategy<Value = Vec<UpstreamDoH>>,
+        S1: Strategy<Value = Vec<IpAddr>> + Clone,
     {
-        ref_client_host(
-            Just(self.client_tunnel_ipv4),
-            Just(self.client_tunnel_ipv6),
-            system_dns,
-            upstream_do53,
-            upstream_doh,
-            self.search_domain(),
-        )
-    }
-
-    pub(crate) fn search_domain(&self) -> impl Strategy<Value = Option<DomainName>> + use<> {
-        let possible_search_domains = self
-            .dns_resources
-            .values()
-            .map(|r| {
-                // For `*.example.com`, we want to extract `example.com`.
-                // For `**.example.com`, we want to extract `example.com`.
-                // For `app.example.com`, we want to extract `example.com`.
-                // Therefore, we can always split by the first dot.
-                let (_, search_domain) = r.address.split_once(".").unwrap();
-
-                DomainName::vec_from_str(search_domain).unwrap()
+        self.clients
+            .iter()
+            .map(|(id, (ipv4, ipv6))| {
+                (
+                    Just(*id),
+                    ref_client_host(Just(*ipv4), Just(*ipv6), system_dns.clone()),
+                )
             })
-            .collect::<Vec<_>>();
-
-        proptest::option::of(sample::select(possible_search_domains))
+            .collect::<Vec<_>>()
+            .prop_map(BTreeMap::from_iter)
     }
 
     pub(crate) fn dns_resource_records(

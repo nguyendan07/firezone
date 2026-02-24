@@ -38,14 +38,14 @@ defmodule Portal.Google.APIClient do
         "assertion" => jwt
       })
 
-    req_options = config[:req_options] || []
+    req_opts = config[:req_opts] || []
 
     Req.post(
       token_endpoint,
       [
         headers: [{"Content-Type", "application/x-www-form-urlencoded"}],
         body: payload
-      ] ++ req_options
+      ] ++ req_opts
     )
   end
 
@@ -95,11 +95,11 @@ defmodule Portal.Google.APIClient do
 
   defp test_endpoint(path, access_token, params) do
     config = Portal.Config.fetch_env!(:portal, __MODULE__)
-    req_options = config[:req_options] || []
+    req_opts = config[:req_opts] || []
     query = URI.encode_query(params)
     url = "#{config[:endpoint]}#{path}?#{query}"
 
-    case Req.get(url, [headers: [Authorization: "Bearer #{access_token}"]] ++ req_options) do
+    case Req.get(url, [headers: [Authorization: "Bearer #{access_token}"]] ++ req_opts) do
       {:ok, %Req.Response{status: 200}} -> :ok
       other -> other
     end
@@ -168,12 +168,38 @@ defmodule Portal.Google.APIClient do
     stream_pages(path, query, access_token, "organizationUnits")
   end
 
+  @doc """
+  Streams users from a specific organization unit.
+  Returns a stream that yields pages of users in the given org unit.
+  """
+  def stream_organization_unit_members(access_token, org_unit_path) do
+    query =
+      URI.encode_query(%{
+        "customer" => "my_customer",
+        "query" => "orgUnitPath='#{org_unit_path}'",
+        "maxResults" => "500",
+        "projection" => "full"
+      })
+
+    path = "/admin/directory/v1/users"
+
+    stream_pages(path, query, access_token, "users")
+    |> Stream.map(fn
+      # Org Unit with no members
+      {:error, {:missing_key, _msg, _body}} ->
+        []
+
+      other ->
+        other
+    end)
+  end
+
   defp get(path, access_token) do
     config = Portal.Config.fetch_env!(:portal, __MODULE__)
-    req_options = config[:req_options] || []
+    req_opts = config[:req_opts] || []
 
     (config[:endpoint] <> path)
-    |> Req.get([headers: [Authorization: "Bearer #{access_token}"]] ++ req_options)
+    |> Req.get([headers: [Authorization: "Bearer #{access_token}"]] ++ req_opts)
   end
 
   defp stream_pages(path, query, access_token, result_key) do
@@ -195,10 +221,10 @@ defmodule Portal.Google.APIClient do
 
   defp fetch_page(current_path, current_query, access_token, result_key) do
     config = Portal.Config.fetch_env!(:portal, __MODULE__)
-    req_options = config[:req_options] || []
+    req_opts = config[:req_opts] || []
     url = "#{config[:endpoint]}#{current_path}?#{current_query}"
 
-    case Req.get(url, [headers: [Authorization: "Bearer #{access_token}"]] ++ req_options) do
+    case Req.get(url, [headers: [Authorization: "Bearer #{access_token}"]] ++ req_opts) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         parse_page_response(body, current_path, current_query, result_key)
 

@@ -1,6 +1,6 @@
 defmodule PortalWeb.Settings.Account.Notifications.Edit do
   use PortalWeb, :live_view
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(_params, _session, socket) do
     socket =
@@ -48,7 +48,7 @@ defmodule PortalWeb.Settings.Account.Notifications.Edit do
                       </tr>
                     </thead>
                     <tbody>
-                      <tr class="bg-white border-b">
+                      <tr class="bg-white border-b border-neutral-200">
                         <.inputs_for :let={outdated_gateway} field={notifications[:outdated_gateway]}>
                           <td scope="row" class="px-6 py-4 whitespace-nowrap">
                             Outdated Gateways
@@ -129,10 +129,10 @@ defmodule PortalWeb.Settings.Account.Notifications.Edit do
   defp update_account_notifications(account, attrs, subject) do
     account
     |> change_account_notifications(attrs)
-    |> DB.update(subject)
+    |> Database.update(subject)
   end
 
-  defmodule DB do
+  defmodule Database do
     alias Portal.Safe
 
     def update(changeset, subject) do

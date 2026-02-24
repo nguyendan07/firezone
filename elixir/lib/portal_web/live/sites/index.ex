@@ -1,7 +1,7 @@
 defmodule PortalWeb.Sites.Index do
   use PortalWeb, :live_view
   alias Portal.Presence
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   def mount(_params, _session, socket) do
@@ -9,7 +9,7 @@ defmodule PortalWeb.Sites.Index do
       :ok = Presence.Gateways.Account.subscribe(socket.assigns.account.id)
     end
 
-    internet_resource = DB.get_internet_resource(socket.assigns.subject)
+    internet_resource = Database.get_internet_resource(socket.assigns.subject)
 
     socket =
       socket
@@ -17,7 +17,7 @@ defmodule PortalWeb.Sites.Index do
       |> assign(internet_resource: internet_resource)
       |> assign(internet_site: internet_resource.site)
       |> assign_live_table("sites",
-        query_module: DB,
+        query_module: Database,
         sortable_fields: [
           {:sites, :name}
         ],
@@ -36,10 +36,10 @@ defmodule PortalWeb.Sites.Index do
   end
 
   def handle_sites_update!(socket, list_opts) do
-    with {:ok, sites, metadata} <- DB.list_sites(socket.assigns.subject, list_opts) do
+    with {:ok, sites, metadata} <- Database.list_sites(socket.assigns.subject, list_opts) do
       site_ids = Enum.map(sites, & &1.id)
-      resources_counts = DB.count_resources_by_site(site_ids, socket.assigns.subject)
-      policies_counts = DB.count_policies_by_site(site_ids, socket.assigns.subject)
+      resources_counts = Database.count_resources_by_site(site_ids, socket.assigns.subject)
+      policies_counts = Database.count_policies_by_site(site_ids, socket.assigns.subject)
 
       {:ok,
        assign(socket,
@@ -198,7 +198,7 @@ defmodule PortalWeb.Sites.Index do
         %Phoenix.Socket.Broadcast{topic: "presences:account_gateways:" <> _account_id},
         socket
       ) do
-    internet_resource = DB.get_internet_resource(socket.assigns.subject)
+    internet_resource = Database.get_internet_resource(socket.assigns.subject)
 
     socket =
       socket
@@ -212,14 +212,14 @@ defmodule PortalWeb.Sites.Index do
   def handle_event(event, params, socket) when event in ["paginate", "order_by", "filter"],
     do: handle_live_table_event(event, params, socket)
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Safe, Site, Resource}
 
     def list_sites(subject, opts \\ []) do
       from(g in Site, as: :sites)
       |> where([sites: s], s.managed_by != :system)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.list(__MODULE__, opts)
     end
 
@@ -228,7 +228,7 @@ defmodule PortalWeb.Sites.Index do
       |> where([resources: r], r.site_id in ^site_ids)
       |> group_by([resources: r], r.site_id)
       |> select([resources: r], {r.site_id, count(r.id)})
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
       |> Map.new()
     end
@@ -242,7 +242,7 @@ defmodule PortalWeb.Sites.Index do
       |> where([resources: r], r.site_id in ^site_ids)
       |> group_by([resources: r], r.site_id)
       |> select([resources: r], {r.site_id, count()})
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
       |> Map.new()
     end
@@ -252,8 +252,8 @@ defmodule PortalWeb.Sites.Index do
         from(r in Resource, as: :resources)
         |> where([resources: r], r.type == :internet)
         |> preload(site: :gateways)
-        |> Safe.scoped(subject)
-        |> Safe.one()
+        |> Safe.scoped(subject, :replica)
+        |> Safe.one(fallback_to_primary: true)
 
       case resource do
         nil ->

@@ -19,6 +19,7 @@ defmodule PortalAPI.Endpoint do
 
   plug RemoteIp,
     headers: ["x-forwarded-for"],
+    parsers: %{"x-forwarded-for" => Portal.RemoteIp.XForwardedForParser},
     proxies: {__MODULE__, :external_trusted_proxies, []},
     clients: {__MODULE__, :clients, []}
 
@@ -35,7 +36,8 @@ defmodule PortalAPI.Endpoint do
       error_handler: {PortalAPI.Sockets, :handle_error, []},
       timeout: :timer.seconds(37)
     ],
-    longpoll: false
+    longpoll: false,
+    drainer: []
 
   socket "/client", PortalAPI.Client.Socket,
     websocket: [
@@ -43,9 +45,10 @@ defmodule PortalAPI.Endpoint do
       check_origin: :conn,
       connect_info: [:trace_context_headers, :user_agent, :peer_data, :x_headers],
       error_handler: {PortalAPI.Sockets, :handle_error, []},
-      timeout: :timer.seconds(307)
+      timeout: :timer.seconds(37)
     ],
-    longpoll: false
+    longpoll: false,
+    drainer: []
 
   socket "/relay", PortalAPI.Relay.Socket,
     websocket: [
@@ -55,7 +58,8 @@ defmodule PortalAPI.Endpoint do
       error_handler: {PortalAPI.Sockets, :handle_error, []},
       timeout: :timer.seconds(41)
     ],
-    longpoll: false
+    longpoll: false,
+    drainer: []
 
   plug :fetch_user_agent
   plug PortalAPI.Router
@@ -88,6 +92,7 @@ defmodule PortalAPI.Endpoint do
   def real_ip_opts do
     [
       headers: ["x-forwarded-for"],
+      parsers: %{"x-forwarded-for" => Portal.RemoteIp.XForwardedForParser},
       proxies: {__MODULE__, :external_trusted_proxies, []},
       clients: {__MODULE__, :clients, []}
     ]

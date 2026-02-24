@@ -9,7 +9,6 @@ db_ssl =
   case System.get_env("DATABASE_SSL", "false") do
     "true" -> true
     "false" -> false
-    json -> json |> JSON.decode!() |> Portal.Config.Dumper.dump_ssl_opts()
   end
 
 db_opts = [
@@ -26,6 +25,7 @@ db_opts = [
 ###############################
 
 config :portal, Portal.Repo, db_opts
+config :portal, Portal.Repo.Replica, db_opts
 
 config :portal, Portal.ChangeLogs.ReplicationConnection,
   replication_slot_name: db_opts[:database] <> "_clog_slot",
@@ -118,8 +118,8 @@ config :portal, PortalWeb.Endpoint,
   url: [scheme: "https", host: "localhost", port: web_port],
   https: [
     port: web_port,
-    certfile: "priv/cert/selfsigned.pem",
-    keyfile: "priv/cert/selfsigned_key.pem"
+    certfile: System.get_env("CERTFILE_PATH", "priv/cert/selfsigned.pem"),
+    keyfile: System.get_env("KEYFILE_PATH", "priv/cert/selfsigned_key.pem")
   ],
   code_reloader: true,
   debug_errors: true,
@@ -151,7 +151,7 @@ config :portal,
 
 config :phoenix_live_reload, :dirs, [File.cwd!()]
 
-config :portal, PortalWeb.Plugs.SecureHeaders,
+config :portal, PortalWeb.Plugs.PutCSPHeader,
   csp_policy: [
     "default-src 'self' 'nonce-${nonce}' https://firezone.statuspage.io",
     "img-src 'self' data: https://www.gravatar.com https://www.firezone.dev https://firezone.statuspage.io",
@@ -178,6 +178,16 @@ config :portal, PortalAPI.Endpoint,
 ###############################
 ##### Third-party configs #####
 ###############################
+
+config :geolix,
+  # Download from maxmind.com (requires free account)
+  databases: [
+    %{
+      id: :city,
+      adapter: Geolix.Adapter.MMDB2,
+      source: Path.expand("../priv/geoip/GeoLite2-City.mmdb", __DIR__)
+    }
+  ]
 
 # Include only message and custom metadata in development logs
 # This filters out Phoenix's automatic metadata like pid, request_id, etc.

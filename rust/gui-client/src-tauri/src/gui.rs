@@ -4,7 +4,7 @@
 //! The real macOS Client is in `swift/apple`
 
 use crate::{
-    controller::{Controller, ControllerRequest, CtlrTx, Failure, GuiIntegration},
+    controller::{Controller, ControllerRequest, Failure, GuiIntegration, NotificationHandle},
     deep_link,
     ipc::{self, ClientRead, ClientWrite, SocketId},
     logging::FileCount,
@@ -157,12 +157,12 @@ impl GuiIntegration for TauriIntegration {
         self.tray.update(app_state)
     }
 
-    fn show_notification(&self, title: &str, body: &str) -> Result<()> {
-        os::show_notification(&self.app, title, body)
-    }
-
-    fn show_update_notification(&self, ctlr_tx: CtlrTx, title: &str, url: url::Url) -> Result<()> {
-        os::show_update_notification(&self.app, ctlr_tx, title, url)
+    fn show_notification(
+        &self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Result<NotificationHandle> {
+        os::show_notification(title.into(), body.into())
     }
 
     fn set_window_visible(&self, visible: bool) -> Result<()> {
@@ -206,6 +206,18 @@ impl GuiIntegration for TauriIntegration {
     fn show_about_page(&self) -> Result<()> {
         self.navigate("about")?;
         self.set_window_visible(true)?;
+
+        Ok(())
+    }
+
+    async fn save_general_settings(&self, settings: &GeneralSettings) -> Result<()> {
+        settings::save_general(settings).await?;
+
+        Ok(())
+    }
+
+    async fn save_advanced_settings(&self, settings: &AdvancedSettings) -> Result<()> {
+        settings::save_advanced(settings).await?;
 
         Ok(())
     }
@@ -326,7 +338,7 @@ pub fn run(
         }
 
         assert_eq!(
-            bin_shared::BUNDLE_ID,
+            crate::BUNDLE_ID,
             app_handle.config().identifier,
             "BUNDLE_ID should match bundle ID in tauri.conf.json"
         );
@@ -344,8 +356,9 @@ pub fn run(
 
         // Spawn the controller
         let ctrl_task = tokio::spawn(Controller::start(
-            ctlr_tx,
+            SocketId::Tunnel,
             integration,
+            ctlr_tx,
             ctlr_rx,
             general_settings,
             mdm_settings,
@@ -422,7 +435,6 @@ pub fn run(
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .build(tauri::generate_context!())
@@ -466,7 +478,7 @@ pub fn run(
 }
 
 #[cfg(not(debug_assertions))]
-async fn smoke_test(_: CtlrTx) -> Result<()> {
+async fn smoke_test(_: mpsc::Sender<ControllerRequest>) -> Result<()> {
     bail!("Smoke test is not built for release binaries.");
 }
 
@@ -475,7 +487,7 @@ async fn smoke_test(_: CtlrTx) -> Result<()> {
 /// You can purposely fail this test by deleting the exported zip file during
 /// the 10-second sleep.
 #[cfg(debug_assertions)]
-async fn smoke_test(ctlr_tx: CtlrTx) -> Result<()> {
+async fn smoke_test(ctrl_tx: mpsc::Sender<ControllerRequest>) -> Result<()> {
     let delay = 10;
     tracing::info!("Will quit on purpose in {delay} seconds as part of the smoke test.");
     let quit_time = tokio::time::Instant::now() + Duration::from_secs(delay);
@@ -492,7 +504,7 @@ async fn smoke_test(ctlr_tx: CtlrTx) -> Result<()> {
             }
         }
     }
-    ctlr_tx
+    ctrl_tx
         .send(ControllerRequest::ExportLogs {
             path: path.clone(),
             stem,
@@ -500,7 +512,7 @@ async fn smoke_test(ctlr_tx: CtlrTx) -> Result<()> {
         .await
         .context("Failed to send `ExportLogs` request")?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    ctlr_tx
+    ctrl_tx
         .send(ControllerRequest::ClearLogs(tx))
         .await
         .context("Failed to send `ClearLogs` request")?;
@@ -532,7 +544,7 @@ async fn smoke_test(ctlr_tx: CtlrTx) -> Result<()> {
     anyhow::ensure!(tokio::fs::try_exists(settings::advanced_settings_path()?).await?);
 
     tracing::info!("Quitting on purpose because of `smoke-test` subcommand");
-    ctlr_tx
+    ctrl_tx
         .send(ControllerRequest::SystemTrayMenu(system_tray::Event::Quit))
         .await
         .context("Failed to send Quit request")?;

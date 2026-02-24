@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
-use tauri::AppHandle;
-use tauri_plugin_notification::NotificationExt as _;
+
+use crate::controller::NotificationHandle;
 
 pub async fn set_autostart(enabled: bool) -> Result<()> {
     let dir = dirs::config_local_dir()
@@ -32,24 +32,31 @@ pub async fn set_autostart(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Since clickable notifications don't work on Linux yet, the update text
-/// must be different on different platforms
-pub(crate) fn show_update_notification(
-    app: &AppHandle,
-    _ctlr_tx: super::CtlrTx,
-    title: &str,
-    download_url: url::Url,
-) -> Result<()> {
-    show_notification(app, title, download_url.to_string().as_ref())?;
-    Ok(())
-}
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Signature must match other platforms."
+)]
+pub(crate) fn show_notification(title: String, body: String) -> Result<NotificationHandle> {
+    let (_, rx) = futures::channel::oneshot::channel();
 
-/// Show a notification in the bottom right of the screen
-pub(crate) fn show_notification(app: &AppHandle, title: &str, body: &str) -> Result<()> {
-    app.notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()?;
-    Ok(())
+    tokio::spawn(async move {
+        let notification = match notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
+            .show_async()
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(%title, "Failed to show notification: {e}");
+                return;
+            }
+        };
+
+        tracing::debug!(%title, %body, "Showing notification");
+
+        notification.on_close(|| {});
+    });
+
+    Ok(NotificationHandle { on_click: rx })
 }

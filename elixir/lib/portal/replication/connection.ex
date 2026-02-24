@@ -91,7 +91,8 @@ defmodule Portal.Replication.Connection do
               warning_threshold: integer(),
               error_threshold: integer(),
               last_sent_lsn: integer() | nil,
-              last_keep_alive: DateTime.t() | nil
+              last_keep_alive: DateTime.t() | nil,
+              region: String.t()
             }
 
       defstruct(
@@ -134,7 +135,9 @@ defmodule Portal.Replication.Connection do
         # last sent LSN, used to log acknowledgement progress
         last_sent_lsn: nil,
         # last keep alive message received at
-        last_keep_alive: nil
+        last_keep_alive: nil,
+        # region for scoping :pg leader election
+        region: ""
       )
     end
   end
@@ -143,12 +146,15 @@ defmodule Portal.Replication.Connection do
   defp connection_functions do
     quote do
       def start_link(%{instance: %__MODULE__{} = instance, connection_opts: connection_opts}) do
-        opts = connection_opts ++ [name: {:global, __MODULE__}]
-        Postgrex.ReplicationConnection.start_link(__MODULE__, instance, opts)
+        Postgrex.ReplicationConnection.start_link(__MODULE__, instance, connection_opts)
       end
 
       @impl true
       def init(state) do
+        # Join pg group so other nodes can discover and link to us.
+        # Scoped by region so each region elects its own leader.
+        :ok = :pg.join({__MODULE__, state.region}, self())
+
         if state.flush_interval > 0 do
           Process.send_after(self(), :flush, state.flush_interval)
         end
@@ -394,20 +400,44 @@ defmodule Portal.Replication.Connection do
       def handle_data(data, state) when is_keep_alive(data) do
         %KeepAlive{reply: reply, wal_end: wal_end} = parse(data)
 
-        wal_end =
-          if state.flush_interval > 0 do
-            # If we are flushing, we use the tracked last_flushed_lsn
-            state.last_flushed_lsn + 1
+        # PostgreSQL standby_status takes three positions:
+        #   - write: last WAL byte + 1 RECEIVED (may not be persisted yet)
+        #   - flush: last WAL byte + 1 DURABLY STORED (flushed to disk)
+        #   - apply: last WAL byte + 1 APPLIED/PROCESSED
+        #
+        # For buffered mode, we need to distinguish between what we've received vs flushed:
+        #   - write = wal_end + 1 (tells PostgreSQL we're receiving data, prevents rapid KeepAlives)
+        #   - flush/apply = last_flushed_lsn + 1 (tells PostgreSQL what's safe to remove from slot)
+        #
+        # This allows PostgreSQL to know we're alive and receiving data (write), while also
+        # preserving durability by tracking what we've actually persisted (flush/apply).
+
+        {write_lsn, flush_lsn} =
+          if state.flush_interval == 0 do
+            # Not buffering - we process immediately, all positions are current
+            lsn = wal_end + 1
+            {lsn, lsn}
           else
-            # Otherwise, we assume to be current with the server
-            wal_end + 1
+            # Buffering mode - we've received up to wal_end, but only flushed up to last_flushed_lsn
+            write = wal_end + 1
+
+            flush =
+              if state.last_flushed_lsn > 0 do
+                state.last_flushed_lsn + 1
+              else
+                # Haven't flushed anything yet - use write position to avoid tight loop
+                # This trades some durability for stability during initial buffering
+                write
+              end
+
+            {write, flush}
           end
 
         # Always reply with standby status to send acks. When wal_sender_timeout is disabled,
         # we won't always receive KeepAlive messages with the reply field set.
-        message = standby_status(wal_end, wal_end, wal_end, reply)
+        message = standby_status(write_lsn, flush_lsn, flush_lsn, reply)
 
-        state = %{state | last_sent_lsn: wal_end, last_keep_alive: DateTime.utc_now()}
+        state = %{state | last_sent_lsn: flush_lsn, last_keep_alive: DateTime.utc_now()}
 
         {:noreply, message, state}
       end

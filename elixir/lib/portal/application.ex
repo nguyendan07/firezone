@@ -1,46 +1,69 @@
 defmodule Portal.Application do
   use Application
 
+  require Logger
+
   @impl true
   def start(_type, _args) do
     configure_logger()
+    verify_geolix_databases()
 
     # Attach Oban Sentry reporter
     Portal.Telemetry.Reporter.Oban.attach()
 
     # OpenTelemetry setup
-    _ = OpentelemetryLoggerMetadata.setup()
-    _ = OpentelemetryEcto.setup([:portal, :repo])
-    _ = OpentelemetryBandit.setup()
-    _ = OpentelemetryPhoenix.setup(adapter: :bandit)
+    :ok = OpentelemetryLoggerMetadata.setup()
+    :ok = OpentelemetryEcto.setup([:portal, :repo])
+    :ok = OpentelemetryEcto.setup([:portal, :repo, :replica])
+    :ok = OpentelemetryBandit.setup()
+    :ok = OpentelemetryPhoenix.setup(adapter: :bandit)
+    :ok = OpentelemetryOban.setup()
 
     Supervisor.start_link(children(), strategy: :one_for_one, name: __MODULE__.Supervisor)
   end
 
+  @impl true
+  def stop(_state) do
+    # Remove the Sentry logger handler before Sentry.Supervisor terminates
+    # to avoid noproc errors during shutdown
+    _ = :logger.remove_handler(:sentry)
+    :ok
+  end
+
   defp children do
-    [
+    base_children = [
       # Core services
       Portal.Repo,
+      Portal.Repo.Replica,
+      # Default pg scope for distributed process discovery (used by replication)
+      %{id: :pg, start: {:pg, :start_link, []}},
       Portal.PubSub,
-
-      # Infrastructure services
-      # Note: only one of platform adapters will be actually started.
-      Portal.GoogleCloudPlatform,
-      Portal.Cluster,
 
       # Application services
       Portal.Presence,
       Portal.Mailer.RateLimiter,
       Portal.ComponentVersions,
-
       # Health check server (always enabled)
-      Portal.Health,
+      Portal.Health
+    ]
 
-      # Web and API apps are always started to allow VerifiedRoutes to work
-      PortalWeb.Endpoint,
-      PortalAPI.Endpoint,
-      PortalAPI.RateLimit
-    ] ++ telemetry() ++ oban() ++ replication()
+    endpoint_children = [
+      # Give Phoenix socket drain enough time to gracefully close channel topics
+      # before transports are force-terminated.
+      {PortalWeb.Endpoint, shutdown: 40_000},
+      {PortalAPI.Endpoint, shutdown: 40_000}
+    ]
+
+    # Child order is chosen to make reverse-order shutdown graceful:
+    # 1) Portal.Cluster sends goodbye while DB/PubSub are healthy.
+    # 2) Replication managers disconnect while BEAM is still fully alive.
+    # 3) Endpoints drain and terminate channels while Presence/PubSub/Repo are alive.
+    # 4) PortalAPI.RateLimit stops after endpoint traffic has ceased.
+    base_children ++
+      client_session_buffer() ++
+      gateway_session_buffer() ++
+      rate_limit() ++
+      telemetry() ++ oban() ++ endpoint_children ++ replication() ++ [Portal.Cluster]
   end
 
   defp configure_logger do
@@ -50,8 +73,10 @@ defmodule Portal.Application do
     # Configure Logger severity at runtime
     :ok = LoggerJSON.configure_log_level_from_env!("LOG_LEVEL")
 
-    if config = Application.get_env(:logger_json, :config) do
-      formatter = LoggerJSON.Formatters.GoogleCloud.new(config)
+    config = Application.get_env(:logger_json, :config)
+
+    if not is_nil(config) do
+      formatter = LoggerJSON.Formatters.Basic.new(config)
       :logger.update_handler_config(:default, :formatter, formatter)
     end
 
@@ -71,6 +96,26 @@ defmodule Portal.Application do
       "warn" -> :warn
       "debug" -> :debug
       _ -> :info
+    end
+  end
+
+  defp client_session_buffer do
+    config = Portal.Config.get_env(:portal, Portal.ClientSession.Buffer, [])
+
+    if Keyword.get(config, :enabled, true) do
+      [Portal.ClientSession.Buffer]
+    else
+      []
+    end
+  end
+
+  defp gateway_session_buffer do
+    config = Portal.Config.get_env(:portal, Portal.GatewaySession.Buffer, [])
+
+    if Keyword.get(config, :enabled, true) do
+      [Portal.GatewaySession.Buffer]
+    else
+      []
     end
   end
 
@@ -109,5 +154,36 @@ defmodule Portal.Application do
         enabled
       end
     end)
+  end
+
+  defp rate_limit do
+    case Portal.Config.get_env(:portal, :node_type, "portal") do
+      type when type in ["api", "portal"] -> [PortalAPI.RateLimit]
+      _ -> []
+    end
+  end
+
+  defp verify_geolix_databases do
+    # Geolix loads databases asynchronously via handle_continue, so they may
+    # not be ready by the time Portal.Application.start/2 runs. Wait for the
+    # async load to finish before proceeding with supervision tree startup.
+    for %{id: id, source: source} <- Portal.Config.get_env(:geolix, :databases, []) do
+      await_geolix_database(id, source, _retries = 30)
+    end
+  end
+
+  defp await_geolix_database(id, source, 0) do
+    Logger.error("Geolix database #{inspect(id)} failed to load from #{source}")
+  end
+
+  defp await_geolix_database(id, source, retries) do
+    case Geolix.metadata(where: id) do
+      nil ->
+        Process.sleep(1000)
+        await_geolix_database(id, source, retries - 1)
+
+      _metadata ->
+        :ok
+    end
   end
 end

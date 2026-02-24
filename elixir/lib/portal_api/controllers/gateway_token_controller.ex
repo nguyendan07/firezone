@@ -1,10 +1,9 @@
 defmodule PortalAPI.GatewayTokenController do
   use PortalAPI, :controller
   use OpenApiSpex.ControllerSpecs
-  alias Portal.{Auth, Safe}
-  alias __MODULE__.DB
-
-  action_fallback PortalAPI.FallbackController
+  alias Portal.Authentication
+  alias PortalAPI.Error
+  alias __MODULE__.Database
 
   tags ["Gateway Tokens"]
 
@@ -22,14 +21,17 @@ defmodule PortalAPI.GatewayTokenController do
       ok: {"New Token Response", "application/json", PortalAPI.Schemas.GatewayToken.Response}
     ]
 
+  @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, %{"site_id" => site_id}) do
     subject = conn.assigns.subject
 
-    with {:ok, site} <- DB.fetch_site(site_id, subject),
-         {:ok, token} <- Auth.create_gateway_token(site, subject) do
+    with {:ok, site} <- Database.fetch_site(site_id, subject),
+         {:ok, token} <- Authentication.create_gateway_token(site, subject) do
       conn
       |> put_status(:created)
-      |> render(:show, token: token, encoded_token: Auth.encode_fragment!(token))
+      |> render(:show, token: token, encoded_token: Authentication.encode_fragment!(token))
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -55,12 +57,15 @@ defmodule PortalAPI.GatewayTokenController do
          PortalAPI.Schemas.GatewayToken.DeletedResponse}
     ]
 
+  @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete(conn, %{"site_id" => _site_id, "id" => token_id}) do
     subject = conn.assigns.subject
 
-    with {:ok, token} <- DB.fetch_token(token_id, subject),
-         {:ok, deleted_token} <- DB.delete_token(token, subject) do
+    with {:ok, token} <- Database.fetch_token(token_id, subject),
+         {:ok, deleted_token} <- Database.delete_token(token, subject) do
       render(conn, :deleted, token: deleted_token)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
@@ -80,25 +85,29 @@ defmodule PortalAPI.GatewayTokenController do
          PortalAPI.Schemas.GatewayToken.DeletedAllResponse}
     ]
 
+  @spec delete_all(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete_all(conn, %{"site_id" => site_id}) do
     subject = conn.assigns.subject
 
-    with {:ok, site} <- DB.fetch_site(site_id, subject),
-         {deleted_count, _} <- DB.delete_all_tokens(site, subject) do
+    with {:ok, site} <- Database.fetch_site(site_id, subject),
+         {deleted_count, _} <- Database.delete_all_tokens(site, subject) do
       render(conn, :deleted_all, count: deleted_count)
+    else
+      error -> Error.handle(conn, error)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
-    alias Portal.{Site, GatewayToken}
+    alias Portal.Site
+    alias Portal.GatewayToken
 
     def fetch_site(id, subject) do
       result =
         from(s in Site, as: :sites)
         |> where([sites: s], s.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do
@@ -111,7 +120,7 @@ defmodule PortalAPI.GatewayTokenController do
     def fetch_token(id, subject) do
       result =
         from(t in GatewayToken, where: t.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do

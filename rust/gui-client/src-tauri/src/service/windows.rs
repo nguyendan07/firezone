@@ -27,6 +27,8 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
+use crate::ipc::SocketId;
+
 const SERVICE_NAME: &str = "firezone_client_ipc";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
@@ -212,7 +214,9 @@ fn run_service(arguments: Vec<OsString>) {
         return;
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("connlib")
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
@@ -283,6 +287,7 @@ fn run_service(arguments: Vec<OsString>) {
         .block_on(super::ipc_listen(
             DnsControlMethod::Nrpt,
             &log_filter_reloader,
+            SocketId::Tunnel,
             &mut signals,
         ))
         .inspect_err(|e| tracing::error!("Tunnel service failed: {e:#}"));

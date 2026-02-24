@@ -50,13 +50,13 @@ defmodule Portal.Resource do
     timestamps()
   end
 
-  def changeset(changeset) do
+  def changeset(%Ecto.Changeset{} = changeset) do
     fields = ~w[address address_description name type ip_stack site_id]a
 
     changeset
     |> trim_change(fields)
     |> validate_length(:name, min: 1, max: 255)
-    |> validate_length(:address_description, min: 1, max: 512)
+    |> validate_length(:address_description, min: 1, max: 255)
     |> maybe_put_default_ip_stack()
     |> validate_address_format()
     |> check_constraint(:ip_stack,
@@ -66,6 +66,7 @@ defmodule Portal.Resource do
     )
     |> cast_embed(:filters, with: &filter_changeset/2)
     |> assoc_constraint(:site)
+    |> assoc_constraint(:account)
     |> unique_constraint(:name,
       name: :resources_account_id_name_index,
       message: "resource with this name already exists"
@@ -332,6 +333,9 @@ defmodule Portal.Resource do
     1. Filters out resources that are not compatible with the given client or gateway version.
     2. Converts DNS resource addresses back to the pre-1.2.0 format if the client or gateway version is < 1.2.0.
   """
+  # Version can be nil when derive_version/1 fails to parse the user agent
+  def adapt_resource_for_version(resource, nil), do: resource
+
   def adapt_resource_for_version(resource, client_or_gateway_version) do
     cond do
       # internet resources require client and gateway >= 1.3.0

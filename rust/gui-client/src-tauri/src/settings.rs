@@ -2,7 +2,6 @@
 //! advanced settings and code for manipulating diagnostic logs.
 
 use anyhow::{Context as _, Result};
-use bin_shared::known_dirs;
 use connlib_model::ResourceId;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -59,7 +58,7 @@ pub struct AdvancedSettings {
     pub log_filter: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Default)]
 pub struct GeneralSettings {
     #[serde(default)]
     pub favorite_resources: HashSet<ResourceId>,

@@ -11,10 +11,10 @@ defmodule PortalWeb.SignIn do
     Userpass
   }
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def mount(%{"account_id_or_slug" => account_id_or_slug} = params, _session, socket) do
-    account = DB.get_account_by_id_or_slug!(account_id_or_slug)
+    account = Database.get_account_by_id_or_slug!(account_id_or_slug)
     mount_account(account, params, socket)
   end
 
@@ -23,7 +23,7 @@ defmodule PortalWeb.SignIn do
       assign(socket,
         page_title: "Sign In",
         account: account,
-        params: PortalWeb.Auth.take_sign_in_params(params),
+        params: PortalWeb.Authentication.take_sign_in_params(params),
         google_auth_providers: auth_providers(account, Google.AuthProvider),
         okta_auth_providers: auth_providers(account, Okta.AuthProvider),
         entra_auth_providers: auth_providers(account, Entra.AuthProvider),
@@ -41,7 +41,7 @@ defmodule PortalWeb.SignIn do
       <div class="flex flex-col items-center justify-center px-6 py-8 mx-auto lg:py-0">
         <.hero_logo text={@account.name} />
 
-        <div class="w-full col-span-6 mx-auto bg-white rounded shadow md:mt-0 sm:max-w-lg xl:p-0">
+        <div class="w-full col-span-6 mx-auto bg-white rounded-sm shadow-sm md:mt-0 sm:max-w-lg xl:p-0">
           <div class="p-6 space-y-4 lg:space-y-6 sm:p-8">
             <.flash flash={@flash} kind={:error} />
             <.flash flash={@flash} kind={:info} />
@@ -182,7 +182,9 @@ defmodule PortalWeb.SignIn do
   end
 
   # We allow signing in to Web UI even for disabled accounts
-  def disabled?(account, %{"as" => "client"}), do: not Portal.Account.active?(account)
+  def disabled?(account, %{"as" => as}) when as in ["client", "gui-client", "headless-client"],
+    do: not Portal.Account.active?(account)
+
   def disabled?(_account, _params), do: false
 
   def separator(assigns) do
@@ -207,7 +209,7 @@ defmodule PortalWeb.SignIn do
       class={[button_style("info"), button_size("md"), "w-full space-x-1"]}
       href={~p"/#{@account}/sign_in/#{@type}/#{@provider.id}?#{@params}"}
     >
-      {render_slot(@icon)} Sign in with <strong>{@provider.name}</strong>
+      {render_slot(@icon)} <span>Sign in with <strong>{@provider.name}</strong></span>
     </.link>
     """
   end
@@ -291,13 +293,13 @@ defmodule PortalWeb.SignIn do
 
   defp auth_providers(account, module) do
     if module in [EmailOTP.AuthProvider, Userpass.AuthProvider] do
-      DB.get_auth_provider(account, module)
+      Database.get_auth_provider(account, module)
     else
-      DB.list_auth_providers(account, module)
+      Database.list_auth_providers(account, module)
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Account
@@ -308,18 +310,18 @@ defmodule PortalWeb.SignIn do
           do: from(a in Account, where: a.id == ^id_or_slug),
           else: from(a in Account, where: a.slug == ^id_or_slug)
 
-      query |> Safe.unscoped() |> Safe.one!()
+      query |> Safe.unscoped(:replica) |> Safe.one!()
     end
 
     def get_auth_provider(account, module) do
       from(ap in module, where: ap.account_id == ^account.id and not ap.is_disabled)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
     end
 
     def list_auth_providers(account, module) do
       from(ap in module, where: ap.account_id == ^account.id and not ap.is_disabled)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
   end

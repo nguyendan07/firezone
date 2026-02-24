@@ -2,7 +2,6 @@ defmodule Portal.Release do
   require Logger
 
   @otp_app :portal
-  @repos Application.compile_env!(@otp_app, :ecto_repos)
 
   def migrate(opts \\ []) do
     IO.puts("Starting sentry app..")
@@ -19,9 +18,7 @@ defmodule Portal.Release do
         )
       )
 
-    for repo <- @repos do
-      {:ok, _, _} = do_migration(repo, manual)
-    end
+    {:ok, _, _} = do_migration(Portal.Repo, manual)
   end
 
   def seed(directory \\ seed_script_path(@otp_app)) do

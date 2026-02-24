@@ -4,23 +4,22 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::{future, sync::Arc, time::Duration};
 
+use futures::SinkExt as _;
 use phoenix_channel::{DeviceInfo, Event, LoginUrl, PhoenixChannel, PublicKeyParam};
 use secrecy::SecretString;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::task::JoinError;
 use tokio_tungstenite::tungstenite::http;
 
 #[tokio::test]
 async fn client_does_not_pipeline_messages() {
-    use std::{str::FromStr, sync::Arc, time::Duration};
+    use std::time::Duration;
 
-    use backoff::ExponentialBackoffBuilder;
     use futures::{SinkExt, StreamExt};
-    use phoenix_channel::{DeviceInfo, LoginUrl, PhoenixChannel, PublicKeyParam};
-    use secrecy::SecretString;
+    use phoenix_channel::PublicKeyParam;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
-    use url::Url;
 
     let _guard = logging::test("debug,wire::api=trace");
 
@@ -35,7 +34,7 @@ async fn client_does_not_pipeline_messages() {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => match text.as_str() {
-                    r#"{"topic":"test","event":"phx_join","payload":null,"ref":1}"# => {
+                    r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
                         // The real Elixir backend processes messages in parallel and therefore may drop messages if we pipeline them instead of waiting for the channel join.
                         // This is difficult to assert in a test because we need to mimic this behaviour of not processing messages sequentially.
                         // The way we assert this is by checking, whether any messages are pipelined.
@@ -47,10 +46,10 @@ async fn client_does_not_pipeline_messages() {
                         }
 
                         ws.send(Message::text(
-                            r#"{"event":"phx_reply","ref":1,"topic":"client","payload":{"status":"ok","response":{}}}"#,
+                            r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#,
                         )).await.unwrap();
                     }
-                    r#"{"topic":"test","event":"bar","ref":0}"# => {
+                    r#"{"topic":"test","event":"bar","ref":1}"# => {
                         ws.send(Message::text(
                             r#"{"topic":"test","event":"foo","payload":null}"#,
                         ))
@@ -68,31 +67,10 @@ async fn client_does_not_pipeline_messages() {
         }
     });
 
-    let login_url = LoginUrl::client(
-        Url::from_str(&format!("ws://localhost:{}", server_addr.port())).unwrap(),
-        String::new(),
-        None,
-        DeviceInfo::default(),
-    )
-    .unwrap();
-
-    let mut channel = PhoenixChannel::<(), OutboundMsg, InboundMsg, _>::disconnected(
-        login_url,
-        SecretString::from("secret"),
-        "test/1.0.0".to_owned(),
-        "test",
-        (),
-        || {
-            ExponentialBackoffBuilder::default()
-                .with_initial_interval(Duration::from_secs(1))
-                .build()
-        },
-        Arc::new(socket_factory::tcp),
-    );
+    let mut channel = make_websocket_test_channel(server_addr.port());
 
     let client = async move {
         channel.connect(PublicKeyParam([0u8; 32]));
-        channel.send("test", OutboundMsg::Bar);
 
         loop {
             match std::future::poll_fn(|cx| channel.poll(cx)).await.unwrap() {
@@ -115,6 +93,9 @@ async fn client_does_not_pipeline_messages() {
                     panic!("Unexpected hiccup: {error:?}")
                 }
                 phoenix_channel::Event::Closed => break,
+                phoenix_channel::Event::Connected => {
+                    channel.send("test", OutboundMsg::Bar).unwrap();
+                }
             }
         }
     };
@@ -130,74 +111,27 @@ async fn client_does_not_pipeline_messages() {
 
 #[tokio::test]
 async fn client_deduplicates_messages() {
-    use std::{str::FromStr, sync::Arc, time::Duration};
+    use std::time::Duration;
 
-    use backoff::ExponentialBackoffBuilder;
-    use futures::{SinkExt, StreamExt};
-    use phoenix_channel::{DeviceInfo, LoginUrl, PhoenixChannel, PublicKeyParam};
-    use secrecy::SecretString;
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::Message;
-    use url::Url;
+    use phoenix_channel::PublicKeyParam;
 
     let _guard = logging::test("debug,wire::api=trace");
 
-    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let server_addr = listener.local_addr().unwrap();
-
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => match text.as_str() {
-                    r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
-                        ws.send(Message::text(
-                            r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#,
-                        )).await.unwrap();
-                    }
-                    // We only handle the message with `ref: 1` and thus guarantee that not more than 1 is received
-                    r#"{"topic":"test","event":"bar","ref":1}"# => {
-                        ws.send(Message::text(
-                            r#"{"topic":"test","event":"foo","payload":null}"#,
-                        ))
-                        .await
-                        .unwrap();
-                    }
-                    other => panic!("Unexpected message: {other}"),
-                },
-                Some(Ok(Message::Close(_))) => continue,
-                Some(other) => {
-                    panic!("Unexpected message: {other:?}")
-                }
-                None => break,
+    let (server, port) = spawn_websocket_server(|text| {
+        match text {
+            r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
+                r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#
             }
+            // We only handle the message with `ref: 1` and thus guarantee that not more than 1 is received
+            r#"{"topic":"test","event":"bar","ref":1}"# => {
+                r#"{"topic":"test","event":"foo","payload":null}"#
+            }
+            other => panic!("Unexpected message: {other}"),
         }
-    });
+    })
+    .await;
 
-    let login_url = LoginUrl::client(
-        Url::from_str(&format!("ws://localhost:{}", server_addr.port())).unwrap(),
-        String::new(),
-        None,
-        DeviceInfo::default(),
-    )
-    .unwrap();
-
-    let mut channel = PhoenixChannel::<(), OutboundMsg, InboundMsg, _>::disconnected(
-        login_url,
-        SecretString::from("secret"),
-        "test/1.0.0".to_owned(),
-        "test",
-        (),
-        || {
-            ExponentialBackoffBuilder::default()
-                .with_initial_interval(Duration::from_secs(1))
-                .build()
-        },
-        Arc::new(socket_factory::tcp),
-    );
+    let mut channel = make_websocket_test_channel(port);
 
     let mut num_responses = 0;
 
@@ -211,10 +145,10 @@ async fn client_deduplicates_messages() {
                     panic!("Unexpected error: {res:?}")
                 }
                 phoenix_channel::Event::JoinedRoom { .. } => {
-                    channel.send("test", OutboundMsg::Bar);
-                    channel.send("test", OutboundMsg::Bar);
-                    channel.send("test", OutboundMsg::Bar);
-                    channel.send("test", OutboundMsg::Bar);
+                    channel.send("test", OutboundMsg::Bar).unwrap();
+                    channel.send("test", OutboundMsg::Bar).unwrap();
+                    channel.send("test", OutboundMsg::Bar).unwrap();
+                    channel.send("test", OutboundMsg::Bar).unwrap();
                 }
                 phoenix_channel::Event::HeartbeatSent => {}
                 phoenix_channel::Event::InboundMessage {
@@ -230,18 +164,198 @@ async fn client_deduplicates_messages() {
                     channel.update_ips(vec![IpAddr::from(Ipv4Addr::LOCALHOST)]);
                 }
                 phoenix_channel::Event::Closed => break,
+                phoenix_channel::Event::Connected => {}
             }
         }
     };
 
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
-        futures::future::join(server, client),
+        futures::future::join(server.wait(), client),
     )
     .await
     .unwrap_err(); // We expect to timeout because we don't ever exit from the tasks.
 
     assert_eq!(num_responses, 1);
+}
+
+#[tokio::test]
+async fn client_clears_local_message_on_connect() {
+    use phoenix_channel::PublicKeyParam;
+
+    let _guard = logging::test("debug,wire::api=trace");
+
+    let (server, port) = spawn_websocket_server(|text| {
+        match text {
+            r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
+                r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#
+            }
+            // We only handle the message with `ref: 1` and thus guarantee that the first one is not received.
+            r#"{"topic":"test","event":"bar","ref":1}"# => {
+                r#"{"topic":"test","event":"foo","payload":null}"#
+            }
+            other => panic!("Unexpected message: {other}"),
+        }
+    })
+    .await;
+
+    let mut channel = make_websocket_test_channel(port);
+
+    let client = async {
+        channel.send("test", OutboundMsg::Bar).unwrap_err();
+        channel.connect(PublicKeyParam([0u8; 32]));
+
+        loop {
+            match std::future::poll_fn(|cx| channel.poll(cx)).await.unwrap() {
+                phoenix_channel::Event::SuccessResponse { .. } => {}
+                phoenix_channel::Event::ErrorResponse { res, .. } => {
+                    panic!("Unexpected error: {res:?}")
+                }
+                phoenix_channel::Event::JoinedRoom { .. } => {
+                    channel.send("test", OutboundMsg::Bar).unwrap();
+                }
+                phoenix_channel::Event::HeartbeatSent => {}
+                phoenix_channel::Event::InboundMessage {
+                    msg: InboundMsg::Foo,
+                    ..
+                } => {
+                    channel.close().unwrap();
+                }
+                phoenix_channel::Event::Hiccup { error, .. } => {
+                    panic!("Unexpected hiccup: {error:?}")
+                }
+                phoenix_channel::Event::NoAddresses => {
+                    channel.update_ips(vec![IpAddr::from(Ipv4Addr::LOCALHOST)]);
+                }
+                phoenix_channel::Event::Closed => break,
+                phoenix_channel::Event::Connected => {}
+            }
+        }
+    };
+
+    client.await;
+    server.wait().await;
+}
+
+#[tokio::test]
+async fn replies_with_close_frame_upon_close() {
+    use phoenix_channel::PublicKeyParam;
+
+    let _guard = logging::test("debug,wire::api=trace");
+
+    let (server, port) = spawn_websocket_server(|text| {
+        match text {
+            r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
+                r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#
+            }
+            other => panic!("Unexpected message: {other}"),
+        }
+    })
+    .await;
+
+    let mut channel = make_websocket_test_channel(port);
+
+    let (mut join_tx, mut join_rx) = futures::channel::mpsc::channel(1);
+
+    let client = tokio::spawn(async move {
+        channel.connect(PublicKeyParam([0u8; 32]));
+
+        loop {
+            match std::future::poll_fn(|cx| channel.poll(cx)).await.unwrap() {
+                phoenix_channel::Event::SuccessResponse { .. } => {}
+                phoenix_channel::Event::ErrorResponse { res, .. } => {
+                    panic!("Unexpected error: {res:?}")
+                }
+                phoenix_channel::Event::JoinedRoom { .. } => {
+                    join_tx.send(()).await.unwrap();
+                }
+                phoenix_channel::Event::HeartbeatSent => {}
+                phoenix_channel::Event::InboundMessage { .. } => {}
+                phoenix_channel::Event::Hiccup { error, .. } => break error,
+                phoenix_channel::Event::NoAddresses => {
+                    channel.update_ips(vec![IpAddr::from(Ipv4Addr::LOCALHOST)]);
+                }
+                phoenix_channel::Event::Closed => panic!("Should not close"),
+                phoenix_channel::Event::Connected => {}
+            }
+        }
+    });
+
+    join_rx.recv().await.unwrap(); // Wait for successful join.
+
+    let server_result = server.stop().await;
+    let client_result = client.await.unwrap();
+
+    server_result.unwrap(); // Server should shutdown cleanly.
+
+    assert_eq!(
+        format!("{client_result:#}"),
+        "Reconnecting to portal on transient error: portal sent empty websocket close frame"
+    );
+}
+
+#[tokio::test]
+async fn times_out_after_missed_heartbeats() {
+    use phoenix_channel::PublicKeyParam;
+
+    let _guard = logging::test("debug,wire::api=trace");
+
+    let (server, port) = spawn_websocket_server(|text| {
+        match text {
+            r#"{"topic":"test","event":"phx_join","payload":null,"ref":0}"# => {
+                r#"{"event":"phx_reply","ref":0,"topic":"client","payload":{"status":"ok","response":{}}}"#
+            }
+            // We send a bogus reply (bad `ref`) to ensure the implementation matches those up correctly.
+            r#"{"topic":"phoenix","event":"heartbeat","payload":{},"ref":1}"# => {
+                r#"{"event":"phx_reply","ref":9999,"topic":"phoenix","payload":{"status":"ok","response":{}}}"#
+            }
+            r#"{"topic":"phoenix","event":"heartbeat","payload":{},"ref":2}"# => {
+                r#"{"event":"phx_reply","ref":9999,"topic":"phoenix","payload":{"status":"ok","response":{}}}"#
+            }
+            r#"{"topic":"phoenix","event":"heartbeat","payload":{},"ref":3}"# => {
+                r#"{"event":"phx_reply","ref":9999,"topic":"phoenix","payload":{"status":"ok","response":{}}}"#
+            }
+            r#"{"topic":"phoenix","event":"heartbeat","payload":{},"ref":4}"# => {
+                r#"{"event":"phx_reply","ref":9999,"topic":"phoenix","payload":{"status":"ok","response":{}}}"#
+            }
+            other => panic!("Unexpected message: {other}"),
+        }
+    })
+    .await;
+
+    let mut channel = make_websocket_test_channel(port);
+
+    let client = async {
+        channel.connect(PublicKeyParam([0u8; 32]));
+
+        loop {
+            match std::future::poll_fn(|cx| channel.poll(cx)).await.unwrap() {
+                phoenix_channel::Event::SuccessResponse { .. } => {}
+                phoenix_channel::Event::ErrorResponse { res, .. } => {
+                    panic!("Unexpected error: {res:?}")
+                }
+                phoenix_channel::Event::JoinedRoom { .. } => {}
+                phoenix_channel::Event::HeartbeatSent => {}
+                phoenix_channel::Event::InboundMessage { .. } => {}
+                phoenix_channel::Event::Hiccup { error, .. } => break error,
+                phoenix_channel::Event::NoAddresses => {
+                    channel.update_ips(vec![IpAddr::from(Ipv4Addr::LOCALHOST)]);
+                }
+                phoenix_channel::Event::Closed => {
+                    panic!("Channel closed")
+                }
+                phoenix_channel::Event::Connected => {}
+            }
+        }
+    };
+
+    let error = client.await;
+    server.abort();
+
+    assert_eq!(
+        format!("{error:#}"),
+        "Reconnecting to portal on transient error: too many heartbeats were unanswered"
+    );
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -355,7 +469,7 @@ async fn discards_failed_ips_on_hiccup() {
         panic!("Expected `Hiccup`")
     };
 
-    let result = tokio::time::timeout(Duration::from_secs(1), async {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
         future::poll_fn(|cx| channel.poll(cx)).await
     })
     .await
@@ -396,6 +510,108 @@ async fn does_not_clear_address_from_url_on_hiccup() {
             other => panic!("Unexpected event: {other:?}"), // This line ensures we never receive `Event::NoAddresses` which means we keep retrying.
         }
     }
+}
+
+/// Spawns a WebSocket server that responds to requests using a handler function.
+/// Returns the server task handle and the port number.
+async fn spawn_websocket_server<F>(handler: F) -> (ServerHandle, u16)
+where
+    F: Fn(&str) -> &str + Send + 'static,
+{
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (close_tx, mut close_rx) = futures::channel::mpsc::channel(1);
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+        loop {
+            match futures::future::select(ws.next(), close_rx.recv()).await {
+                futures::future::Either::Left((Some(Ok(Message::Text(text))), _)) => {
+                    let response = handler(text.as_str());
+                    ws.send(Message::text(response)).await.unwrap();
+                }
+                futures::future::Either::Left((Some(Ok(Message::Close(_))), _)) => continue,
+                futures::future::Either::Left((Some(other), _)) => {
+                    panic!("Unexpected message: {other:?}")
+                }
+                futures::future::Either::Left((None, _)) => break,
+                futures::future::Either::Right((Err(_), _)) => continue,
+                futures::future::Either::Right((Ok(()), _)) => {
+                    ws.close(None).await.unwrap();
+                    ws.flush().await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
+                }
+            }
+        }
+    });
+
+    (
+        ServerHandle {
+            task: server,
+            close_tx,
+        },
+        port,
+    )
+}
+
+struct ServerHandle {
+    task: tokio::task::JoinHandle<()>,
+    close_tx: futures::channel::mpsc::Sender<()>,
+}
+
+impl ServerHandle {
+    async fn stop(mut self) -> Result<(), JoinError> {
+        let _ = self.close_tx.send(()).await;
+
+        self.task.await
+    }
+
+    async fn wait(self) {
+        self.task.await.unwrap()
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+fn make_websocket_test_channel(
+    port: u16,
+) -> PhoenixChannel<(), OutboundMsg, InboundMsg, PublicKeyParam> {
+    use std::{str::FromStr, sync::Arc, time::Duration};
+
+    use backoff::ExponentialBackoffBuilder;
+    use phoenix_channel::{DeviceInfo, LoginUrl, PhoenixChannel};
+    use secrecy::SecretString;
+    use url::Url;
+
+    let login_url = LoginUrl::client(
+        Url::from_str(&format!("ws://localhost:{}", port)).unwrap(),
+        String::new(),
+        None,
+        DeviceInfo::default(),
+    )
+    .unwrap();
+
+    PhoenixChannel::<(), OutboundMsg, InboundMsg, _>::disconnected(
+        login_url,
+        SecretString::from("secret"),
+        "test/1.0.0".to_owned(),
+        "test",
+        (),
+        || {
+            ExponentialBackoffBuilder::default()
+                .with_initial_interval(Duration::from_secs(1))
+                .build()
+        },
+        Arc::new(socket_factory::tcp),
+    )
 }
 
 fn make_test_channel(host: &str, port: u16) -> PhoenixChannel<(), (), (), PublicKeyParam> {

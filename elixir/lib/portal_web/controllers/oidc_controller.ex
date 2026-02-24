@@ -1,27 +1,24 @@
 defmodule PortalWeb.OIDCController do
   use PortalWeb, :controller
 
-  alias Portal.{
-    AuthProvider,
-    Safe
-  }
+  alias Portal.AuthProvider
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   alias PortalWeb.Session.Redirector
 
   require Logger
 
-  action_fallback PortalWeb.FallbackController
-
   @invalid_json_error_message "Discovery document contains invalid JSON. Please verify the Discovery Document URI returns valid OpenID Connect configuration."
 
+  @spec sign_in(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def sign_in(conn, %{"account_id_or_slug" => account_id_or_slug} = params) do
-    account = DB.get_account_by_id_or_slug!(account_id_or_slug)
+    account = Database.get_account_by_id_or_slug!(account_id_or_slug)
     provider = get_provider!(account, params)
     provider_redirect(conn, account, provider, params)
   end
 
+  @spec callback(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def callback(conn, %{"state" => state, "code" => code}) do
     # Check if this is a verification operation (state starts with "oidc-verification:")
     case String.split(state, ":", parts: 2) do
@@ -60,9 +57,10 @@ defmodule PortalWeb.OIDCController do
          conn = PortalWeb.Cookie.OIDC.delete(conn),
          :ok <- verify_state(cookie.state, state),
          context_type = context_type(cookie.params),
-         account = DB.get_account_by_id_or_slug!(cookie.account_id),
+         account = Database.get_account_by_id_or_slug!(cookie.account_id),
          provider = get_provider!(account, cookie),
          :ok <- validate_context(provider, context_type),
+         false <- client_sign_in_restricted?(account, context_type),
          {:ok, tokens} <-
            PortalWeb.OIDC.exchange_code(provider, code, cookie.verifier),
          {:ok, claims} <- PortalWeb.OIDC.verify_token(provider, tokens["id_token"]),
@@ -256,11 +254,11 @@ defmodule PortalWeb.OIDCController do
       "Unable to connect to the identity provider: #{inspect(reason)}. Please try again or contact your administrator."
 
   defp get_provider!(account, %{"auth_provider_type" => type, "auth_provider_id" => id}) do
-    DB.get_provider!(account.id, type, id)
+    Database.get_provider!(account.id, type, id)
   end
 
   defp get_provider!(account, %PortalWeb.Cookie.OIDC{} = cookie) do
-    DB.get_provider!(account.id, cookie.auth_provider_type, cookie.auth_provider_id)
+    Database.get_provider!(account.id, cookie.auth_provider_type, cookie.auth_provider_id)
   end
 
   defp fetch_userinfo(provider, access_token) do
@@ -296,7 +294,7 @@ defmodule PortalWeb.OIDCController do
       |> Map.put("idp_id", idp_id)
 
     with %{valid?: true} <- validate_upsert_attrs(attrs) do
-      DB.upsert_identity(account.id, email, issuer, idp_id, profile_attrs)
+      Database.upsert_identity(account.id, email, issuer, idp_id, profile_attrs)
     else
       changeset -> {:error, changeset}
     end
@@ -387,13 +385,15 @@ defmodule PortalWeb.OIDCController do
        ),
        do: :ok
 
-  defp check_admin(%Portal.ExternalIdentity{actor: %Portal.Actor{type: :account_user}}, :client),
-    do: :ok
+  defp check_admin(%Portal.ExternalIdentity{actor: %Portal.Actor{type: :account_user}}, t)
+       when t in [:gui_client, :headless_client],
+       do: :ok
 
   defp check_admin(_identity, _context_type), do: {:error, :not_admin}
 
-  defp validate_context(%{context: context}, :client)
-       when context in [:clients_only, :clients_and_portal] do
+  defp validate_context(%{context: context}, t)
+       when t in [:gui_client, :headless_client] and
+              context in [:clients_only, :clients_and_portal] do
     :ok
   end
 
@@ -404,12 +404,19 @@ defmodule PortalWeb.OIDCController do
 
   defp validate_context(_provider, _context_type), do: {:error, :invalid_context}
 
+  defp client_sign_in_restricted?(account, context_type)
+       when context_type in [:gui_client, :headless_client] do
+    Portal.Billing.client_sign_in_restricted?(account)
+  end
+
+  defp client_sign_in_restricted?(_account, _context_type), do: false
+
   defp create_session_or_token(conn, identity, provider, params) do
     user_agent = conn.assigns[:user_agent]
     remote_ip = conn.remote_ip
     type = context_type(params)
     headers = conn.req_headers
-    context = Portal.Auth.Context.build(remote_ip, user_agent, headers, type)
+    context = Portal.Authentication.Context.build(remote_ip, user_agent, headers, type)
 
     # Get the provider schema module to access default values
     schema = provider.__struct__
@@ -417,7 +424,10 @@ defmodule PortalWeb.OIDCController do
     # Determine session lifetime based on context type
     session_lifetime_secs =
       case type do
-        :client ->
+        :gui_client ->
+          provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
+
+        :headless_client ->
           provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
 
         :portal ->
@@ -428,14 +438,14 @@ defmodule PortalWeb.OIDCController do
 
     case type do
       :portal ->
-        Portal.Auth.create_portal_session(
+        Portal.Authentication.create_portal_session(
           identity.actor,
           provider.id,
           context,
           expires_at
         )
 
-      :client ->
+      :gui_client ->
         attrs = %{
           secret_nonce: params["nonce"],
           account_id: identity.account_id,
@@ -445,7 +455,19 @@ defmodule PortalWeb.OIDCController do
           expires_at: expires_at
         }
 
-        Portal.Auth.create_gui_client_token(attrs)
+        Portal.Authentication.create_gui_client_token(attrs)
+
+      :headless_client ->
+        attrs = %{
+          secret_nonce: "",
+          account_id: identity.account_id,
+          actor_id: identity.actor_id,
+          auth_provider_id: provider.id,
+          identity_id: identity.id,
+          expires_at: expires_at
+        }
+
+        Portal.Authentication.create_gui_client_token(attrs)
     end
   end
 
@@ -457,10 +479,10 @@ defmodule PortalWeb.OIDCController do
     |> Redirector.portal_signed_in(account, params)
   end
 
-  # Context: :client
+  # Context: :gui_client
   # Store a cookie and redirect to client handler which redirects to the final URL based on platform
-  defp signed_in(conn, :client, account, identity, token, _provider, _tokens, params) do
-    Redirector.client_signed_in(
+  defp signed_in(conn, :gui_client, account, identity, token, _provider, _tokens, params) do
+    Redirector.gui_client_signed_in(
       conn,
       account,
       identity.actor.name,
@@ -470,7 +492,21 @@ defmodule PortalWeb.OIDCController do
     )
   end
 
-  defp context_type(%{"as" => "client"}), do: :client
+  # Context: :headless_client
+  # Show the token to the user to copy manually
+  defp signed_in(conn, :headless_client, account, identity, token, _provider, _tokens, params) do
+    Redirector.headless_client_signed_in(
+      conn,
+      account,
+      identity.actor.name,
+      token,
+      params["state"]
+    )
+  end
+
+  defp context_type(%{"as" => "client"}), do: :gui_client
+  defp context_type(%{"as" => "gui-client"}), do: :gui_client
+  defp context_type(%{"as" => "headless-client"}), do: :headless_client
   defp context_type(_), do: :portal
 
   defp handle_error(conn, {:error, :oidc_cookie_not_found}) do
@@ -508,6 +544,18 @@ defmodule PortalWeb.OIDCController do
   defp handle_error(conn, {:error, :invalid_context}) do
     {account_slug, original_params} = fetch_error_context(conn)
     error = "This authentication method is not available for your sign-in context."
+    path = ~p"/#{account_slug}?#{sanitize(original_params)}"
+
+    redirect_for_error(conn, error, path)
+  end
+
+  defp handle_error(conn, true) do
+    {account_slug, original_params} = fetch_error_context(conn)
+
+    error =
+      "This account is temporarily suspended from client authentication " <>
+        "due to exceeding billing limits. Please contact your administrator to add more seats."
+
     path = ~p"/#{account_slug}?#{sanitize(original_params)}"
 
     redirect_for_error(conn, error, path)
@@ -648,7 +696,7 @@ defmodule PortalWeb.OIDCController do
     Map.take(params, ["as", "redirect_to", "state", "nonce"])
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.{Safe, AuthProvider, ExternalIdentity}
     alias Portal.Account
@@ -659,7 +707,7 @@ defmodule PortalWeb.OIDCController do
           do: from(a in Account, where: a.id == ^id_or_slug or a.slug == ^id_or_slug),
           else: from(a in Account, where: a.slug == ^id_or_slug)
 
-      query |> Safe.unscoped() |> Safe.one!()
+      query |> Safe.unscoped(:replica) |> Safe.one!()
     end
 
     def get_provider!(account_id, type, id) do
@@ -668,7 +716,7 @@ defmodule PortalWeb.OIDCController do
       from(p in schema,
         where: p.account_id == ^account_id and p.id == ^id and p.is_disabled == false
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one!()
     end
 
@@ -760,7 +808,8 @@ defmodule PortalWeb.OIDCController do
           {:error, :actor_not_found}
 
         {_, [%ExternalIdentity{} = identity]} ->
-          {:ok, Safe.preload(identity, [:actor, :account])}
+          # actor and account are long-lived records, safe to read from replica
+          {:ok, Safe.preload(identity, [:actor, :account], :replica)}
       end
     end
   end

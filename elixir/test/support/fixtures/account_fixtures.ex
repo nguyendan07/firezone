@@ -28,7 +28,6 @@ defmodule Portal.AccountFixtures do
       },
       features: %{
         policy_conditions: true,
-        multi_site_resources: true,
         traffic_filters: true,
         idp_sync: true,
         rest_api: true
@@ -120,7 +119,19 @@ defmodule Portal.AccountFixtures do
     attrs = Enum.into(attrs, %{})
 
     account
-    |> cast(attrs, [:name, :legal_name, :slug, :disabled_at, :disabled_reason])
+    |> cast(attrs, [
+      :name,
+      :legal_name,
+      :slug,
+      :disabled_at,
+      :disabled_reason,
+      :users_limit_exceeded,
+      :seats_limit_exceeded,
+      :service_accounts_limit_exceeded,
+      :sites_limit_exceeded,
+      :admins_limit_exceeded,
+      :warning_last_sent_at
+    ])
     |> cast_embed(:config)
     |> cast_embed(:features)
     |> cast_embed(:limits)

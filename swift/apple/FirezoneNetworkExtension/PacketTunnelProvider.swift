@@ -17,21 +17,26 @@ enum PacketTunnelProviderError: Error {
 
 class PacketTunnelProvider: NEPacketTunnelProvider {
   private var adapter: Adapter?
+  /// Task for consuming commands from Adapter. Uses CancellableTask for RAII cleanup.
+  private var commandConsumerTask: CancellableTask?
 
   enum LogExportState {
     case inProgress(TunnelLogArchive)
     case idle
   }
 
-  private var getLogFolderSizeTask: Task<Void, Never>?
+  private var getLogFolderSizeTask: CancellableTask?
+  private var logCleanupTask: CancellableTask?
 
   private var logExportState: LogExportState = .idle
   private var tunnelConfiguration: TunnelConfiguration?
   private let defaults = UserDefaults.standard
 
   override init() {
-    // Initialize Telemetry as early as possible
-    Telemetry.start()
+    // Initialize Telemetry as early as possible.
+    // Disable app hang tracking because Network Extensions legitimately block
+    // on mach_msg when idle, causing false positive reports.
+    Telemetry.start(enableAppHangTracking: false)
 
     super.init()
 
@@ -47,10 +52,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     self.tunnelConfiguration = TunnelConfiguration.tryLoad()
   }
 
-  deinit {
-    getLogFolderSizeTask?.cancel()
-  }
-
   override func startTunnel(
     // swiftlint:disable:next discouraged_optional_collection - Apple API signature
     options: [String: NSObject]?,
@@ -59,7 +60,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Dummy start to attach a utun for cleanup later
     if options?["cycleStart"] as? Bool == true {
       Log.info("Cycle start requested - extension awakened and temporarily starting tunnel")
-      return completionHandler(nil)
+      completionHandler(nil)
+      return
     }
 
     // Log version on actual tunnel start
@@ -68,6 +70,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
     Log.info("Starting tunnel - Version: \(version), Build: \(build)")
 
+    // Try to load configuration from options first (passed from client at startup)
+    if let configData = options?["configuration"] as? Data {
+      do {
+        let decoder = PropertyListDecoder()
+        let configFromOptions = try decoder.decode(TunnelConfiguration.self, from: configData)
+        // Save it for future fallback (e.g., system-initiated restarts)
+        configFromOptions.save()
+        self.tunnelConfiguration = configFromOptions
+      } catch {
+        Log.error(error)
+      }
+    }
+
     // If the tunnel starts up before the GUI after an upgrade crossing the 1.4.15 version boundary,
     // the old system settings-based config will still be present and the new configuration will be empty.
     // So handle that edge case gracefully.
@@ -75,62 +90,105 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
       protocolConfiguration: protocolConfiguration as? NETunnelProviderProtocol
     )
 
+    // Extract token from options before any async work
+    let passedToken = options?["token"] as? String
+
+    // Load token synchronously - Keychain access is thread-safe
+    guard let token = loadToken(passedToken: passedToken)
+    else {
+      completionHandler(PacketTunnelProviderError.tokenNotFoundInKeychain)
+      return
+    }
+
+    // Try to save the token back to the Keychain but continue if we can't
+    handleTokenSave(token)
+
+    // The firezone id should be initialized by now
+    guard let rawId = UserDefaults.standard.string(forKey: "firezoneId")
+    else {
+      completionHandler(PacketTunnelProviderError.firezoneIdIsInvalid)
+      return
+    }
+    let firezoneId = FirezoneId(uuid: rawId)
+
+    guard let apiURL = legacyConfiguration?["apiURL"] ?? tunnelConfiguration?.apiURL,
+      let logFilter = legacyConfiguration?["logFilter"] ?? tunnelConfiguration?.logFilter,
+      let accountSlug = legacyConfiguration?["accountSlug"] ?? tunnelConfiguration?.accountSlug
+    else {
+      completionHandler(PacketTunnelProviderError.tunnelConfigurationIsInvalid)
+      return
+    }
+
+    Telemetry.setEnvironmentOrClose(apiURL)
+    Telemetry.setUser(firezoneId: firezoneId.encoded, accountSlug: accountSlug)
+
+    let enabled = legacyConfiguration?["internetResourceEnabled"]
+    let internetResourceEnabled =
+      enabled != nil ? enabled == "true" : (tunnelConfiguration?.internetResourceEnabled ?? false)
+
+    // Create command channel for Adapter -> Provider communication
+    let (commandSender, commandReceiver): (Sender<ProviderCommand>, Receiver<ProviderCommand>) =
+      Channel.create()
+
+    let adapter: Adapter
     do {
-      // If we don't have a token, we can't continue.
-      guard let token = loadAndSaveToken(from: options)
-      else {
-        return completionHandler(PacketTunnelProviderError.tokenNotFoundInKeychain)
-      }
-
-      // Try to save the token back to the Keychain but continue if we can't
-      handleTokenSave(token)
-
-      // The firezone id should be initialized by now
-      guard let id = UserDefaults.standard.string(forKey: "firezoneId")
-      else {
-        throw PacketTunnelProviderError.firezoneIdIsInvalid
-      }
-
-      guard let apiURL = legacyConfiguration?["apiURL"] ?? tunnelConfiguration?.apiURL,
-        let logFilter = legacyConfiguration?["logFilter"] ?? tunnelConfiguration?.logFilter,
-        let accountSlug = legacyConfiguration?["accountSlug"] ?? tunnelConfiguration?.accountSlug
-      else {
-        throw PacketTunnelProviderError.tunnelConfigurationIsInvalid
-      }
-
-      // Configure telemetry
-      Telemetry.setEnvironmentOrClose(apiURL)
-      Task { await Telemetry.setAccountSlug(accountSlug) }
-
-      let enabled = legacyConfiguration?["internetResourceEnabled"]
-      let internetResourceEnabled =
-        enabled != nil ? enabled == "true" : (tunnelConfiguration?.internetResourceEnabled ?? false)
-
-      // Create the adapter with all configuration
-      let adapter = Adapter(
+      adapter = try Adapter(
         apiURL: apiURL,
         token: token,
-        deviceId: id,
+        deviceId: firezoneId.uuid,
         logFilter: logFilter,
         accountSlug: accountSlug,
         internetResourceEnabled: internetResourceEnabled,
-        packetTunnelProvider: self,
-        startCompletionHandler: completionHandler
+        providerCommandSender: commandSender
       )
-
-      // Start the adapter
-      try adapter.start()
-
-      self.adapter = adapter
-
     } catch {
       Log.error(error)
       completionHandler(error)
+      return
+    }
+
+    // Store adapter reference so it's accessible to wake() and stopTunnel()
+    self.adapter = adapter
+
+    // Start command consumer loop
+    let handler = PacketTunnelProviderActorBridge(self)
+    commandConsumerTask = CancellableTask { @Sendable in
+      for await command in commandReceiver.stream {
+        handler.handle(command)
+      }
+      Log.log("Provider command consumer finished")
+    }
+
+    // Start the adapter asynchronously. The Task only captures Sendable values:
+    // - adapter: actor (Sendable)
+    // - completionHandler: @Sendable
+    Task { @Sendable in
+      do {
+        try await adapter.start()
+        completionHandler(nil)
+      } catch {
+        Log.error(error)
+        completionHandler(error)
+      }
     }
   }
 
+  /// Loads the token from passed value or Keychain.
+  private func loadToken(passedToken: String?) -> Token? {
+    // Try to load saved token from Keychain, continuing if Keychain is unavailable.
+    let keychainToken: Token? = {
+      do { return try Token.load() } catch { Log.error(error) }
+      return nil
+    }()
+
+    return Token(passedToken) ?? keychainToken
+  }
+
   override func wake() {
-    adapter?.reset(reason: "awoke from sleep")
+    let adapter = self.adapter
+    Task { @Sendable in
+      await adapter?.reset(reason: "awoke from sleep")
+    }
   }
 
   // This can be called by the system, or initiated by connlib.
@@ -141,9 +199,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
   ) {
     Log.log("stopTunnel: Reason: \(reason)")
 
+    logCleanupTask = nil
+
+    // Cancel command consumer - CancellableTask handles cancellation on deinit
+    commandConsumerTask = nil
+
     // handles both connlib-initiated and user-initiated stops
-    adapter?.stop()
-    completionHandler()
+    let adapter = self.adapter
+    Task { @Sendable in
+      await adapter?.stop()
+      completionHandler()
+    }
   }
 
   // It would be helpful to be able to encapsulate Errors here. To do that
@@ -161,25 +227,36 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         tunnelConfiguration.save()
         self.tunnelConfiguration = tunnelConfiguration
 
-        self.adapter?.setInternetResourceEnabled(tunnelConfiguration.internetResourceEnabled)
+        let adapter = self.adapter
+        Task { @Sendable in
+          await adapter?.setInternetResourceEnabled(tunnelConfiguration.internetResourceEnabled)
+        }
         completionHandler?(nil)
 
       case .signOut:
         do { try Token.delete() } catch { Log.error(error) }
         completionHandler?(nil)
-      case .getResourceList(let hash):
-        guard let adapter = adapter
-        else {
+      case .getState(let hash):
+        guard let adapter else {
           Log.warning("Adapter is nil")
           completionHandler?(nil)
-
           return
         }
 
         // Use hash comparison to only return resources if they've changed
-        adapter.getResourcesIfVersionDifferentFrom(hash: hash) { resourceData in
-          completionHandler?(resourceData)
+        Task { @Sendable in
+          // Use hash comparison to only return state if it changed
+          let connlibState = await adapter.getStateIfVersionDifferentFrom(hash: hash)
+          completionHandler?(connlibState)
         }
+      case .getEncodedFirezoneId:
+        guard let rawId = UserDefaults.standard.string(forKey: "firezoneId") else {
+          Log.error(PacketTunnelProviderError.firezoneIdIsInvalid)
+          completionHandler?(nil)
+          return
+        }
+        let encodedId = FirezoneId(uuid: rawId).encoded
+        completionHandler?(encodedId.data(using: .utf8))
       case .clearLogs:
         clearLogs(completionHandler)
       case .getLogFolderSize:
@@ -195,21 +272,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
       Log.error(error)
       completionHandler?(nil)
     }
-  }
-
-  // swiftlint:disable:next discouraged_optional_collection - matches Apple API parameter type
-  func loadAndSaveToken(from options: [String: NSObject]?) -> Token? {
-    let passedToken = options?["token"] as? String
-
-    // Try to load saved token from Keychain, continuing if Keychain is
-    // unavailable.
-    let keychainToken = {
-      do { return try Token.load() } catch { Log.error(error) }
-
-      return nil
-    }()
-
-    return Token(passedToken) ?? keychainToken
   }
 
   func clearLogs(_ completionHandler: (@Sendable (Data?) -> Void)? = nil) {
@@ -230,7 +292,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
       return
     }
 
-    let task = Task {
+    getLogFolderSizeTask = CancellableTask {
       let size = await Log.size(of: logFolderURL)
       let data = withUnsafeBytes(of: size) { Data($0) }
 
@@ -238,7 +300,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
       guard !Task.isCancelled else { return }
       completionHandler?(data)
     }
-    getLogFolderSizeTask = task
   }
 
   func exportLogs(_ completionHandler: @escaping @Sendable (Data?) -> Void) {
@@ -300,6 +361,37 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
   }
 
+  func startLogCleanupTask() {
+    let maxSizeMb = logCleanupDefaultMaxSizeMb()
+    let intervalNs = UInt64(logCleanupDefaultIntervalSecs()) * 1_000_000_000
+
+    // Run cleanup in background task - both immediately and at the default interval
+    logCleanupTask = CancellableTask {
+      Self.performLogCleanup(maxSizeMb: maxSizeMb)
+
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: intervalNs)
+        guard !Task.isCancelled else { break }
+        Self.performLogCleanup(maxSizeMb: maxSizeMb)
+      }
+    }
+  }
+
+  private static func performLogCleanup(maxSizeMb: UInt32) {
+    guard let connlibDir = SharedAccess.connlibLogFolderURL?.path,
+      let tunnelDir = SharedAccess.tunnelLogFolderURL?.path
+    else {
+      Log.warning("Cannot enforce log size cap: log directories unavailable")
+      return
+    }
+
+    let deletedBytes = enforceLogSizeCap(logDirs: [connlibDir, tunnelDir], maxSizeMb: maxSizeMb)
+    if deletedBytes > 0 {
+      let deletedMb = deletedBytes / 1024 / 1024
+      Log.info("Cleaned up \(deletedMb) MB of old logs")
+    }
+  }
+
   // Firezone ID migration. Can be removed once most clients migrate past 1.4.15.
   private func migrateFirezoneId() {
     let filename = "firezone-id"
@@ -321,7 +413,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     // 3. Generate and save new one
-    defaults.set(UUID().uuidString, forKey: key)
+    defaults.set(FirezoneId.generate().uuid, forKey: key)
   }
 
   #if os(macOS)
@@ -347,6 +439,84 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
       do { try token.save() } catch { Log.error(error) }
     }
   #endif
+
+  /// Handle commands from the Adapter via channel.
+  ///
+  /// **Must be called on the main thread.** NEPacketTunnelProvider's properties and methods
+  /// have undocumented main-thread requirements:
+  /// - `reasserting`: Reading/writing from background threads silently returns stale values
+  /// - `cancelTunnelWithError(_:)`: May not properly signal the system from background threads
+  /// - `setTunnelNetworkSettings(_:completionHandler:)`: Works from any thread but we keep
+  ///   it consistent with other calls
+  ///
+  /// The caller (`PacketTunnelProviderActorBridge.handle`) dispatches to main before calling.
+  fileprivate func handleProviderCommand(_ command: ProviderCommand) {
+    switch command {
+    case .cancelWithError(let sendableError):
+      if let sendableError {
+        let error: Error =
+          sendableError.isAuthenticationError
+          ? FirezoneKit.ConnlibError.sessionExpired(sendableError.message)
+          : NSError(
+            domain: "Firezone", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: sendableError.message])
+        cancelTunnelWithError(error)
+      } else {
+        cancelTunnelWithError(nil)
+      }
+
+    case .setReasserting(let value):
+      reasserting = value
+
+    case .getReasserting(let responseSender):
+      responseSender.send(reasserting)
+
+    case .startLogCleanupTask:
+      startLogCleanupTask()
+
+    case .applyNetworkSettings(let payload, let responseSender):
+      let neSettings = payload.build()
+      setTunnelNetworkSettings(neSettings) { error in
+        responseSender.send(error?.localizedDescription)
+      }
+    }
+  }
+}
+
+// MARK: - PacketTunnelProviderActorBridge
+
+/// Sendable wrapper for handling provider commands from a concurrent task.
+///
+/// Marked @unchecked Sendable because PacketTunnelProvider is not Sendable (framework
+/// limitation), but the methods called (cancelTunnelWithError, setTunnelNetworkSettings,
+/// reasserting) are designed for cross-thread access by NEPacketTunnelProvider.
+private final class PacketTunnelProviderActorBridge: @unchecked Sendable {
+  private weak var provider: PacketTunnelProvider?
+
+  fileprivate init(_ provider: PacketTunnelProvider) {
+    self.provider = provider
+  }
+
+  func handle(_ command: ProviderCommand) {
+    guard let provider else {
+      Log.warning("CommandHandler: provider deallocated, dropping command")
+      // Respond to channels to prevent callers from hanging indefinitely
+      switch command {
+      case .getReasserting(let sender):
+        sender.send(false)
+      case .applyNetworkSettings(_, let sender):
+        sender.send("Provider unavailable")
+      case .cancelWithError, .setReasserting, .startLogCleanupTask:
+        break  // Fire-and-forget commands, no response needed
+      }
+      return
+    }
+    // NEPacketTunnelProvider properties like `reasserting` require main-thread access.
+    // Without this, property reads silently fail and channel responses never arrive.
+    DispatchQueue.main.async {
+      provider.handleProviderCommand(command)
+    }
+  }
 }
 
 // Increase usefulness of TunnelConfiguration now that we're over the IPC barrier

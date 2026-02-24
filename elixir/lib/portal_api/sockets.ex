@@ -25,6 +25,15 @@ defmodule PortalAPI.Sockets do
   def handle_error(conn, :missing_token),
     do: Plug.Conn.send_resp(conn, 401, "Missing token")
 
+  def handle_error(conn, :limits_exceeded),
+    do:
+      Plug.Conn.send_resp(
+        conn,
+        402,
+        "This account is temporarily suspended from client authentication " <>
+          "due to exceeding billing limits. Please contact your administrator to add more seats."
+      )
+
   def handle_error(conn, :account_disabled),
     do: Plug.Conn.send_resp(conn, 403, "The account is disabled")
 
@@ -49,7 +58,7 @@ defmodule PortalAPI.Sockets do
 
   def auth_context(%{user_agent: user_agent, x_headers: x_headers, peer_data: peer_data}, type) do
     remote_ip = real_ip(x_headers, peer_data)
-    Portal.Auth.Context.build(remote_ip, user_agent, x_headers, type)
+    Portal.Authentication.Context.build(remote_ip, user_agent, x_headers, type)
   end
 
   defp real_ip(x_headers, peer_data) do

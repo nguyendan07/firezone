@@ -1,8 +1,8 @@
 defmodule PortalWeb.Settings.ApiClients.NewToken do
   use PortalWeb, :live_view
   import PortalWeb.Settings.ApiClients.Components
-  alias Portal.{Auth, APIToken}
-  alias __MODULE__.DB
+  alias Portal.{Authentication, APIToken}
+  alias __MODULE__.Database
   import Ecto.Changeset
 
   def mount(%{"id" => id}, _session, socket) do
@@ -10,7 +10,7 @@ defmodule PortalWeb.Settings.ApiClients.NewToken do
       do: raise(PortalWeb.LiveErrors.NotFoundError)
 
     account = socket.assigns.account
-    %{type: :api_client} = actor = DB.get_api_client!(id, socket.assigns.subject)
+    %{type: :api_client} = actor = Database.get_api_client!(id, socket.assigns.subject)
 
     if Portal.Billing.can_create_api_tokens?(account, actor) do
       changeset = build_token_changeset(%{})
@@ -93,7 +93,7 @@ defmodule PortalWeb.Settings.ApiClients.NewToken do
       attrs = map_expires_at(attrs)
 
       with {:ok, encoded_token} <-
-             Auth.create_api_token(
+             Authentication.create_api_token(
                actor,
                attrs,
                socket.assigns.subject
@@ -130,7 +130,7 @@ defmodule PortalWeb.Settings.ApiClients.NewToken do
     |> cast(attrs, [:name, :expires_at])
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -139,8 +139,8 @@ defmodule PortalWeb.Settings.ApiClients.NewToken do
         where: a.id == ^id,
         where: a.type == :api_client
       )
-      |> Safe.scoped(subject)
-      |> Safe.one!()
+      |> Safe.scoped(subject, :replica)
+      |> Safe.one!(fallback_to_primary: true)
     end
   end
 end

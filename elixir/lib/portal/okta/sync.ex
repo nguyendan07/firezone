@@ -12,7 +12,7 @@ defmodule Portal.Okta.Sync do
     ]
 
   alias Portal.Okta
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   require Logger
   require OpenTelemetry.Tracer
@@ -24,7 +24,7 @@ defmodule Portal.Okta.Sync do
       timestamp: DateTime.utc_now()
     )
 
-    case DB.get_directory(directory_id) do
+    case Database.get_directory(directory_id) do
       nil ->
         Logger.info("Okta directory not found, disabled, or account disabled, skipping",
           okta_directory_id: directory_id
@@ -51,18 +51,30 @@ defmodule Portal.Okta.Sync do
         :is_verified
       ])
 
-    {:ok, _directory} = DB.update_directory(changeset)
+    {:ok, _directory} = Database.update_directory(changeset)
   end
 
   defp sync(%Okta.Directory{} = directory) do
     client = Okta.APIClient.new(directory)
     access_token = get_access_token!(client, directory)
+    verify_access_token!(client, access_token, directory)
     synced_at = DateTime.utc_now()
 
     apps = get_apps!(client, access_token, directory)
     sync_all_apps!(apps, client, access_token, directory, synced_at)
     sync_all_memberships!(client, access_token, directory, synced_at)
+    check_deletion_threshold!(directory, synced_at)
     delete_unsynced(directory, synced_at)
+
+    # Reconnect orphaned policies after sync (groups may have been recreated)
+    reconnected = Portal.Policy.reconnect_orphaned_policies(directory.account_id)
+
+    if reconnected > 0 do
+      Logger.info("Reconnected #{reconnected} orphaned policies after sync",
+        account_id: directory.account_id,
+        okta_directory_id: directory.id
+      )
+    end
 
     # Clear error state on successful sync completion
     update(directory, %{
@@ -96,10 +108,34 @@ defmodule Portal.Okta.Sync do
         )
 
         raise Okta.SyncError,
-          reason: "Failed to get access token",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :get_access_token
+    end
+  end
+
+  @required_scopes ~w[okta.apps.read okta.users.read okta.groups.read]
+
+  defp verify_access_token!(client, access_token, directory) do
+    Logger.debug("Verifying access token scopes", okta_directory_id: directory.id)
+
+    case Okta.APIClient.introspect_token(client, access_token) do
+      {:ok, %{"scope" => raw_scopes}} ->
+        scopes = String.split(raw_scopes, " ")
+        missing_scopes = @required_scopes -- scopes
+
+        if missing_scopes != [] do
+          raise Okta.SyncError,
+            error: {:scopes, "missing #{Enum.join(missing_scopes, ", ")}"},
+            directory_id: directory.id,
+            step: :verify_scopes
+        end
+
+      _ ->
+        raise Okta.SyncError,
+          error: {:scopes, "missing #{Enum.join(@required_scopes, ", ")}"},
+          directory_id: directory.id,
+          step: :verify_scopes
     end
   end
 
@@ -122,8 +158,7 @@ defmodule Portal.Okta.Sync do
         )
 
         raise Okta.SyncError,
-          reason: "Failed to fetch apps",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :list_apps
     end
@@ -181,8 +216,7 @@ defmodule Portal.Okta.Sync do
     case errors do
       [error | _] ->
         raise Okta.SyncError,
-          reason: "Failed to stream app users",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_app_users
 
@@ -190,7 +224,7 @@ defmodule Portal.Okta.Sync do
         account_id = directory.account_id
         issuer = issuer(directory)
         directory_id = directory.id
-        parsed_users = Enum.map(users, &parse_okta_user/1)
+        parsed_users = Enum.map(users, &parse_okta_user(&1, directory_id))
 
         # Map users to identity attributes
         identity_attrs =
@@ -205,7 +239,7 @@ defmodule Portal.Okta.Sync do
             }
           end)
 
-        case DB.batch_upsert_identities(
+        case Database.batch_upsert_identities(
                account_id,
                issuer,
                directory_id,
@@ -224,8 +258,7 @@ defmodule Portal.Okta.Sync do
             )
 
             raise Okta.SyncError,
-              reason: "Failed to upsert identities",
-              cause: reason,
+              error: "Failed to upsert identities: #{inspect(reason)}",
               directory_id: directory.id,
               step: :batch_upsert_identities
         end
@@ -263,8 +296,7 @@ defmodule Portal.Okta.Sync do
     case errors do
       [error | _] ->
         raise Okta.SyncError,
-          reason: "Failed to stream app groups",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_app_groups
 
@@ -284,7 +316,7 @@ defmodule Portal.Okta.Sync do
 
         unless Enum.empty?(group_attrs) do
           {:ok, %{upserted_groups: count}} =
-            DB.batch_upsert_groups(account_id, directory_id, synced_at, group_attrs)
+            Database.batch_upsert_groups(account_id, directory_id, synced_at, group_attrs)
 
           Logger.debug("Upserted #{count} groups", okta_directory_id: directory.id)
         end
@@ -300,7 +332,7 @@ defmodule Portal.Okta.Sync do
 
     Logger.debug("Syncing group memberships", okta_directory_id: directory.id)
 
-    group_idp_ids = DB.get_synced_group_idp_ids(account_id, directory_id, synced_at)
+    group_idp_ids = Database.get_synced_group_idp_ids(account_id, directory_id, synced_at)
 
     Logger.debug("Found synced groups",
       okta_directory_id: directory.id,
@@ -341,7 +373,7 @@ defmodule Portal.Okta.Sync do
         Enum.map(member_ids, fn member_id -> {group_idp_id, member_id} end)
       end)
 
-    case DB.batch_upsert_memberships(
+    case Database.batch_upsert_memberships(
            account_id,
            issuer,
            directory_id,
@@ -360,8 +392,7 @@ defmodule Portal.Okta.Sync do
         )
 
         raise Okta.SyncError,
-          reason: "Failed to upsert memberships",
-          cause: reason,
+          error: "Failed to upsert memberships: #{inspect(reason)}",
           directory_id: directory_id,
           step: :batch_upsert_memberships
     end
@@ -379,8 +410,7 @@ defmodule Portal.Okta.Sync do
 
       {:error, reason}, _acc ->
         raise Okta.SyncError,
-          reason: "Failed to stream group members",
-          cause: reason,
+          error: reason,
           directory_id: directory_id,
           step: :stream_group_members
     end)
@@ -391,12 +421,21 @@ defmodule Portal.Okta.Sync do
   defp issuer(directory), do: "https://#{directory.okta_domain}"
 
   # Parses an Okta user API response into a structured map
-  defp parse_okta_user(user) do
+  defp parse_okta_user(user, directory_id) do
     profile = user["profile"] || %{}
+
+    email = profile["email"]
+
+    unless email do
+      raise Okta.SyncError,
+        error: {:validation, "user '#{user["id"]}' missing 'email' field"},
+        directory_id: directory_id,
+        step: :process_user
+    end
 
     first_name = (profile["firstName"] || "") |> String.trim()
     last_name = (profile["lastName"] || "") |> String.trim()
-    email = profile["email"] |> String.downcase() |> String.trim()
+    email = email |> String.downcase() |> String.trim()
 
     %{
       okta_id: user["id"],
@@ -424,7 +463,7 @@ defmodule Portal.Okta.Sync do
 
     # Delete groups that weren't synced
     {deleted_groups_count, _} =
-      DB.delete_unsynced_groups(account_id, directory_id, synced_at)
+      Database.delete_unsynced_groups(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced groups",
       okta_directory_id: directory.id,
@@ -433,7 +472,7 @@ defmodule Portal.Okta.Sync do
 
     # Delete identities that weren't synced
     {deleted_identities_count, _} =
-      DB.delete_unsynced_identities(account_id, directory_id, synced_at)
+      Database.delete_unsynced_identities(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced identities",
       okta_directory_id: directory.id,
@@ -442,7 +481,7 @@ defmodule Portal.Okta.Sync do
 
     # Delete memberships that weren't synced
     {deleted_memberships_count, _} =
-      DB.delete_unsynced_memberships(account_id, directory_id, synced_at)
+      Database.delete_unsynced_memberships(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced group memberships",
       okta_directory_id: directory.id,
@@ -450,7 +489,8 @@ defmodule Portal.Okta.Sync do
     )
 
     # Delete actors that no longer have any identities and were created by this directory
-    {deleted_actors_count, _} = DB.delete_actors_without_identities(account_id, directory_id)
+    {deleted_actors_count, _} =
+      Database.delete_actors_without_identities(account_id, directory_id)
 
     Logger.debug("Deleted actors without identities",
       okta_directory_id: directory.id,
@@ -458,7 +498,64 @@ defmodule Portal.Okta.Sync do
     )
   end
 
-  defmodule DB do
+  # Circuit breaker protection against accidental mass deletion
+  # This can happen if someone misconfigures or removes the Okta app
+  defp check_deletion_threshold!(directory, synced_at) do
+    # Skip check on first sync - there's nothing to delete
+    if is_nil(directory.synced_at) do
+      Logger.debug("Skipping deletion threshold check - first sync",
+        okta_directory_id: directory.id
+      )
+    else
+      account_id = directory.account_id
+      directory_id = directory.id
+
+      # Get counts for identities
+      identity_counts = Database.count_identities(account_id, directory_id, synced_at)
+
+      # Get counts for groups
+      group_counts = Database.count_groups(account_id, directory_id, synced_at)
+
+      # Check identity deletion threshold
+      check_resource_threshold!(
+        identity_counts,
+        "identities",
+        directory
+      )
+
+      # Check group deletion threshold
+      check_resource_threshold!(
+        group_counts,
+        "groups",
+        directory
+      )
+    end
+  end
+
+  defp check_resource_threshold!(%{total: 0}, resource_name, directory) do
+    Logger.debug(
+      "Skipping deletion threshold check for #{resource_name} - no resources exist",
+      okta_directory_id: directory.id
+    )
+  end
+
+  defp check_resource_threshold!(counts, resource_name, directory) do
+    %{total: total, to_delete: to_delete} = counts
+
+    if to_delete == total do
+      Logger.error(
+        "Deletion threshold exceeded for #{resource_name}",
+        okta_directory_id: directory.id
+      )
+
+      raise Okta.SyncError,
+        error: {:circuit_breaker, "would delete all #{resource_name}"},
+        directory_id: directory.id,
+        step: :check_deletion_threshold
+    end
+  end
+
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -470,12 +567,67 @@ defmodule Portal.Okta.Sync do
         where: d.is_disabled == false,
         where: is_nil(a.disabled_at)
       )
-      |> Safe.unscoped()
-      |> Safe.one()
+      |> Safe.unscoped(:replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def update_directory(changeset) do
       changeset |> Safe.unscoped() |> Safe.update()
+    end
+
+    # Count functions for circuit breaker threshold checks
+    @spec count_identities(String.t(), String.t(), DateTime.t()) :: %{
+            total: non_neg_integer(),
+            to_delete: non_neg_integer()
+          }
+    def count_identities(account_id, directory_id, synced_at) do
+      total =
+        from(i in Portal.ExternalIdentity,
+          where: i.account_id == ^account_id,
+          where: i.directory_id == ^directory_id,
+          select: count(i.id)
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      to_delete =
+        from(i in Portal.ExternalIdentity,
+          where: i.account_id == ^account_id,
+          where: i.directory_id == ^directory_id,
+          where: i.last_synced_at < ^synced_at or is_nil(i.last_synced_at),
+          select: count(i.id)
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      %{total: total, to_delete: to_delete}
+    end
+
+    @spec count_groups(String.t(), String.t(), DateTime.t()) :: %{
+            total: non_neg_integer(),
+            to_delete: non_neg_integer()
+          }
+    def count_groups(account_id, directory_id, synced_at) do
+      total =
+        from(g in Portal.Group,
+          where: g.account_id == ^account_id,
+          where: g.directory_id == ^directory_id,
+          select: count(g.id)
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      to_delete =
+        from(g in Portal.Group,
+          where: g.account_id == ^account_id,
+          where: g.directory_id == ^directory_id,
+          where: g.last_synced_at < ^synced_at or is_nil(g.last_synced_at),
+          select: count(g.id)
+        )
+        |> Safe.unscoped(:replica)
+        |> Safe.one!(fallback_to_primary: true)
+
+      %{total: total, to_delete: to_delete}
     end
 
     def get_synced_group_idp_ids(account_id, directory_id, synced_at) do
@@ -486,7 +638,7 @@ defmodule Portal.Okta.Sync do
         where: not is_nil(g.idp_id),
         select: g.idp_id
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
 

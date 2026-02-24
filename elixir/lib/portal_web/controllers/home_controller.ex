@@ -1,15 +1,15 @@
 defmodule PortalWeb.HomeController do
   use PortalWeb, :controller
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   def home(conn, params) do
     %PortalWeb.Cookie.RecentAccounts{account_ids: recent_account_ids} =
       PortalWeb.Cookie.RecentAccounts.fetch(conn)
 
-    recent_accounts = DB.get_accounts_by_ids(recent_account_ids)
+    recent_accounts = Database.get_accounts_by_ids(recent_account_ids)
     ids_to_remove = recent_account_ids -- Enum.map(recent_accounts, & &1.id)
     conn = PortalWeb.Cookie.RecentAccounts.remove(conn, ids_to_remove)
-    params = PortalWeb.Auth.take_sign_in_params(params)
+    params = PortalWeb.Authentication.take_sign_in_params(params)
 
     conn
     |> put_layout(html: {PortalWeb.Layouts, :public})
@@ -20,7 +20,7 @@ defmodule PortalWeb.HomeController do
   end
 
   def redirect_to_sign_in(conn, %{"account_id_or_slug" => account_id_or_slug} = params) do
-    params = PortalWeb.Auth.take_sign_in_params(params)
+    params = PortalWeb.Authentication.take_sign_in_params(params)
 
     case validate_account_id_or_slug(account_id_or_slug) do
       {:ok, account_id_or_slug} ->
@@ -48,13 +48,13 @@ defmodule PortalWeb.HomeController do
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
     def get_accounts_by_ids(account_ids) do
       from(a in Portal.Account, where: a.id in ^account_ids)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.all()
     end
   end

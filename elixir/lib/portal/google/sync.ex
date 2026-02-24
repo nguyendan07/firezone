@@ -12,7 +12,7 @@ defmodule Portal.Google.Sync do
     ]
 
   alias Portal.Google
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   @impl Oban.Worker
@@ -22,7 +22,7 @@ defmodule Portal.Google.Sync do
       timestamp: DateTime.utc_now()
     )
 
-    case DB.get_directory(directory_id) do
+    case Database.get_directory(directory_id) do
       nil ->
         Logger.info("Google directory not found, disabled, or account disabled, skipping",
           google_directory_id: directory_id
@@ -48,7 +48,7 @@ defmodule Portal.Google.Sync do
         :is_verified
       ])
 
-    {:ok, _directory} = DB.update_directory(changeset)
+    {:ok, _directory} = Database.update_directory(changeset)
   end
 
   defp sync(%Google.Directory{} = directory) do
@@ -57,6 +57,16 @@ defmodule Portal.Google.Sync do
 
     fetch_and_sync_all(directory, access_token, synced_at)
     delete_unsynced(directory, synced_at)
+
+    # Reconnect orphaned policies after sync (groups may have been recreated)
+    reconnected = Portal.Policy.reconnect_orphaned_policies(directory.account_id)
+
+    if reconnected > 0 do
+      Logger.info("Reconnected #{reconnected} orphaned policies after sync",
+        account_id: directory.account_id,
+        google_directory_id: directory.id
+      )
+    end
 
     # Clear error state on successful sync completion
     update(directory, %{
@@ -92,8 +102,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Invalid access token response",
-          cause: response,
+          error: response,
           directory_id: directory.id,
           step: :get_access_token
 
@@ -104,8 +113,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Failed to get access token",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :get_access_token
     end
@@ -147,8 +155,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Failed to stream users",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_users
 
@@ -164,8 +171,7 @@ defmodule Portal.Google.Sync do
             # Ensure critical fields exist
             unless user["id"] do
               raise Google.SyncError,
-                reason: "User missing required 'id' field",
-                cause: user,
+                error: {:validation, "user missing 'id' field"},
                 directory_id: directory.id,
                 step: :process_user
             end
@@ -192,8 +198,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Failed to stream groups",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_groups
 
@@ -209,16 +214,14 @@ defmodule Portal.Google.Sync do
             # Ensure critical fields exist - if Google returns incomplete data, we must fail
             unless group["id"] do
               raise Google.SyncError,
-                reason: "Group missing required 'id' field",
-                cause: group,
+                error: {:validation, "group missing 'id' field"},
                 directory_id: directory.id,
                 step: :process_group
             end
 
             unless group["name"] || group["email"] do
               raise Google.SyncError,
-                reason: "Group missing both 'name' and 'email' fields",
-                cause: group,
+                error: {:validation, "group '#{group["id"]}' missing 'name' field"},
                 directory_id: directory.id,
                 step: :process_group
             end
@@ -262,8 +265,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Failed to stream group members for #{group_name}",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_group_members
 
@@ -288,8 +290,7 @@ defmodule Portal.Google.Sync do
       Enum.map(user_members, fn member ->
         unless member["id"] do
           raise Google.SyncError,
-            reason: "Member missing required 'id' field in group #{group_name}",
-            cause: member,
+            error: {:validation, "member missing 'id' field in group #{group_name}"},
             directory_id: directory.id,
             step: :process_member
         end
@@ -314,8 +315,7 @@ defmodule Portal.Google.Sync do
         )
 
         raise Google.SyncError,
-          reason: "Failed to stream organization units",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_org_units
 
@@ -330,16 +330,22 @@ defmodule Portal.Google.Sync do
           Enum.map(org_units, fn org_unit ->
             unless org_unit["orgUnitId"] do
               raise Google.SyncError,
-                reason: "Organization unit missing required 'orgUnitId' field",
-                cause: org_unit,
+                error: {:validation, "org_unit missing 'orgUnitId' field"},
                 directory_id: directory.id,
                 step: :process_org_unit
             end
 
             unless org_unit["name"] do
               raise Google.SyncError,
-                reason: "Organization unit missing required 'name' field",
-                cause: org_unit,
+                error: {:validation, "org_unit '#{org_unit["orgUnitId"]}' missing 'name' field"},
+                directory_id: directory.id,
+                step: :process_org_unit
+            end
+
+            unless org_unit["orgUnitPath"] do
+              raise Google.SyncError,
+                error:
+                  {:validation, "org_unit '#{org_unit["orgUnitId"]}' missing 'orgUnitPath' field"},
                 directory_id: directory.id,
                 step: :process_org_unit
             end
@@ -353,15 +359,79 @@ defmodule Portal.Google.Sync do
         unless Enum.empty?(org_unit_attrs) do
           batch_upsert_org_units(directory, synced_at, org_unit_attrs)
         end
+
+        # For each org unit, stream and sync members
+        Enum.each(org_units, fn org_unit ->
+          sync_org_unit_members(directory, access_token, synced_at, org_unit)
+        end)
     end)
     |> Stream.run()
+  end
+
+  defp sync_org_unit_members(directory, access_token, synced_at, org_unit) do
+    org_unit_id = org_unit["orgUnitId"]
+    org_unit_name = org_unit["name"]
+    org_unit_path = org_unit["orgUnitPath"]
+
+    Logger.debug("Streaming members for organization unit",
+      google_directory_id: directory.id,
+      org_unit_id: org_unit_id,
+      org_unit_name: org_unit_name,
+      org_unit_path: org_unit_path
+    )
+
+    Google.APIClient.stream_organization_unit_members(access_token, org_unit_path)
+    |> Stream.each(fn
+      {:error, error} ->
+        Logger.error("Failed to fetch users for organization unit",
+          org_unit_id: org_unit_id,
+          org_unit_name: org_unit_name,
+          org_unit_path: org_unit_path,
+          error: inspect(error),
+          google_directory_id: directory.id
+        )
+
+        raise Google.SyncError,
+          error: error,
+          directory_id: directory.id,
+          step: :stream_org_unit_members
+
+      users when is_list(users) ->
+        process_org_unit_members_page(directory, synced_at, org_unit_id, org_unit_name, users)
+    end)
+    |> Stream.run()
+  end
+
+  defp process_org_unit_members_page(directory, synced_at, org_unit_id, org_unit_name, users) do
+    Logger.debug("Received users page for organization unit",
+      google_directory_id: directory.id,
+      org_unit_id: org_unit_id,
+      count: length(users)
+    )
+
+    # Build memberships (org_unit_idp_id, user_idp_id) - validate required fields
+    memberships =
+      Enum.map(users, fn user ->
+        unless user["id"] do
+          raise Google.SyncError,
+            error: {:validation, "user missing 'id' field in org unit #{org_unit_name}"},
+            directory_id: directory.id,
+            step: :process_org_unit_member
+        end
+
+        {org_unit_id, user["id"]}
+      end)
+
+    unless Enum.empty?(memberships) do
+      batch_upsert_memberships(directory, synced_at, memberships)
+    end
   end
 
   defp batch_upsert_identities(directory, synced_at, identities) do
     account_id = directory.account_id
     directory_id = directory.id
 
-    case DB.batch_upsert_identities(account_id, directory_id, synced_at, identities) do
+    case Database.batch_upsert_identities(account_id, directory_id, synced_at, identities) do
       {:ok, %{upserted_identities: count}} ->
         Logger.debug("Upserted #{count} identities", google_directory_id: directory.id)
         :ok
@@ -382,7 +452,7 @@ defmodule Portal.Google.Sync do
     directory_id = directory.id
 
     {:ok, %{upserted_groups: count}} =
-      DB.batch_upsert_groups(account_id, directory_id, synced_at, groups, :group)
+      Database.batch_upsert_groups(account_id, directory_id, synced_at, groups, :group)
 
     Logger.debug("Upserted #{count} groups", google_directory_id: directory.id)
     :ok
@@ -392,7 +462,7 @@ defmodule Portal.Google.Sync do
     account_id = directory.account_id
     directory_id = directory.id
 
-    case DB.batch_upsert_memberships(account_id, directory_id, synced_at, memberships) do
+    case Database.batch_upsert_memberships(account_id, directory_id, synced_at, memberships) do
       {:ok, %{upserted_memberships: count}} ->
         Logger.debug("Upserted #{count} memberships", google_directory_id: directory.id)
         :ok
@@ -413,7 +483,7 @@ defmodule Portal.Google.Sync do
     directory_id = directory.id
 
     {:ok, %{upserted_groups: count}} =
-      DB.batch_upsert_groups(account_id, directory_id, synced_at, org_units, :org_unit)
+      Database.batch_upsert_groups(account_id, directory_id, synced_at, org_units, :org_unit)
 
     Logger.debug("Upserted #{count} organization units", google_directory_id: directory.id)
     :ok
@@ -424,7 +494,8 @@ defmodule Portal.Google.Sync do
     directory_id = directory.id
 
     # Delete groups that weren't synced
-    {deleted_groups_count, _} = DB.delete_unsynced_groups(account_id, directory_id, synced_at)
+    {deleted_groups_count, _} =
+      Database.delete_unsynced_groups(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced groups",
       google_directory_id: directory.id,
@@ -433,7 +504,7 @@ defmodule Portal.Google.Sync do
 
     # Delete identities that weren't synced
     {deleted_identities_count, _} =
-      DB.delete_unsynced_identities(account_id, directory_id, synced_at)
+      Database.delete_unsynced_identities(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced identities",
       google_directory_id: directory.id,
@@ -442,7 +513,7 @@ defmodule Portal.Google.Sync do
 
     # Delete memberships that weren't synced
     {deleted_memberships_count, _} =
-      DB.delete_unsynced_memberships(account_id, directory_id, synced_at)
+      Database.delete_unsynced_memberships(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced group memberships",
       google_directory_id: directory.id,
@@ -450,7 +521,8 @@ defmodule Portal.Google.Sync do
     )
 
     # Delete actors that no longer have any identities and were created by this directory
-    {deleted_actors_count, _} = DB.delete_actors_without_identities(account_id, directory_id)
+    {deleted_actors_count, _} =
+      Database.delete_actors_without_identities(account_id, directory_id)
 
     Logger.debug("Deleted actors without identities",
       google_directory_id: directory.id,
@@ -465,8 +537,7 @@ defmodule Portal.Google.Sync do
 
     unless primary_email do
       raise Google.SyncError,
-        reason: "User missing required 'primaryEmail' field",
-        cause: user,
+        error: {:validation, "user '#{user["id"]}' missing 'primaryEmail' field"},
         directory_id: directory_id,
         step: :process_user
     end
@@ -482,7 +553,7 @@ defmodule Portal.Google.Sync do
     }
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -496,8 +567,8 @@ defmodule Portal.Google.Sync do
         where: d.is_disabled == false,
         where: is_nil(a.disabled_at)
       )
-      |> Safe.unscoped()
-      |> Safe.one()
+      |> Safe.unscoped(:replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def update_directory(changeset) do

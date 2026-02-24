@@ -42,7 +42,9 @@ defmodule Portal.MixProject do
         :logger,
         :runtime_tools,
         :crypto,
-        :dialyzer
+        :dialyzer,
+        # Ensure Postgrex.SCRAM.LockedCache is started before any database connections
+        :postgrex
       ]
     ]
   end
@@ -84,7 +86,7 @@ defmodule Portal.MixProject do
       {:plug_crypto, "~> 2.0"},
       {:jose, "~> 1.11"},
       {:openid_connect,
-       github: "firezone/openid_connect", ref: "b6c58cb2d49c54631004a58f756f7dc120f8eb9f"},
+       github: "firezone/openid_connect", ref: "916db1eef9265f03ea947ad618a57b6dc426acaa"},
       {:argon2_elixir, "~> 4.0"},
 
       # Background jobs
@@ -92,23 +94,22 @@ defmodule Portal.MixProject do
 
       # Erlang clustering
       {:libcluster, "~> 3.3"},
-
-      # CLDR / Internationalization
-      {:ex_cldr_dates_times, "~> 2.13"},
-      {:ex_cldr_numbers, "~> 2.31"},
-      {:ex_cldr, "~> 2.38"},
       {:tzdata, "~> 1.1"},
       {:sizeable, "~> 1.0"},
 
       # Email
       {:gen_smtp, "~> 1.0"},
-      {:multipart, "~> 0.4.0"},
+      {:multipart, "~> 0.6.0"},
       {:phoenix_swoosh, "~> 1.0"},
+
+      # IP Geolocation
+      {:geolix, "~> 2.0"},
+      {:geolix_adapter_mmdb2, "~> 0.6"},
 
       # API / OpenAPI
       {:open_api_spex, "~> 3.22.0"},
       {:ymlr, "~> 5.0"},
-      {:hammer, "~> 7.1.0"},
+      {:hammer, "~> 7.2.0"},
 
       # Observability
       {:telemetry, "~> 1.0"},
@@ -118,12 +119,27 @@ defmodule Portal.MixProject do
       {:observer_cli, "~> 1.7"},
       {:opentelemetry, "~> 1.5"},
       {:opentelemetry_logger_metadata, "~> 0.2.0"},
+      {:opentelemetry_api_experimental,
+       github: "open-telemetry/opentelemetry-erlang",
+       sparse: "apps/opentelemetry_api_experimental",
+       ref: "98be90e6",
+       override: true},
+      {:opentelemetry_experimental,
+       github: "open-telemetry/opentelemetry-erlang",
+       sparse: "apps/opentelemetry_experimental",
+       ref: "98be90e6",
+       override: true},
       {:opentelemetry_exporter, "~> 1.8"},
       {:opentelemetry_ecto, "~> 1.2"},
+      {:opentelemetry_oban, "~> 1.1.1"},
       {:opentelemetry_telemetry, "~> 1.1", override: true},
       {:opentelemetry_bandit, "~> 0.3"},
       {:opentelemetry_phoenix, "~> 2.0"},
       {:nimble_options, "~> 1.0", override: true},
+
+      # TODO: Remove override when this issue is resolved:
+      # https://github.com/open-telemetry/opentelemetry-erlang-contrib/issues/428
+      {:opentelemetry_semantic_conventions, "~> 1.27", override: true},
       {:sentry, "~> 11.0"},
       {:hackney, "~> 1.19"},
       {:logger_json, "~> 7.0"},
@@ -162,7 +178,9 @@ defmodule Portal.MixProject do
       "ecto.setup": ["ecto.create", "ecto.migrate"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       reboot: ["ecto.reset", "run priv/repo/seeds.exs", "start"],
-      sobelow: ["sobelow --config"],
+      sobelow: [
+        "sobelow --skip -i Config.HTTPS,Config.Secrets,Config.CSWH,Config.CSRFRoute,Config.Headers"
+      ],
       "assets.setup": [
         "cmd --shell cd assets && CI=true pnpm i",
         "tailwind.install --if-missing",
@@ -184,6 +202,7 @@ defmodule Portal.MixProject do
         applications: [
           portal: :permanent,
           opentelemetry_exporter: :permanent,
+          opentelemetry_experimental: :permanent,
           opentelemetry: :temporary
         ]
       ]

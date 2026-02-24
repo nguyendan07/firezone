@@ -11,6 +11,8 @@ defmodule Portal.Telemetry do
   def init(_arg) do
     config = Portal.Config.fetch_env!(:portal, __MODULE__)
 
+    register_otel_instruments()
+
     children = [
       # Telemetry poller will execute the given period measurements
       # every 10_000ms. Learn more here: https://hexdocs.pm/telemetry_metrics
@@ -236,6 +238,155 @@ defmodule Portal.Telemetry do
         reason: inspect(error)
       )
 
+      :ok
+  end
+
+  defp register_otel_instruments do
+    meter = :opentelemetry_experimental.get_meter()
+
+    # Common attributes for all metrics to enable splitting by node in Azure Monitor
+    node_attrs = %{
+      "node_name" => System.get_env("NODE_NAME", to_string(node())),
+      "node_type" => System.get_env("NODE_TYPE", "unknown")
+    }
+
+    # Observable gauges for BEAM health
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.process_count",
+      fn _args ->
+        count = :erlang.system_info(:process_count)
+        limit = :erlang.system_info(:process_limit)
+        utilization = Float.round(count / limit * 100, 2)
+
+        [
+          {count, Map.put(node_attrs, "type", "total")},
+          {limit, Map.put(node_attrs, "type", "limit")},
+          {utilization, Map.put(node_attrs, "type", "utilization_percent")}
+        ]
+      end,
+      [],
+      %{description: "BEAM process count, limit, and utilization"}
+    )
+
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.atom_count",
+      fn _args ->
+        count = :erlang.system_info(:atom_count)
+        limit = :erlang.system_info(:atom_limit)
+        utilization = Float.round(count / limit * 100, 2)
+
+        [
+          {count, Map.put(node_attrs, "type", "count")},
+          {limit, Map.put(node_attrs, "type", "limit")},
+          {utilization, Map.put(node_attrs, "type", "utilization_percent")}
+        ]
+      end,
+      [],
+      %{description: "BEAM atom count, limit, and utilization"}
+    )
+
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.port_count",
+      fn _args ->
+        count = :erlang.system_info(:port_count)
+        limit = :erlang.system_info(:port_limit)
+        utilization = Float.round(count / limit * 100, 2)
+
+        [
+          {count, Map.put(node_attrs, "type", "count")},
+          {limit, Map.put(node_attrs, "type", "limit")},
+          {utilization, Map.put(node_attrs, "type", "utilization_percent")}
+        ]
+      end,
+      [],
+      %{description: "BEAM port count, limit, and utilization"}
+    )
+
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.ets.count",
+      fn _args ->
+        [{length(:ets.all()), node_attrs}]
+      end,
+      [],
+      %{description: "Number of ETS tables"}
+    )
+
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.memory",
+      fn _args ->
+        memory = :erlang.memory() |> Enum.into(%{})
+
+        [
+          {memory[:processes], Map.put(node_attrs, "type", "processes")},
+          {memory[:system], Map.put(node_attrs, "type", "system")},
+          {memory[:atom], Map.put(node_attrs, "type", "atom")},
+          {memory[:binary], Map.put(node_attrs, "type", "binary")},
+          {memory[:code], Map.put(node_attrs, "type", "code")},
+          {memory[:ets], Map.put(node_attrs, "type", "ets")}
+        ]
+      end,
+      [],
+      %{description: "BEAM memory usage in bytes", unit: :By}
+    )
+
+    :otel_meter.create_observable_gauge(
+      meter,
+      :"vm.scheduler_utilization",
+      fn _args ->
+        total_run_queue = :erlang.statistics(:total_run_queue_lengths)
+        run_queue_lengths = :erlang.statistics(:run_queue_lengths)
+        max_run_queue = Enum.max(run_queue_lengths, fn -> 0 end)
+
+        avg_run_queue =
+          if run_queue_lengths != [] do
+            Float.round(Enum.sum(run_queue_lengths) / length(run_queue_lengths), 2)
+          else
+            0.0
+          end
+
+        [
+          {total_run_queue, Map.put(node_attrs, "type", "total_run_queue")},
+          {max_run_queue, Map.put(node_attrs, "type", "max_run_queue")},
+          {avg_run_queue, Map.put(node_attrs, "type", "avg_run_queue")},
+          {length(run_queue_lengths), Map.put(node_attrs, "type", "scheduler_count")}
+        ]
+      end,
+      [],
+      %{description: "BEAM scheduler run queue metrics"}
+    )
+
+    # Observable counters for monotonically increasing values
+    :otel_meter.create_observable_counter(
+      meter,
+      :"vm.gc.collections_count",
+      fn _args ->
+        {collections, _words_reclaimed, _} = :erlang.statistics(:garbage_collection)
+        [{collections, node_attrs}]
+      end,
+      [],
+      %{description: "Total number of garbage collections"}
+    )
+
+    :otel_meter.create_observable_counter(
+      meter,
+      :"vm.gc.words_reclaimed",
+      fn _args ->
+        {_collections, words_reclaimed, _} = :erlang.statistics(:garbage_collection)
+        [{words_reclaimed, node_attrs}]
+      end,
+      [],
+      %{description: "Total words reclaimed by garbage collection"}
+    )
+
+    :ok
+  rescue
+    error ->
+      Logger.info("Failed to register OTEL instruments", reason: inspect(error))
       :ok
   end
 

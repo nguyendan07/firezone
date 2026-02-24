@@ -6,19 +6,19 @@
 mod allocation;
 mod backoff;
 mod channel_data;
+mod crypto;
 mod index;
 mod node;
 mod stats;
 mod utils;
 
 pub use allocation::RelaySocket;
-#[allow(deprecated)] // Rust bug: `expect` doesn't seem to work on imports?
-pub use node::{Answer, Offer};
 pub use node::{
-    Client, ClientNode, Credentials, Event, HANDSHAKE_TIMEOUT, NoTurnServers, Node, Server,
-    ServerNode, Transmit, UnknownConnection,
+    Credentials, Event, IceConfig, IceRole, NoTurnServers, Node, Transmit, UnknownConnection,
 };
 pub use stats::{ConnectionStats, NodeStats};
+
+pub(crate) use crypto::CRYPTO_PROVIDER;
 
 pub fn is_wireguard(payload: &[u8]) -> bool {
     boringtun::noise::Tunn::parse_incoming_packet(payload).is_ok()

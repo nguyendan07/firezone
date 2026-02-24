@@ -12,7 +12,7 @@ defmodule Portal.Entra.Sync do
     ]
 
   alias Portal.Entra
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   @impl Oban.Worker
@@ -22,7 +22,7 @@ defmodule Portal.Entra.Sync do
       timestamp: DateTime.utc_now()
     )
 
-    case DB.get_directory(directory_id) do
+    case Database.get_directory(directory_id) do
       nil ->
         Logger.info("Entra directory not found, disabled, or account disabled, skipping",
           entra_directory_id: directory_id
@@ -48,7 +48,7 @@ defmodule Portal.Entra.Sync do
         :is_verified
       ])
 
-    {:ok, _directory} = DB.update_directory(changeset)
+    {:ok, _directory} = Database.update_directory(changeset)
   end
 
   defp sync(%Entra.Directory{} = directory) do
@@ -57,6 +57,16 @@ defmodule Portal.Entra.Sync do
 
     fetch_and_sync_all(directory, access_token, synced_at)
     delete_unsynced(directory, synced_at)
+
+    # Reconnect orphaned policies after sync (groups may have been recreated)
+    reconnected = Portal.Policy.reconnect_orphaned_policies(directory.account_id)
+
+    if reconnected > 0 do
+      Logger.info("Reconnected #{reconnected} orphaned policies after sync",
+        account_id: directory.account_id,
+        entra_directory_id: directory.id
+      )
+    end
 
     # Clear error state on successful sync completion
     update(directory, %{
@@ -92,8 +102,7 @@ defmodule Portal.Entra.Sync do
         )
 
         raise Entra.SyncError,
-          reason: "Invalid access token response",
-          cause: response,
+          error: response,
           directory_id: directory.id,
           step: :get_access_token
 
@@ -104,8 +113,7 @@ defmodule Portal.Entra.Sync do
         )
 
         raise Entra.SyncError,
-          reason: "Failed to get access token",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :get_access_token
     end
@@ -122,10 +130,74 @@ defmodule Portal.Entra.Sync do
   end
 
   defp sync_assigned_groups(directory, access_token, synced_at) do
-    service_principal_id = fetch_service_principal_id!(directory, access_token)
+    # Directory Sync app is REQUIRED - fail if not found (consent may have been revoked)
+    directory_sync_sp_id = fetch_directory_sync_service_principal!(directory, access_token)
 
-    # Stream and sync app role assignments page by page
-    Logger.debug("Streaming app role assignments", entra_directory_id: directory.id)
+    # Auth Provider app is optional (deprecated) - returns nil if not found
+    auth_provider_sp_id = fetch_auth_provider_service_principal(directory, access_token)
+
+    sync_assignments(directory, access_token, synced_at, directory_sync_sp_id)
+
+    # DEPRECATED: Also sync assignments from the Authentication app for backwards compatibility.
+    # This supports existing Entra directory sync setups that have users assigned to the
+    # Authentication app rather than the Directory Sync app.
+    # TODO: Remove this once all customers have migrated to assigning users to the
+    # Directory Sync app.
+    if auth_provider_sp_id do
+      sync_assignments(directory, access_token, synced_at, auth_provider_sp_id)
+    end
+
+    :ok
+  end
+
+  defp fetch_directory_sync_service_principal!(directory, access_token) do
+    case fetch_service_principal_id(directory, access_token, :directory_sync) do
+      {:ok, id} ->
+        id
+
+      {:error, {:not_found, _response}} ->
+        raise Entra.SyncError,
+          error:
+            {:consent_revoked,
+             "Directory Sync app service principal not found. Please re-grant admin consent."},
+          directory_id: directory.id,
+          step: :fetch_directory_sync_service_principal
+
+      {:error, {:request_failed, error}} ->
+        raise Entra.SyncError,
+          error: error,
+          directory_id: directory.id,
+          step: :fetch_directory_sync_service_principal
+    end
+  end
+
+  defp fetch_auth_provider_service_principal(directory, access_token) do
+    case fetch_service_principal_id(directory, access_token, :auth_provider) do
+      {:ok, id} ->
+        id
+
+      {:error, {:not_found, _response}} ->
+        Logger.debug("Auth Provider app service principal not found, skipping (deprecated app)",
+          entra_directory_id: directory.id
+        )
+
+        nil
+
+      {:error, {:request_failed, error}} ->
+        Logger.info("Failed to fetch Auth Provider service principal, skipping",
+          entra_directory_id: directory.id,
+          error: inspect(error)
+        )
+
+        nil
+    end
+  end
+
+  defp sync_assignments(directory, access_token, synced_at, service_principal_id) do
+    Logger.debug("Streaming app role assignments",
+      entra_directory_id: directory.id,
+      service_principal_id: service_principal_id
+    )
 
     Entra.APIClient.stream_app_role_assignments(access_token, service_principal_id)
     |> Stream.each(fn
@@ -136,8 +208,7 @@ defmodule Portal.Entra.Sync do
         )
 
         raise Entra.SyncError,
-          reason: "Failed to stream app role assignments",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_app_role_assignments
 
@@ -145,56 +216,52 @@ defmodule Portal.Entra.Sync do
         process_app_role_assignments(directory, access_token, synced_at, assignments)
     end)
     |> Stream.run()
-
-    :ok
   end
 
-  defp fetch_service_principal_id!(directory, access_token) do
-    # Get the service principal ID for the Entra Auth Provider app (not the Directory Sync app)
-    # We use app role assignments from the auth app to determine group memberships
-    config = Portal.Config.fetch_env!(:portal, Portal.Entra.AuthProvider)
+  # Fetches the service principal ID for the specified app type.
+  # Returns {:ok, id} on success, {:error, reason} on failure.
+  defp fetch_service_principal_id(directory, access_token, app_type) do
+    {config_module, app_name} =
+      case app_type do
+        :directory_sync -> {Portal.Entra.APIClient, "Directory Sync"}
+        :auth_provider -> {Portal.Entra.AuthProvider, "Authentication"}
+      end
+
+    config = Portal.Config.fetch_env!(:portal, config_module)
     client_id = config[:client_id]
 
-    Logger.debug("Getting service principal for Entra Auth Provider",
+    Logger.debug("Getting service principal for Entra #{app_name} app",
       entra_directory_id: directory.id,
       client_id: client_id
     )
 
     case Entra.APIClient.get_service_principal(access_token, client_id) do
       {:ok, %{body: %{"value" => [%{"id" => id} | _]} = body}} ->
-        Logger.debug("Found service principal",
+        Logger.debug("Found service principal for #{app_name} app",
           entra_directory_id: directory.id,
           service_principal_id: id,
           response_body: inspect(body)
         )
 
-        id
+        {:ok, id}
 
       {:ok, %{body: body} = response} ->
-        Logger.debug("Service principal not found",
+        Logger.debug("Service principal not found for #{app_name} app",
           entra_directory_id: directory.id,
           client_id: client_id,
           status: response.status,
           response_body: inspect(body)
         )
 
-        raise Entra.SyncError,
-          reason: "Service principal not found",
-          cause: response,
-          directory_id: directory.id,
-          step: :get_service_principal
+        {:error, {:not_found, response}}
 
       {:error, error} ->
-        Logger.debug("Failed to get service principal",
+        Logger.debug("Failed to get service principal for #{app_name} app",
           entra_directory_id: directory.id,
           error: inspect(error)
         )
 
-        raise Entra.SyncError,
-          reason: "Failed to get service principal",
-          cause: error,
-          directory_id: directory.id,
-          step: :get_service_principal
+        {:error, {:request_failed, error}}
     end
   end
 
@@ -227,24 +294,25 @@ defmodule Portal.Entra.Sync do
     Enum.each(assignments, fn assignment ->
       unless assignment["principalId"] do
         raise Entra.SyncError,
-          reason: "Assignment missing required 'principalId' field",
-          cause: assignment,
+          error: {:validation, "assignment missing 'principalId' field"},
           directory_id: directory_id,
           step: :process_assignment
       end
 
       unless assignment["principalType"] do
         raise Entra.SyncError,
-          reason: "Assignment missing required 'principalType' field",
-          cause: assignment,
+          error:
+            {:validation,
+             "assignment '#{assignment["principalId"]}' missing 'principalType' field"},
           directory_id: directory_id,
           step: :process_assignment
       end
 
       unless assignment["principalDisplayName"] do
         raise Entra.SyncError,
-          reason: "Assignment missing required 'principalDisplayName' field",
-          cause: assignment,
+          error:
+            {:validation,
+             "assignment '#{assignment["principalId"]}' missing 'principalDisplayName' field"},
           directory_id: directory_id,
           step: :process_assignment
       end
@@ -295,8 +363,7 @@ defmodule Portal.Entra.Sync do
 
       {:error, error} ->
         raise Entra.SyncError,
-          reason: "Failed to batch fetch users",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :batch_get_users
     end
@@ -341,8 +408,7 @@ defmodule Portal.Entra.Sync do
     |> Stream.each(fn
       {:error, error} ->
         raise Entra.SyncError,
-          reason: "Failed to stream group transitive members for #{group_name}",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_group_transitive_members
 
@@ -369,8 +435,7 @@ defmodule Portal.Entra.Sync do
     Enum.each(user_members, fn member ->
       unless member["id"] do
         raise Entra.SyncError,
-          reason: "User member missing required 'id' field in group #{group_name}",
-          cause: member,
+          error: {:validation, "user missing 'id' field in group #{group_name}"},
           directory_id: directory.id,
           step: :process_group_member
       end
@@ -405,8 +470,7 @@ defmodule Portal.Entra.Sync do
         )
 
         raise Entra.SyncError,
-          reason: "Failed to stream groups",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_groups
 
@@ -420,16 +484,14 @@ defmodule Portal.Entra.Sync do
         Enum.each(groups, fn group ->
           unless group["id"] do
             raise Entra.SyncError,
-              reason: "Group missing required 'id' field",
-              cause: group,
+              error: {:validation, "group missing 'id' field"},
               directory_id: directory.id,
               step: :process_group
           end
 
           unless group["displayName"] do
             raise Entra.SyncError,
-              reason: "Group missing required 'displayName' field",
-              cause: group,
+              error: {:validation, "group '#{group["id"]}' missing 'displayName' field"},
               directory_id: directory.id,
               step: :process_group
           end
@@ -477,8 +539,7 @@ defmodule Portal.Entra.Sync do
     |> Stream.each(fn
       {:error, error} ->
         raise Entra.SyncError,
-          reason: "Failed to stream group transitive members",
-          cause: error,
+          error: error,
           directory_id: directory.id,
           step: :stream_group_transitive_members
 
@@ -505,8 +566,7 @@ defmodule Portal.Entra.Sync do
     Enum.each(user_members, fn member ->
       unless member["id"] do
         raise Entra.SyncError,
-          reason: "User member missing required 'id' field in group #{group_name}",
-          cause: member,
+          error: {:validation, "user missing 'id' field in group #{group_name}"},
           directory_id: directory.id,
           step: :process_group_member
       end
@@ -533,7 +593,7 @@ defmodule Portal.Entra.Sync do
     issuer = issuer(directory)
     directory_id = directory.id
 
-    case DB.batch_upsert_identities(
+    case Database.batch_upsert_identities(
            account_id,
            issuer,
            directory_id,
@@ -560,7 +620,7 @@ defmodule Portal.Entra.Sync do
     directory_id = directory.id
 
     {:ok, %{upserted_groups: count}} =
-      DB.batch_upsert_groups(account_id, directory_id, synced_at, groups)
+      Database.batch_upsert_groups(account_id, directory_id, synced_at, groups)
 
     Logger.debug("Upserted #{count} groups", entra_directory_id: directory.id)
     :ok
@@ -571,7 +631,13 @@ defmodule Portal.Entra.Sync do
     directory_id = directory.id
     issuer = issuer(directory)
 
-    case DB.batch_upsert_memberships(account_id, issuer, directory_id, synced_at, memberships) do
+    case Database.batch_upsert_memberships(
+           account_id,
+           issuer,
+           directory_id,
+           synced_at,
+           memberships
+         ) do
       {:ok, %{upserted_memberships: count}} ->
         Logger.debug("Upserted #{count} memberships", entra_directory_id: directory.id)
         :ok
@@ -592,7 +658,8 @@ defmodule Portal.Entra.Sync do
     directory_id = directory.id
 
     # Delete groups that weren't synced
-    {deleted_groups_count, _} = DB.delete_unsynced_groups(account_id, directory_id, synced_at)
+    {deleted_groups_count, _} =
+      Database.delete_unsynced_groups(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced groups",
       entra_directory_id: directory.id,
@@ -601,7 +668,7 @@ defmodule Portal.Entra.Sync do
 
     # Delete identities that weren't synced
     {deleted_identities_count, _} =
-      DB.delete_unsynced_identities(account_id, directory_id, synced_at)
+      Database.delete_unsynced_identities(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced identities",
       entra_directory_id: directory.id,
@@ -610,7 +677,7 @@ defmodule Portal.Entra.Sync do
 
     # Delete memberships that weren't synced
     {deleted_memberships_count, _} =
-      DB.delete_unsynced_memberships(account_id, directory_id, synced_at)
+      Database.delete_unsynced_memberships(account_id, directory_id, synced_at)
 
     Logger.debug("Deleted unsynced group memberships",
       entra_directory_id: directory.id,
@@ -618,7 +685,8 @@ defmodule Portal.Entra.Sync do
     )
 
     # Delete actors that no longer have any identities and were created by this directory
-    {deleted_actors_count, _} = DB.delete_actors_without_identities(account_id, directory_id)
+    {deleted_actors_count, _} =
+      Database.delete_actors_without_identities(account_id, directory_id)
 
     Logger.debug("Deleted actors without identities",
       entra_directory_id: directory.id,
@@ -634,8 +702,7 @@ defmodule Portal.Entra.Sync do
     # Validate that critical fields are present
     unless user["id"] do
       raise Entra.SyncError,
-        reason: "User missing required 'id' field",
-        cause: user,
+        error: {:validation, "user missing 'id' field"},
         directory_id: directory_id,
         step: :process_user
     end
@@ -644,8 +711,7 @@ defmodule Portal.Entra.Sync do
 
     unless primary_email do
       raise Entra.SyncError,
-        reason: "User missing both 'mail' and 'userPrincipalName' fields",
-        cause: user,
+        error: {:validation, "user '#{user["id"]}' missing 'mail' field"},
         directory_id: directory_id,
         step: :process_user
     end
@@ -669,7 +735,7 @@ defmodule Portal.Entra.Sync do
     }
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -681,8 +747,8 @@ defmodule Portal.Entra.Sync do
         where: d.is_disabled == false,
         where: is_nil(a.disabled_at)
       )
-      |> Safe.unscoped()
-      |> Safe.one()
+      |> Safe.unscoped(:replica)
+      |> Safe.one(fallback_to_primary: true)
     end
 
     def update_directory(changeset) do

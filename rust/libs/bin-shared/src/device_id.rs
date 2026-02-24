@@ -25,10 +25,22 @@ pub struct DeviceId {
     pub source: Source,
 }
 
+impl DeviceId {
+    #[cfg(feature = "test")]
+    pub fn test() -> Self {
+        Self {
+            id: "FF85E1A39B9489356C5F5A23134CC80442530B76ED44925FAF787AF4B33ABA94".to_owned(),
+            source: Source::Test,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
     Disk,
     HardwareId,
+    #[cfg(feature = "test")]
+    Test,
 }
 
 /// Returns the path of the randomly-generated Firezone device ID
@@ -36,7 +48,7 @@ pub enum Source {
 /// e.g. `C:\ProgramData\dev.firezone.client/firezone-id.json` or
 /// `/var/lib/dev.firezone.client/config/firezone-id.json`.
 pub fn client_path() -> Result<PathBuf> {
-    let path = crate::known_dirs::tunnel_service_config()
+    let path = known_dirs::tunnel_service_config()
         .context("Failed to compute path for firezone-id file")?
         .join("firezone-id.json");
     Ok(path)

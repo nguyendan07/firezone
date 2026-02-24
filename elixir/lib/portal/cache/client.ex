@@ -1,5 +1,5 @@
 defmodule Portal.Cache.Client do
-  alias __MODULE__.DB
+  alias __MODULE__.Database
 
   @moduledoc """
     This cache is used in the client channel to maintain a materialized view of the client access state.
@@ -52,7 +52,7 @@ defmodule Portal.Cache.Client do
 
   """
 
-  alias Portal.{Auth, Client, Cache, Resource, Policy, Version}
+  alias Portal.{Authentication, Client, ClientSession, Cache, Resource, Policy, Version}
   require Logger
   require OpenTelemetry.Tracer
   import Ecto.UUID, only: [dump!: 1, load!: 1]
@@ -86,12 +86,18 @@ defmodule Portal.Cache.Client do
     the resource is not authorized for the client.
   """
 
-  @spec authorize_resource(t(), Portal.Client.t(), Ecto.UUID.t(), Auth.Subject.t()) ::
+  @spec authorize_resource(
+          t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Ecto.UUID.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, Cache.Cacheable.Resource.t(), Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()}
           | {:error, :not_found}
           | {:error, {:forbidden, violated_properties: [atom()]}}
 
-  def authorize_resource(cache, client, resource_id, subject) do
+  def authorize_resource(cache, client, session, resource_id, subject) do
     rid_bytes = dump!(resource_id)
 
     resource = Enum.find(cache.connectable_resources, :not_found, fn r -> r.id == rid_bytes end)
@@ -100,6 +106,7 @@ defmodule Portal.Cache.Client do
       for({_id, %{resource_id: ^rid_bytes} = p} <- cache.policies, do: p)
       |> longest_conforming_policy_for_client(
         client,
+        session,
         subject.credential.auth_provider_id,
         subject.expires_at
       )
@@ -147,23 +154,24 @@ defmodule Portal.Cache.Client do
   @spec recompute_connectable_resources(
           t() | nil,
           Portal.Client.t(),
-          Auth.Subject.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t(),
           Keyword.t()
         ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def recompute_connectable_resources(nil, client, subject) do
+  def recompute_connectable_resources(nil, client, session, subject) do
     hydrate(client, subject)
-    |> recompute_connectable_resources(client, subject)
+    |> recompute_connectable_resources(client, session, subject)
   end
 
-  def recompute_connectable_resources(cache, client, subject, opts \\ []) do
+  def recompute_connectable_resources(cache, client, session, subject, opts \\ []) do
     {toggle, _opts} = Keyword.pop(opts, :toggle, false)
 
     connectable_resources =
       cache.policies
-      |> conforming_resource_ids(client, subject.credential.auth_provider_id)
-      |> adapted_resources(cache.resources, client)
+      |> conforming_resource_ids(client, session, subject.credential.auth_provider_id)
+      |> adapted_resources(cache.resources, session)
 
     added = connectable_resources -- cache.connectable_resources
 
@@ -190,10 +198,15 @@ defmodule Portal.Cache.Client do
     yield deleted IDs, so we send those back.
   """
 
-  @spec add_membership(t(), Portal.Client.t(), Auth.Subject.t()) ::
+  @spec add_membership(
+          t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def add_membership(cache, client, subject) do
+  def add_membership(cache, client, session, subject) do
     # TODO: Optimization
     # For simplicity, we rehydrate the cache here. This could be made more efficient by calculating which
     # policies and resources we are missing, and selectively fetching, filtering, and updating the cache.
@@ -204,17 +217,23 @@ defmodule Portal.Cache.Client do
     # Use the previous connectable IDs so that the recomputation yields the difference
     cache = %{hydrate(client, subject) | connectable_resources: previously_connectable}
 
-    recompute_connectable_resources(cache, client, subject)
+    recompute_connectable_resources(cache, client, session, subject)
   end
 
   @doc """
     Removes all policies, resources, and memberships associated with the given group_id from the cache.
   """
 
-  @spec delete_membership(t(), Portal.Membership.t(), Portal.Client.t(), Auth.Subject.t()) ::
+  @spec delete_membership(
+          t(),
+          Portal.Membership.t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, [Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def delete_membership(cache, membership, client, subject) do
+  def delete_membership(cache, membership, client, session, subject) do
     gid_bytes = dump!(membership.group_id)
 
     updated_policies =
@@ -241,7 +260,7 @@ defmodule Portal.Cache.Client do
         memberships: updated_memberships
     }
 
-    recompute_connectable_resources(cache, client, subject)
+    recompute_connectable_resources(cache, client, session, subject)
   end
 
   @doc """
@@ -252,11 +271,12 @@ defmodule Portal.Cache.Client do
           t(),
           Portal.Site.t(),
           Portal.Client.t(),
-          Auth.Subject.t()
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
         ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def update_resources_with_site_name(cache, site, client, subject) do
+  def update_resources_with_site_name(cache, site, client, session, subject) do
     site = Portal.Cache.Cacheable.to_cache(site)
 
     # Get updated resources
@@ -274,11 +294,11 @@ defmodule Portal.Cache.Client do
 
     cache = %{cache | resources: resources}
 
-    toggle = Version.resource_cannot_change_sites_on_client?(client)
+    toggle = Version.resource_cannot_change_sites_on_client?(session)
 
     # For these updates we need to make sure the resource is toggled deleted then created.
     # See https://github.com/firezone/firezone/issues/9881
-    recompute_connectable_resources(cache, client, subject, toggle: toggle)
+    recompute_connectable_resources(cache, client, session, subject, toggle: toggle)
   end
 
   @doc """
@@ -289,10 +309,16 @@ defmodule Portal.Cache.Client do
     otherwise we just return the updated cache.
   """
 
-  @spec add_policy(t(), Policy.t(), Portal.Client.t(), Auth.Subject.t()) ::
+  @spec add_policy(
+          t(),
+          Policy.t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def add_policy(cache, %{resource_id: resource_id} = policy, client, subject) do
+  def add_policy(cache, %{resource_id: resource_id} = policy, client, session, subject) do
     policy = Portal.Cache.Cacheable.to_cache(policy)
 
     if Map.has_key?(cache.memberships, policy.group_id) do
@@ -305,15 +331,15 @@ defmodule Portal.Cache.Client do
           cache
         else
           # Need to fetch the resource from the DB
-          {:ok, resource} = DB.fetch_resource_by_id(resource_id, subject)
-          resource = DB.preload_site(resource)
+          {:ok, resource} = Database.fetch_resource_by_id(resource_id, subject)
+          resource = Database.preload_site(resource)
 
           resource = Portal.Cache.Cacheable.to_cache(resource)
 
           %{cache | resources: Map.put(cache.resources, resource.id, resource)}
         end
 
-      recompute_connectable_resources(cache, client, subject)
+      recompute_connectable_resources(cache, client, session, subject)
     else
       {:ok, [], [], cache}
     end
@@ -336,9 +362,15 @@ defmodule Portal.Cache.Client do
     Removes a policy from the cache. If we can't find another policy granting access to the resource,
     we return the deleted resource ID.
   """
-  @spec delete_policy(t(), Policy.t(), Portal.Client.t(), Auth.Subject.t()) ::
+  @spec delete_policy(
+          t(),
+          Policy.t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
-  def delete_policy(cache, policy, client, subject) do
+  def delete_policy(cache, policy, client, session, subject) do
     policy = Portal.Cache.Cacheable.to_cache(policy)
 
     if Map.has_key?(cache.policies, policy.id) do
@@ -359,7 +391,7 @@ defmodule Portal.Cache.Client do
 
       cache = %{cache | resources: resources}
 
-      recompute_connectable_resources(cache, client, subject)
+      recompute_connectable_resources(cache, client, session, subject)
     else
       {:ok, [], [], cache}
     end
@@ -378,26 +410,41 @@ defmodule Portal.Cache.Client do
     we return only the updated cache.
   """
 
-  @spec update_resource(t(), Portal.Resource.t(), Portal.Client.t(), Auth.Subject.t()) ::
+  @spec update_resource(
+          t(),
+          Portal.Resource.t(),
+          Portal.Client.t(),
+          Portal.ClientSession.t(),
+          Authentication.Subject.t()
+        ) ::
           {:ok, [Portal.Cache.Cacheable.Resource.t()], [Ecto.UUID.t()], t()}
 
-  def update_resource(cache, %Portal.Resource{} = changed_resource, client, subject) do
+  def update_resource(cache, %Portal.Resource{} = changed_resource, client, session, subject) do
     resource = Portal.Cache.Cacheable.to_cache(changed_resource)
 
     if Map.has_key?(cache.resources, resource.id) do
       cached_resource = Map.get(cache.resources, resource.id)
-      site_id = Ecto.UUID.dump!(changed_resource.site_id)
-      site_changed? = cached_resource.site.id != site_id
+      site_id_bytes = if changed_resource.site_id, do: Ecto.UUID.dump!(changed_resource.site_id)
 
-      # We need to hydrate the new site name if the site has changed
-      site =
-        if site_changed? do
-          case DB.get_site_by_id(site_id, subject) do
-            %Portal.Site{} = site -> Portal.Cache.Cacheable.to_cache(site)
-            nil -> nil
-          end
-        else
-          cached_resource.site
+      # Check if we can reuse the cached site or need to fetch from DB.
+      # site_id can be nil when site is deleted (ON DELETE SET NULL).
+      # cached site can be nil if hydration failed to load it.
+      {site, site_changed?} =
+        cond do
+          is_nil(site_id_bytes) ->
+            {nil, not is_nil(cached_resource.site)}
+
+          cached_resource.site && cached_resource.site.id == site_id_bytes ->
+            {cached_resource.site, false}
+
+          true ->
+            site =
+              case Database.get_site_by_id(site_id_bytes, subject) do
+                %Portal.Site{} = site -> Portal.Cache.Cacheable.to_cache(site)
+                nil -> nil
+              end
+
+            {site, not is_nil(cached_resource.site)}
         end
 
       resource = %{resource | site: site}
@@ -407,9 +454,9 @@ defmodule Portal.Cache.Client do
       cache = %{cache | resources: resources}
 
       # Determine if we need to toggle the resource (delete then add) based on site change and client version
-      toggle = Version.resource_cannot_change_sites_on_client?(client) and site_changed?
+      toggle = Version.resource_cannot_change_sites_on_client?(session) and site_changed?
 
-      recompute_connectable_resources(cache, client, subject, toggle: toggle)
+      recompute_connectable_resources(cache, client, session, subject, toggle: toggle)
     else
       {:ok, [], [], cache}
     end
@@ -422,7 +469,7 @@ defmodule Portal.Cache.Client do
 
     OpenTelemetry.Tracer.with_span "Cache.Cacheable.hydrate", attributes: attributes do
       {_policies, cache} =
-        DB.all_policies_for_actor_id!(client.actor_id, subject)
+        Database.all_policies_for_actor_id!(client.actor_id, subject)
         |> Enum.map_reduce(%{policies: %{}, resources: %{}}, fn policy, cache ->
           resource = Cache.Cacheable.to_cache(policy.resource)
           resources = Map.put(cache.resources, resource.id, resource)
@@ -433,7 +480,7 @@ defmodule Portal.Cache.Client do
         end)
 
       memberships =
-        for membership <- DB.all_memberships_for_actor_id!(client.actor_id, subject),
+        for membership <- Database.all_memberships_for_actor_id!(client.actor_id, subject),
             into: %{} do
           mid = if membership.id, do: dump!(membership.id), else: nil
           {dump!(membership.group_id), mid}
@@ -445,28 +492,29 @@ defmodule Portal.Cache.Client do
     end
   end
 
-  defp adapted_resources(conforming_resource_ids, resources, client) do
+  defp adapted_resources(conforming_resource_ids, resources, session) do
     for id <- conforming_resource_ids,
-        adapted_resource = Map.get(resources, id) |> adapt(client),
+        adapted_resource = Map.get(resources, id) |> adapt(session),
         not is_nil(adapted_resource),
         not is_nil(adapted_resource.site) do
       adapted_resource
     end
   end
 
-  defp adapt(resource, client) do
-    Resource.adapt_resource_for_version(resource, client.last_seen_version)
+  defp adapt(resource, session) do
+    Resource.adapt_resource_for_version(resource, session.version)
   end
 
-  defp conforming_resource_ids(policies, client, auth_provider_id) when is_map(policies) do
+  defp conforming_resource_ids(policies, client, session, auth_provider_id)
+       when is_map(policies) do
     policies
     |> Map.values()
-    |> conforming_resource_ids(client, auth_provider_id)
+    |> conforming_resource_ids(client, session, auth_provider_id)
   end
 
-  defp conforming_resource_ids(policies, client, auth_provider_id) do
+  defp conforming_resource_ids(policies, client, session, auth_provider_id) do
     policies
-    |> filter_by_conforming_policies_for_client(client, auth_provider_id)
+    |> filter_by_conforming_policies_for_client(client, session, auth_provider_id)
     |> Enum.map(& &1.resource_id)
     |> Enum.uniq()
   end
@@ -476,11 +524,12 @@ defmodule Portal.Cache.Client do
   defp filter_by_conforming_policies_for_client(
          policies,
          %Client{} = client,
+         %ClientSession{} = session,
          auth_provider_id
        ) do
     Enum.filter(policies, fn policy ->
       policy.conditions
-      |> Portal.Policies.Evaluator.ensure_conforms(client, auth_provider_id)
+      |> Portal.Policies.Evaluator.ensure_conforms(client, session, auth_provider_id)
       |> case do
         {:ok, _expires_at} -> true
         {:error, _violated_properties} -> false
@@ -490,10 +539,16 @@ defmodule Portal.Cache.Client do
 
   @infinity ~U[9999-12-31 23:59:59.999999Z]
 
-  defp longest_conforming_policy_for_client(policies, client, auth_provider_id, expires_at) do
+  defp longest_conforming_policy_for_client(
+         policies,
+         client,
+         session,
+         auth_provider_id,
+         expires_at
+       ) do
     policies
     |> Enum.reduce(%{failed: [], succeeded: []}, fn policy, acc ->
-      case ensure_client_conforms_policy_conditions(policy, client, auth_provider_id) do
+      case ensure_client_conforms_policy_conditions(policy, client, session, auth_provider_id) do
         {:ok, expires_at} ->
           %{acc | succeeded: [{expires_at, policy} | acc.succeeded]}
 
@@ -516,11 +571,13 @@ defmodule Portal.Cache.Client do
   defp ensure_client_conforms_policy_conditions(
          %Portal.Policy{} = policy,
          %Portal.Client{} = client,
+         %ClientSession{} = session,
          auth_provider_id
        ) do
     ensure_client_conforms_policy_conditions(
       Cache.Cacheable.to_cache(policy),
       client,
+      session,
       auth_provider_id
     )
   end
@@ -528,9 +585,15 @@ defmodule Portal.Cache.Client do
   defp ensure_client_conforms_policy_conditions(
          %Cache.Cacheable.Policy{} = policy,
          %Portal.Client{} = client,
+         %ClientSession{} = session,
          auth_provider_id
        ) do
-    case Portal.Policies.Evaluator.ensure_conforms(policy.conditions, client, auth_provider_id) do
+    case Portal.Policies.Evaluator.ensure_conforms(
+           policy.conditions,
+           client,
+           session,
+           auth_provider_id
+         ) do
       {:ok, expires_at} ->
         {:ok, expires_at}
 
@@ -554,7 +617,7 @@ defmodule Portal.Cache.Client do
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
 
@@ -584,7 +647,7 @@ defmodule Portal.Cache.Client do
              ag.name == "Everyone")
       )
       |> preload(resource: :site)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.all()
     end
 
@@ -592,7 +655,7 @@ defmodule Portal.Cache.Client do
       # Get real memberships
       memberships =
         from(m in Portal.Membership, where: m.actor_id == ^actor_id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.all()
         |> case do
           {:error, :unauthorized} -> []
@@ -609,7 +672,7 @@ defmodule Portal.Cache.Client do
                 g.name == "Everyone" and
                 g.account_id == ^subject.account.id
           )
-          |> Safe.scoped(subject)
+          |> Safe.scoped(subject, :replica)
           |> Safe.one()
 
         # Append a synthetic membership for the Everyone group
@@ -631,7 +694,7 @@ defmodule Portal.Cache.Client do
     def fetch_resource_by_id(id, subject) do
       result =
         from(r in Portal.Resource, where: r.id == ^id)
-        |> Safe.scoped(subject)
+        |> Safe.scoped(subject, :replica)
         |> Safe.one()
 
       case result do
@@ -642,7 +705,7 @@ defmodule Portal.Cache.Client do
     end
 
     def preload_site(resource) do
-      Safe.preload(resource, :site)
+      Safe.preload(resource, :site, :replica)
     end
 
     def get_site(nil, _subject), do: nil
@@ -651,7 +714,7 @@ defmodule Portal.Cache.Client do
       id = Ecto.UUID.load!(site.id)
 
       from(s in Portal.Site, where: s.id == ^id)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.one()
     end
 
@@ -659,7 +722,7 @@ defmodule Portal.Cache.Client do
       id = Ecto.UUID.load!(site_id)
 
       from(s in Portal.Site, where: s.id == ^id)
-      |> Safe.scoped(subject)
+      |> Safe.scoped(subject, :replica)
       |> Safe.one()
     end
   end

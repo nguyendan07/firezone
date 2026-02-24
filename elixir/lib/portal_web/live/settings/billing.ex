@@ -1,16 +1,16 @@
 defmodule PortalWeb.Settings.Billing do
   use PortalWeb, :live_view
   alias Portal.Billing
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   def mount(_params, _session, socket) do
     if Billing.account_provisioned?(socket.assigns.account) do
-      admins_count = DB.count_account_admin_users_for_account(socket.assigns.account)
-      service_accounts_count = DB.count_service_accounts_for_account(socket.assigns.account)
-      users_count = DB.count_users_for_account(socket.assigns.account)
-      active_users_count = DB.count_1m_active_users_for_account(socket.assigns.account)
-      sites_count = DB.count_groups_for_account(socket.assigns.account)
+      admins_count = Database.count_account_admin_users_for_account(socket.assigns.account)
+      service_accounts_count = Database.count_service_accounts_for_account(socket.assigns.account)
+      users_count = Database.count_users_for_account(socket.assigns.account)
+      active_users_count = Database.count_1m_active_users_for_account(socket.assigns.account)
+      sites_count = Database.count_groups_for_account(socket.assigns.account)
 
       socket =
         assign(socket,
@@ -288,7 +288,7 @@ defmodule PortalWeb.Settings.Billing do
     end
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Account
@@ -301,7 +301,7 @@ defmodule PortalWeb.Settings.Billing do
         where: is_nil(a.disabled_at),
         where: a.type == :account_admin_user
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -311,7 +311,7 @@ defmodule PortalWeb.Settings.Billing do
         where: is_nil(a.disabled_at),
         where: a.type == :service_account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -321,14 +321,18 @@ defmodule PortalWeb.Settings.Billing do
         where: is_nil(a.disabled_at),
         where: a.type in [:account_admin_user, :account_user]
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
     def count_1m_active_users_for_account(%Account{} = account) do
       from(c in Client, as: :clients)
       |> where([clients: c], c.account_id == ^account.id)
-      |> where([clients: c], c.last_seen_at > ago(1, "month"))
+      |> join(:inner, [clients: c], s in Portal.ClientSession,
+        on: s.client_id == c.id and s.account_id == c.account_id,
+        as: :session
+      )
+      |> where([session: s], s.inserted_at > ago(1, "month"))
       |> join(:inner, [clients: c], a in Actor,
         on: c.actor_id == a.id and c.account_id == a.account_id,
         as: :actor
@@ -337,7 +341,7 @@ defmodule PortalWeb.Settings.Billing do
       |> where([actor: a], a.type in [:account_user, :account_admin_user])
       |> select([clients: c], c.actor_id)
       |> distinct(true)
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
 
@@ -346,7 +350,7 @@ defmodule PortalWeb.Settings.Billing do
         where: g.account_id == ^account.id,
         where: g.managed_by == :account
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.aggregate(:count)
     end
   end

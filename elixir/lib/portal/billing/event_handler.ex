@@ -6,7 +6,7 @@ defmodule Portal.Billing.EventHandler do
   alias Portal.Accounts
   alias Portal.Billing
   alias Portal.Billing.Stripe.ProcessedEvents
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   require Logger
 
   @subscription_events ["created", "resumed"]
@@ -18,7 +18,7 @@ defmodule Portal.Billing.EventHandler do
   defp process_event_with_lock(event) do
     customer_id = extract_customer_id(event)
 
-    DB.with_customer_lock(customer_id, fn ->
+    Database.with_customer_lock(customer_id, fn ->
       process_event(event, customer_id)
     end)
   end
@@ -230,8 +230,10 @@ defmodule Portal.Billing.EventHandler do
   defp handle_subscription_active(subscription_data) do
     customer_id = Map.get(subscription_data, "customer")
 
-    with {:ok, attrs} <- build_subscription_update_attrs(subscription_data) do
-      update_account(customer_id, attrs)
+    with {:ok, attrs} <- build_subscription_update_attrs(subscription_data),
+         {:ok, account} <- update_account_and_return(customer_id, attrs),
+         {:ok, _account} <- Billing.evaluate_account_limits(account) do
+      :ok
     else
       {:error, reason} ->
         Logger.error("Failed to build subscription update attrs",
@@ -262,10 +264,10 @@ defmodule Portal.Billing.EventHandler do
       "metadata" => subscription_metadata,
       "trial_end" => trial_end,
       "status" => status,
-      "items" => %{"data" => [%{"price" => %{"product" => product_id}, "quantity" => quantity}]}
+      "items" => %{"data" => items}
     } = subscription_data
 
-    with {:ok, product_info} <- Billing.fetch_product(product_id) do
+    with {:ok, product_info, quantity} <- find_plan_product(items) do
       %{"name" => product_name, "metadata" => product_metadata} = product_info
 
       subscription_trialing? = not is_nil(trial_end) and status in ["trialing", "paused"]
@@ -287,16 +289,68 @@ defmodule Portal.Billing.EventHandler do
         |> Map.put(:disabled_reason, nil)
 
       {:ok, attrs}
-    else
-      {:error, :retry_later} ->
-        {:error, :fetch_product_failed}
     end
+  end
+
+  defp find_plan_product(items) do
+    plan_ids = Billing.plan_product_ids()
+
+    {plan_items, other_items} =
+      Enum.split_with(items, &(get_in(&1, ["price", "product"]) in plan_ids))
+
+    log_non_plan_items(other_items)
+
+    case plan_items do
+      [%{"price" => %{"product" => product_id}, "quantity" => quantity}] ->
+        with {:ok, info} <- Billing.fetch_product(product_id), do: {:ok, info, quantity}
+
+      [] ->
+        {:error, :no_plan_product}
+
+      multiple ->
+        ids = Enum.map(multiple, &get_in(&1, ["price", "product"]))
+        Logger.error("Multiple plan products found in subscription", product_ids: inspect(ids))
+        {:error, :multiple_plan_products}
+    end
+  end
+
+  defp log_non_plan_items(items) do
+    adhoc_id = Billing.adhoc_device_product_id()
+
+    Enum.each(items, fn %{"price" => %{"product" => product_id}} = item ->
+      if product_id == adhoc_id do
+        Logger.info("Ignoring adhoc device product in subscription",
+          product_id: product_id,
+          item_id: item["id"]
+        )
+      else
+        Logger.warning("Ignoring unrecognized product in subscription",
+          product_id: product_id,
+          item_id: item["id"]
+        )
+      end
+    end)
   end
 
   defp update_account(customer_id, attrs) do
     case update_account_by_stripe_customer_id(customer_id, attrs) do
       {:ok, _account} ->
         :ok
+
+      {:error, reason} ->
+        Logger.error("Failed to update account on Stripe subscription event",
+          customer_id: customer_id,
+          reason: inspect(reason)
+        )
+
+        {:error, reason}
+    end
+  end
+
+  defp update_account_and_return(customer_id, attrs) do
+    case update_account_by_stripe_customer_id(customer_id, attrs) do
+      {:ok, account} ->
+        {:ok, account}
 
       {:error, reason} ->
         Logger.error("Failed to update account on Stripe subscription event",
@@ -408,7 +462,7 @@ defmodule Portal.Billing.EventHandler do
   defp generate_unique_slug do
     slug_candidate = Portal.NameGenerator.generate_slug()
 
-    if DB.slug_exists?(slug_candidate) do
+    if Database.slug_exists?(slug_candidate) do
       generate_unique_slug()
     else
       slug_candidate
@@ -418,7 +472,7 @@ defmodule Portal.Billing.EventHandler do
   # TODO: BILLING OVERHAUL
   # The DB operations should be wrapped in a transaction to ensure atomicity
   defp create_account_with_defaults(attrs, metadata, account_email) do
-    with {:ok, account} <- attrs |> create_account_changeset() |> DB.insert(),
+    with {:ok, account} <- attrs |> create_account_changeset() |> Database.insert(),
          {:ok, account} <- Billing.update_stripe_customer(account),
          {:ok, account} <- Portal.Billing.create_subscription(account),
          :ok <- setup_account_defaults(account, metadata, account_email) do
@@ -429,16 +483,16 @@ defmodule Portal.Billing.EventHandler do
   defp setup_account_defaults(account, metadata, account_email) do
     # Create default groups and resources
     changeset = create_everyone_group_changeset(account)
-    {:ok, _everyone_group} = DB.insert(changeset)
+    {:ok, _everyone_group} = Database.insert(changeset)
     changeset = create_site_changeset(account, %{name: "Default Site"})
-    {:ok, _site} = DB.insert_site(changeset)
+    {:ok, _site} = Database.insert_site(changeset)
     changeset = create_internet_site_changeset(account)
-    {:ok, internet_site} = DB.insert_site(changeset)
+    {:ok, internet_site} = Database.insert_site(changeset)
     changeset = create_internet_resource_changeset(account, internet_site)
-    {:ok, _resource} = DB.insert(changeset)
+    {:ok, _resource} = Database.insert(changeset)
 
     # Create email provider
-    {:ok, _email_provider} = DB.create_email_provider(account)
+    {:ok, _email_provider} = Database.create_email_provider(account)
 
     # Create admin user
     email = metadata["account_admin_email"] || account_email
@@ -446,7 +500,7 @@ defmodule Portal.Billing.EventHandler do
     family_name = metadata["account_owner_last_name"]
     name = "#{given_name} #{family_name}"
     changeset = create_admin_changeset(account, email, name)
-    {:ok, _actor} = DB.insert(changeset)
+    {:ok, _actor} = Database.insert(changeset)
 
     :ok
   end
@@ -514,7 +568,7 @@ defmodule Portal.Billing.EventHandler do
   # Account Updates
   defp update_account_by_stripe_customer_id(customer_id, attrs) do
     with {:ok, account_id} <- Billing.fetch_customer_account_id(customer_id) do
-      DB.update_account_by_id(account_id, attrs)
+      Database.update_account_by_id(account_id, attrs)
     end
   end
 
@@ -588,7 +642,7 @@ defmodule Portal.Billing.EventHandler do
     |> validate_required([:name, :legal_name, :slug])
   end
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     import Ecto.Changeset
 

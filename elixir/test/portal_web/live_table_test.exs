@@ -340,6 +340,16 @@ defmodule PortalWeb.LiveTableTest do
       enabled_button = html |> Floki.parse_fragment!() |> Floki.find("nav button:not([disabled])")
       assert "prev_cursor" in Floki.attribute(enabled_button, "phx-value-cursor")
     end
+
+    test "does not render pagination when table is empty", %{assigns: assigns} do
+      assigns = %{assigns | rows: []}
+      html = render_component(&live_table/1, assigns)
+
+      # Should not find any nav element for pagination
+      assert html
+             |> Floki.parse_fragment!()
+             |> Floki.find("nav[aria-label='Table navigation']") == []
+    end
   end
 
   describe "assign_live_table/3" do
@@ -671,12 +681,23 @@ defmodule PortalWeb.LiveTableTest do
     test "updates query parameters with new filter and resets the cursor", %{socket: socket} do
       assert handle_live_table_event(
                "filter",
-               %{"table_id" => "table-id", "table-id" => %{"name" => "foo"}},
+               %{"table_id" => "table-id", "table-id" => %{"name" => "foo", "email" => "bar"}},
                socket
              )
              |> fetch_patched_query_params!() == %{
                "table-id_filter[email]" => "bar",
                "table-id_filter[name]" => "foo",
+               "table-id_order_by" => "actors:asc:name"
+             }
+    end
+
+    test "clears all filter parameters when filter is empty", %{socket: socket} do
+      assert handle_live_table_event(
+               "filter",
+               %{"table_id" => "table-id"},
+               socket
+             )
+             |> fetch_patched_query_params!() == %{
                "table-id_order_by" => "actors:asc:name"
              }
     end

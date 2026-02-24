@@ -76,14 +76,14 @@ jobs:
       matrix:
         include:
           # mark:next-gateway-version
-          - release_name: gateway-1.4.20
+          - release_name: gateway-1.5.1
             config_name: release-drafter-gateway.yml
           # mark:next-headless-version
           - release_name: headless-client-1.5.7
             config_name: release-drafter-headless-client.yml
 
     steps:
-      - uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5 # v6.1.0
+      - uses: release-drafter/release-drafter@6db134d15f3909ccc9eefd369f02bd1e9cffdf97 # v6.2.0
         if: "${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'main' }}"
         id: update-release-draft
         with:
@@ -119,7 +119,7 @@ jobs:
       ARTIFACT_PATH: ${{ matrix.artifact }}_${{ matrix.version }}_${{ matrix.arch }}.exe
       RELEASE_NAME: ${{ matrix.release_name }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.sha }}
           fetch-depth: 0 # Required to make `setup-rust-target-cache` effective.
@@ -210,9 +210,9 @@ jobs:
             artifact: firezone-gateway
             image_name: gateway
             # mark:next-gateway-version
-            release_name: gateway-1.4.20
+            release_name: gateway-1.5.1
             # mark:next-gateway-version
-            version: 1.4.20
+            version: 1.5.1
           - package: http-test-server
             artifact: http-test-server
             image_name: http-test-server
@@ -226,7 +226,7 @@ jobs:
       gateway_image: ${{ steps.image-name.outputs.gateway_image }}
       http_test_server_image: ${{ steps.image-name.outputs.http-test-server_image }}
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.sha }}
           fetch-depth: 0 # Required to make `setup-rust-target-cache` effective.
@@ -269,17 +269,8 @@ jobs:
 
           # Used for release artifact
           cp ${{ matrix.name.package }} "$BINARY_DEST_PATH"
-      # For pushing built images to Google Cloud Storage
-      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        if: ${{ inputs.profile == 'release' && matrix.stage == 'release' && matrix.name.artifact == 'firezone-relay' }}
-        with:
-          token_format: access_token
-          workload_identity_provider: "projects/85623168602/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
-          service_account: "github-account@firezone-staging.iam.gserviceaccount.com"
-          export_environment_variables: true
-          create_credentials_file: true
-      - name: Copy relay to Cloud Storage
-        if: ${{ inputs.profile == 'release' && matrix.stage == 'release' && matrix.name.artifact == 'firezone-relay' }}
+      - name: Copy binary to Azure Blob Storage
+        if: ${{ inputs.profile == 'release' && matrix.stage == 'release' && (matrix.name.artifact == 'firezone-relay' || matrix.name.artifact == 'firezone-gateway') }}
         run: |
           set -e
 
@@ -353,7 +344,7 @@ jobs:
       - name: Build Docker images (read-only cache)
         if: ${{ github.ref != 'refs/heads/main' }}
         id: build_ro
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           platforms: ${{ matrix.arch.platform }}
           build-args: |
@@ -366,11 +357,13 @@ jobs:
           # no cache-to -> read-only
           target: ${{ matrix.stage }}
           outputs: type=image,name=${{ steps.login.outputs.registry }}/firezone/${{ matrix.image_prefix && format('{0}/', matrix.image_prefix) || '' }}${{ matrix.name.image_name }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.sha }}
       # main: read/write cache
       - name: Build Docker images (read/write cache)
         if: ${{ github.ref == 'refs/heads/main' }}
         id: build_rw
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           platforms: ${{ matrix.arch.platform }}
           build-args: |
@@ -384,6 +377,8 @@ jobs:
             type=gha,scope=${{ matrix.name.image_name }}:${{ env.CACHE_TAG }},mode=max,ignore-error=true
           target: ${{ matrix.stage }}
           outputs: type=image,name=${{ steps.login.outputs.registry }}/firezone/${{ matrix.image_prefix && format('{0}/', matrix.image_prefix) || '' }}${{ matrix.name.image_name }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.sha }}
       - name: Export digest
         run: |
           mkdir -p /tmp/digests/${{ matrix.name.image_name }}
@@ -421,13 +416,13 @@ jobs:
           - name: relay
           - name: gateway
             # mark:next-gateway-version
-            version: 1.4.20
+            version: 1.5.1
           - name: client
             # mark:next-client-version
             version: 1.0.6
           - name: http-test-server
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.sha }}
       - uses: ./.github/actions/ghcr-docker-login
@@ -462,7 +457,9 @@ jobs:
           echo "Sources: $sources"
 
           # shellcheck disable=SC2086 # $tags and $sources must be split by whitespace
-          docker buildx imagetools create $tags $sources
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=${{ inputs.sha }}" \
+            $tags $sources
           docker buildx imagetools inspect "${{ steps.login.outputs.registry }}/firezone/${{ matrix.image_prefix && format('{0}/', matrix.image_prefix) || '' }}${{ matrix.image.name }}"
 
   regenerate-apt-index:

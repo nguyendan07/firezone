@@ -6,13 +6,12 @@ defmodule PortalWeb.UserpassController do
 
   alias Portal.Userpass
 
-  alias __MODULE__.DB
+  alias __MODULE__.Database
   alias PortalWeb.Session.Redirector
 
   require Logger
 
-  action_fallback PortalWeb.FallbackController
-
+  @spec sign_in(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def sign_in(
         conn,
         %{
@@ -25,8 +24,9 @@ defmodule PortalWeb.UserpassController do
     password = userpass["secret"]
     context_type = context_type(params)
 
-    with %Portal.Account{} = account <- DB.get_account_by_id_or_slug(account_id_or_slug),
+    with %Portal.Account{} = account <- Database.get_account_by_id_or_slug(account_id_or_slug),
          %Userpass.AuthProvider{} = provider <- fetch_provider(account, auth_provider_id),
+         false <- client_sign_in_restricted?(account, context_type),
          %Portal.Actor{} = actor <- fetch_actor(account, email),
          :ok <- check_admin(actor, context_type),
          {:ok, actor, _expires_at} <- verify_password(actor, password, conn),
@@ -58,15 +58,26 @@ defmodule PortalWeb.UserpassController do
   end
 
   defp check_admin(%Portal.Actor{type: :account_admin_user}, _context_type), do: :ok
-  defp check_admin(%Portal.Actor{type: :account_user}, :client), do: :ok
+
+  defp check_admin(%Portal.Actor{type: :account_user}, t)
+       when t in [:gui_client, :headless_client],
+       do: :ok
+
   defp check_admin(_actor, _context_type), do: {:error, :not_admin}
+
+  defp client_sign_in_restricted?(account, context_type)
+       when context_type in [:gui_client, :headless_client] do
+    Portal.Billing.client_sign_in_restricted?(account)
+  end
+
+  defp client_sign_in_restricted?(_account, _context_type), do: false
 
   defp create_session_or_token(conn, actor, provider, params) do
     user_agent = conn.assigns[:user_agent]
     remote_ip = conn.remote_ip
     type = context_type(params)
     headers = conn.req_headers
-    context = Portal.Auth.Context.build(remote_ip, user_agent, headers, type)
+    context = Portal.Authentication.Context.build(remote_ip, user_agent, headers, type)
 
     # Get the provider schema module to access default values
     schema = provider.__struct__
@@ -74,7 +85,10 @@ defmodule PortalWeb.UserpassController do
     # Determine session lifetime based on context type
     session_lifetime_secs =
       case type do
-        :client ->
+        :gui_client ->
+          provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
+
+        :headless_client ->
           provider.client_session_lifetime_secs || schema.default_client_session_lifetime_secs()
 
         :portal ->
@@ -85,14 +99,14 @@ defmodule PortalWeb.UserpassController do
 
     case type do
       :portal ->
-        Portal.Auth.create_portal_session(
+        Portal.Authentication.create_portal_session(
           actor,
           provider.id,
           context,
           expires_at
         )
 
-      :client ->
+      :gui_client ->
         attrs = %{
           type: :client,
           secret_nonce: params["nonce"],
@@ -103,7 +117,20 @@ defmodule PortalWeb.UserpassController do
           expires_at: expires_at
         }
 
-        Portal.Auth.create_gui_client_token(attrs)
+        Portal.Authentication.create_gui_client_token(attrs)
+
+      :headless_client ->
+        attrs = %{
+          type: :client,
+          secret_nonce: "",
+          secret_fragment: Portal.Crypto.random_token(32, encoder: :hex32),
+          account_id: actor.account_id,
+          actor_id: actor.id,
+          auth_provider_id: provider.id,
+          expires_at: expires_at
+        }
+
+        Portal.Authentication.create_gui_client_token(attrs)
     end
   end
 
@@ -115,10 +142,10 @@ defmodule PortalWeb.UserpassController do
     |> Redirector.portal_signed_in(account, params)
   end
 
-  # Context: :client
+  # Context: :gui_client
   # Store a cookie and redirect to client handler which redirects to the final URL based on platform
-  defp signed_in(conn, :client, account, actor, token, params) do
-    Redirector.client_signed_in(
+  defp signed_in(conn, :gui_client, account, actor, token, params) do
+    Redirector.gui_client_signed_in(
       conn,
       account,
       actor.name,
@@ -128,12 +155,24 @@ defmodule PortalWeb.UserpassController do
     )
   end
 
+  # Context: :headless_client
+  # Show the token to the user to copy manually
+  defp signed_in(conn, :headless_client, account, actor, token, params) do
+    Redirector.headless_client_signed_in(
+      conn,
+      account,
+      actor.name,
+      token,
+      params["state"]
+    )
+  end
+
   defp fetch_provider(account, id) do
-    DB.get_provider(account, id)
+    Database.get_provider(account, id)
   end
 
   defp fetch_actor(account, email) do
-    DB.get_actor_by_email(account, email)
+    Database.get_actor_by_email(account, email)
   end
 
   defp handle_error(conn, {:error, :invalid_secret}, _params) do
@@ -144,6 +183,15 @@ defmodule PortalWeb.UserpassController do
 
   defp handle_error(conn, {:error, :not_admin}, params) do
     error = "This action requires admin privileges."
+    path = ~p"/#{params["account_id_or_slug"]}"
+    redirect_for_error(conn, error, path)
+  end
+
+  defp handle_error(conn, true, params) do
+    error =
+      "This account is temporarily suspended from client authentication " <>
+        "due to exceeding billing limits. Please contact your administrator to add more seats."
+
     path = ~p"/#{params["account_id_or_slug"]}"
     redirect_for_error(conn, error, path)
   end
@@ -168,10 +216,12 @@ defmodule PortalWeb.UserpassController do
     |> halt()
   end
 
-  defp context_type(%{"as" => "client"}), do: :client
+  defp context_type(%{"as" => "client"}), do: :gui_client
+  defp context_type(%{"as" => "gui-client"}), do: :gui_client
+  defp context_type(%{"as" => "headless-client"}), do: :headless_client
   defp context_type(_), do: :portal
 
-  defmodule DB do
+  defmodule Database do
     import Ecto.Query
     alias Portal.Safe
     alias Portal.Account
@@ -183,14 +233,14 @@ defmodule PortalWeb.UserpassController do
           do: from(a in Account, where: a.id == ^id_or_slug or a.slug == ^id_or_slug),
           else: from(a in Account, where: a.slug == ^id_or_slug)
 
-      query |> Safe.unscoped() |> Safe.one()
+      query |> Safe.unscoped(:replica) |> Safe.one()
     end
 
     def get_provider(account, id) do
       from(p in Userpass.AuthProvider,
         where: p.account_id == ^account.id and p.id == ^id and not p.is_disabled
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
     end
 
@@ -198,7 +248,7 @@ defmodule PortalWeb.UserpassController do
       from(a in Portal.Actor,
         where: a.email == ^email and a.account_id == ^account.id and is_nil(a.disabled_at)
       )
-      |> Safe.unscoped()
+      |> Safe.unscoped(:replica)
       |> Safe.one()
     end
   end

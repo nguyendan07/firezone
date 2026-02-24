@@ -19,6 +19,10 @@ if config_env() == :prod do
            {:ssl, env_var_to_config!(:database_ssl)},
            {:parameters, env_var_to_config!(:database_parameters)}
          ] ++
+           if(env_var_to_config!(:database_socket_options) != [],
+             do: [{:socket_options, env_var_to_config!(:database_socket_options)}],
+             else: []
+           ) ++
            if(env_var_to_config(:database_password),
              do: [{:password, env_var_to_config!(:database_password)}],
              else: []
@@ -28,9 +32,30 @@ if config_env() == :prod do
              else: [{:hostname, env_var_to_config!(:database_host)}]
            )
 
+  config :portal,
+         Portal.Repo.Replica,
+         [
+           {:database, env_var_to_config!(:database_name)},
+           {:username, env_var_to_config!(:database_user)},
+           {:port, env_var_to_config!(:database_port)},
+           {:pool_size, env_var_to_config!(:database_pool_size)},
+           {:queue_target, env_var_to_config!(:database_queue_target)},
+           {:queue_interval, env_var_to_config!(:database_queue_interval)},
+           {:ssl, env_var_to_config!(:database_ssl)},
+           {:parameters, env_var_to_config!(:database_parameters)},
+           {:hostname, env_var_to_config!(:database_host_replica)}
+         ] ++
+           if(env_var_to_config!(:database_socket_options) != [],
+             do: [{:socket_options, env_var_to_config!(:database_socket_options)}],
+             else: []
+           ) ++
+           if(env_var_to_config(:database_password),
+             do: [{:password, env_var_to_config!(:database_password)}],
+             else: []
+           )
+
   config :portal, Portal.ChangeLogs.ReplicationConnection,
-    # TODO: Use a dedicated node for Change Log replication
-    enabled: env_var_to_config!(:background_jobs_enabled),
+    enabled: env_var_to_config!(:change_logs_replication_enabled),
     replication_slot_name: env_var_to_config!(:database_change_logs_replication_slot_name),
     publication_name: env_var_to_config!(:database_change_logs_publication_name),
     connection_opts:
@@ -41,18 +66,22 @@ if config_env() == :prod do
         username: env_var_to_config!(:database_user),
         database: env_var_to_config!(:database_name)
       ] ++
+        if(env_var_to_config!(:database_socket_options) != [],
+          do: [{:socket_options, env_var_to_config!(:database_socket_options)}],
+          else: []
+        ) ++
         if(env_var_to_config(:database_password),
           do: [{:password, env_var_to_config!(:database_password)}],
           else: []
         ) ++
         if(env_var_to_config(:database_socket_dir),
           do: [{:socket_dir, env_var_to_config!(:database_socket_dir)}],
-          else: [{:hostname, env_var_to_config!(:database_host)}]
+          else: [{:hostname, env_var_to_config!(:database_host_replica)}]
         )
 
   config :portal, Portal.Changes.ReplicationConnection,
-    # TODO: Use a dedicated node for Change Data Capture replication
-    enabled: env_var_to_config!(:background_jobs_enabled),
+    enabled: env_var_to_config!(:changes_replication_enabled),
+    region: env_var_to_config!(:region),
     replication_slot_name: env_var_to_config!(:database_changes_replication_slot_name),
     publication_name: env_var_to_config!(:database_changes_publication_name),
     connection_opts:
@@ -63,13 +92,17 @@ if config_env() == :prod do
         username: env_var_to_config!(:database_user),
         database: env_var_to_config!(:database_name)
       ] ++
+        if(env_var_to_config!(:database_socket_options) != [],
+          do: [{:socket_options, env_var_to_config!(:database_socket_options)}],
+          else: []
+        ) ++
         if(env_var_to_config(:database_password),
           do: [{:password, env_var_to_config!(:database_password)}],
           else: []
         ) ++
         if(env_var_to_config(:database_socket_dir),
           do: [{:socket_dir, env_var_to_config!(:database_socket_dir)}],
-          else: [{:hostname, env_var_to_config!(:database_host)}]
+          else: [{:hostname, env_var_to_config!(:database_host_replica)}]
         )
 
   config :portal, Portal.Tokens,
@@ -97,17 +130,25 @@ if config_env() == :prod do
 
   config :portal, Portal.Billing.Stripe.APIClient, endpoint: "https://api.stripe.com"
 
-  config :portal, Portal.Billing,
-    enabled: env_var_to_config!(:billing_enabled),
-    secret_key: env_var_to_config!(:stripe_secret_key),
-    webhook_signing_secret: env_var_to_config!(:stripe_webhook_signing_secret),
-    default_price_id: env_var_to_config!(:stripe_default_price_id)
+  config :portal,
+         Portal.Billing,
+         [
+           enabled: env_var_to_config!(:billing_enabled),
+           secret_key: env_var_to_config!(:stripe_secret_key),
+           webhook_signing_secret: env_var_to_config!(:stripe_webhook_signing_secret),
+           default_price_id: env_var_to_config!(:stripe_default_price_id)
+         ] ++
+           if(env_var_to_config(:stripe_plan_product_ids) != [],
+             do: [plan_product_ids: env_var_to_config!(:stripe_plan_product_ids)],
+             else: []
+           ) ++
+           if(env_var_to_config(:stripe_adhoc_device_product_id),
+             do: [adhoc_device_product_id: env_var_to_config!(:stripe_adhoc_device_product_id)],
+             else: []
+           )
 
-  config :portal, platform_adapter: env_var_to_config!(:platform_adapter)
-
-  if platform_adapter = env_var_to_config!(:platform_adapter) do
-    config :portal, platform_adapter, env_var_to_config!(:platform_adapter_config)
-  end
+  config :portal, region: env_var_to_config!(:region)
+  config :portal, node_type: env_var_to_config!(:node_type)
 
   config :portal, Portal.Cluster,
     adapter: env_var_to_config!(:erlang_cluster_adapter),
@@ -119,13 +160,10 @@ if config_env() == :prod do
     idp_sync: env_var_to_config!(:feature_idp_sync_enabled),
     sign_up: env_var_to_config!(:feature_sign_up_enabled),
     policy_conditions: env_var_to_config!(:feature_policy_conditions_enabled),
-    multi_site_resources: env_var_to_config!(:feature_multi_site_resources_enabled),
     rest_api: env_var_to_config!(:feature_rest_api_enabled),
     internet_resource: env_var_to_config!(:feature_internet_resource_enabled)
 
   config :portal, sign_up_whitelisted_domains: env_var_to_config!(:sign_up_whitelisted_domains)
-
-  config :portal, docker_registry: env_var_to_config!(:docker_registry)
 
   config :portal,
     outbound_email_adapter_configured?: !!env_var_to_config!(:outbound_email_adapter)
@@ -144,77 +182,83 @@ if config_env() == :prod do
 
   # Oban has its own config validation that prevents overriding config in runtime.exs,
   # so we explicitly set the config in dev.exs, test.exs, and runtime.exs (for prod) only.
+  background_jobs_enabled = env_var_to_config!(:background_jobs_enabled)
+
+  oban_crontab = [
+    # Delete expired policy_authorizations every minute
+    {"* * * * *", Portal.Workers.DeleteExpiredPolicyAuthorizations},
+
+    # Schedule Entra directory sync every 2 hours
+    {"0 */2 * * *", Portal.Entra.Scheduler},
+
+    # Schedule Google directory sync every 2 hours
+    {"20 */2 * * *", Portal.Google.Scheduler},
+
+    # Schedule Okta directory sync every 2 hours
+    {"40 */2 * * *", Portal.Okta.Scheduler},
+
+    # Directory sync error notifications - daily check for low error count
+    {"0 9 * * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "entra", frequency: "daily"}},
+    {"0 9 * * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "google", frequency: "daily"}},
+    {"0 9 * * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "okta", frequency: "daily"}},
+
+    # Directory sync error notifications - every 3 days for medium error count
+    {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "entra", frequency: "three_days"}},
+    {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "google", frequency: "three_days"}},
+    {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "okta", frequency: "three_days"}},
+
+    # Directory sync error notifications - weekly for high error count
+    {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "entra", frequency: "weekly"}},
+    {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "google", frequency: "weekly"}},
+    {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
+     args: %{provider: "okta", frequency: "weekly"}},
+
+    # Check account limits every 30 minutes
+    {"*/30 * * * *", Portal.Workers.CheckAccountLimits},
+
+    # Check for outdated gateways - Sundays at 9am
+    {"0 9 * * 0", Portal.Workers.OutdatedGateways},
+
+    # Delete expired tokens every 5 minutes
+    {"*/5 * * * *", Portal.Workers.DeleteExpiredClientTokens},
+
+    # Delete old client sessions every 5 minutes
+    {"*/5 * * * *", Portal.Workers.DeleteOldClientSessions},
+
+    # Delete expired API tokens every 5 minutes
+    {"*/5 * * * *", Portal.Workers.DeleteExpiredAPITokens},
+
+    # Delete expired one-time passcodes every 5 minutes
+    {"*/5 * * * *", Portal.Workers.DeleteExpiredOneTimePasscodes},
+
+    # Delete expired portal sessions every 5 minutes
+    {"*/5 * * * *", Portal.Workers.DeleteExpiredPortalSessions}
+  ]
+
   config :portal, Oban,
-    # Periodic jobs don't make sense in tests
-    plugins: [
-      # Keep the last 7 days of completed, cancelled, and discarded jobs
-      {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
-
-      # Rescue jobs that have been stuck in executing state due to node crashes,
-      # deploys, or other issues. Jobs will be moved back to available state
-      # after the timeout. This can happen after a deploy or if a node crashes.
-      {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(120)},
-
-      # Periodic jobs
-      {Oban.Plugins.Cron,
-       crontab: [
-         # Delete expired policy_authorizations every minute
-         {"* * * * *", Portal.Workers.DeleteExpiredPolicyAuthorizations},
-
-         # Schedule Entra directory sync every 2 hours
-         {"0 */2 * * *", Portal.Entra.Scheduler},
-
-         # Schedule Google directory sync every 2 hours
-         {"20 */2 * * *", Portal.Google.Scheduler},
-
-         # Schedule Okta directory sync every 2 hours
-         {"40 */2 * * *", Portal.Okta.Scheduler},
-
-         # Directory sync error notifications - daily check for low error count
-         {"0 9 * * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "entra", frequency: "daily"}},
-         {"0 9 * * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "google", frequency: "daily"}},
-         {"0 9 * * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "okta", frequency: "daily"}},
-
-         # Directory sync error notifications - every 3 days for medium error count
-         {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "entra", frequency: "three_days"}},
-         {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "google", frequency: "three_days"}},
-         {"0 9 */3 * *", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "okta", frequency: "three_days"}},
-
-         # Directory sync error notifications - weekly for high error count
-         {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "entra", frequency: "weekly"}},
-         {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "google", frequency: "weekly"}},
-         {"0 9 * * 1", Portal.Workers.SyncErrorNotification,
-          args: %{provider: "okta", frequency: "weekly"}},
-
-         # Check account limits every 30 minutes
-         {"*/30 * * * *", Portal.Workers.CheckAccountLimits},
-
-         # Check for outdated gateways - Sundays at 9am
-         {"0 9 * * 0", Portal.Workers.OutdatedGateways},
-
-         # Delete expired tokens every 5 minutes
-         {"*/5 * * * *", Portal.Workers.DeleteExpiredClientTokens},
-
-         # Delete expired API tokens every 5 minutes
-         {"*/5 * * * *", Portal.Workers.DeleteExpiredAPITokens},
-
-         # Delete expired one-time passcodes every 5 minutes
-         {"*/5 * * * *", Portal.Workers.DeleteExpiredOneTimePasscodes},
-
-         # Delete expired portal sessions every 5 minutes
-         {"*/5 * * * *", Portal.Workers.DeleteExpiredPortalSessions}
-       ]}
-    ],
+    # Disable peer election and plugins on web/api nodes to avoid DB row-lock
+    # contention during blue/green deploys. With pool_size=2, Oban.Peers.Database
+    # transactions competing for the oban_peers lock can starve the connection pool.
+    peer: if(background_jobs_enabled, do: Oban.Peers.Database, else: false),
+    plugins:
+      if(background_jobs_enabled,
+        do: [
+          {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+          {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(120)},
+          {Oban.Plugins.Cron, crontab: oban_crontab}
+        ],
+        else: []
+      ),
     queues:
-      if(env_var_to_config!(:background_jobs_enabled),
+      if(background_jobs_enabled,
         do: [
           default: 10,
           entra_scheduler: 1,
@@ -255,12 +299,13 @@ if config_env() == :prod do
         path: web_external_url_path
       ],
       secret_key_base: env_var_to_config!(:secret_key_base),
-      check_origin: [
-        "#{web_external_url_scheme}://#{web_external_url_host}:#{web_external_url_port}",
-        "#{web_external_url_scheme}://*.#{web_external_url_host}:#{web_external_url_port}",
-        "#{web_external_url_scheme}://#{web_external_url_host}",
-        "#{web_external_url_scheme}://*.#{web_external_url_host}"
-      ],
+      check_origin:
+        [
+          "#{web_external_url_scheme}://#{web_external_url_host}:#{web_external_url_port}",
+          "#{web_external_url_scheme}://*.#{web_external_url_host}:#{web_external_url_port}",
+          "#{web_external_url_scheme}://#{web_external_url_host}",
+          "#{web_external_url_scheme}://*.#{web_external_url_host}"
+        ] ++ env_var_to_config!(:websocket_additional_origins),
       live_view: [
         signing_salt: env_var_to_config!(:live_view_signing_salt)
       ]
@@ -306,16 +351,34 @@ if config_env() == :prod do
   ##### Third-party configs #####
   ###############################
 
+  if maxmind_city_db_path = env_var_to_config!(:maxmind_city_db_path) do
+    config :geolix,
+      databases: [
+        %{
+          id: :city,
+          adapter: Geolix.Adapter.MMDB2,
+          source: maxmind_city_db_path
+        }
+      ]
+  end
+
   if System.get_env("OTLP_ENDPOINT") do
     config :opentelemetry,
       resource_detectors: [:otel_resource_env_var, :otel_resource_app_env],
       resource: %{
         service: %{
-          # These are populated on our GCP VMs
-          name: System.get_env("APPLICATION_NAME"),
-          namespace: System.get_env("GCP_PROJECT_ID"),
+          name: System.get_env("NODE_TYPE", "portal"),
+          namespace: "firezone",
           version: System.get_env("RELEASE_VSN"),
-          instance: %{id: System.get_env("GCP_INSTANCE_NAME")}
+          instance: %{id: System.get_env("NODE_NAME")}
+        },
+        host: %{
+          name: System.get_env("NODE_NAME"),
+          id: System.get_env("NODE_NAME")
+        },
+        cloud: %{
+          provider: "azure",
+          region: System.get_env("REGION")
         }
       }
 
@@ -327,6 +390,18 @@ if config_env() == :prod do
       otlp_protocol: :http_protobuf,
       otlp_traces_protocol: :http_protobuf,
       otlp_endpoint: System.get_env("OTLP_ENDPOINT")
+
+    config :opentelemetry_experimental,
+      readers: [
+        %{
+          module: :otel_metric_reader,
+          config: %{
+            export_interval_ms: 30_000,
+            exporter:
+              {:otel_exporter_metrics_otlp, %{endpoints: [System.get_env("OTLP_ENDPOINT")]}}
+          }
+        }
+      ]
   end
 
   config :portal, Portal.Health, health_port: env_var_to_config!(:health_port)

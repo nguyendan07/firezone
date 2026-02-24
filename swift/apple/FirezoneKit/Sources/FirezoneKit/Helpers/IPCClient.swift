@@ -6,6 +6,7 @@
 
 import Foundation
 @preconcurrency import NetworkExtension
+import SystemPackage
 
 // TODO: Use a more abstract IPC protocol to make this less terse
 
@@ -33,15 +34,25 @@ enum IPCClient {
 
   // Auto-connect
   @MainActor
-  static func start(session: NETunnelProviderSession) throws {
-    try session.startTunnel()
+  static func start(
+    session: NETunnelProviderSession, configuration: TunnelConfiguration
+  ) throws {
+    let configData = try encoder.encode(configuration)
+    let options: [String: NSObject] = [
+      "configuration": configData as NSObject
+    ]
+    try session.startTunnel(options: options)
   }
 
   // Sign in
   @MainActor
-  static func start(session: NETunnelProviderSession, token: String) throws {
+  static func start(
+    session: NETunnelProviderSession, token: String, configuration: TunnelConfiguration
+  ) throws {
+    let configData = try encoder.encode(configuration)
     let options: [String: NSObject] = [
-      "token": token as NSObject
+      "token": token as NSObject,
+      "configuration": configData as NSObject,
     ]
 
     try session.startTunnel(options: options)
@@ -56,10 +67,10 @@ enum IPCClient {
   }
 
   @MainActor
-  static func fetchResources(
+  static func fetchState(
     session: NETunnelProviderSession, currentHash: Data
   ) async throws -> Data? {
-    let message = ProviderMessage.getResourceList(currentHash)
+    let message = ProviderMessage.getState(currentHash)
 
     // Get data from the provider - if hash matches, provider returns nil
     return try await sendProviderMessage(session: session, message: message)
@@ -95,7 +106,14 @@ enum IPCClient {
   }
 
   @MainActor
-  static func exportLogs(session: NETunnelProviderSession, fileHandle: FileHandle) async throws {
+  static func fetchEncodedFirezoneId(session: NETunnelProviderSession) async throws -> String? {
+    guard let data = try await sendProviderMessage(session: session, message: .getEncodedFirezoneId)
+    else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  @MainActor
+  static func exportLogs(session: NETunnelProviderSession, fd: FileDescriptor) async throws {
     let isCycleStart = try await maybeCycleStart(session)
     defer {
       if isCycleStart { session.stopTunnel() }
@@ -125,8 +143,7 @@ enum IPCClient {
     while true {
       let chunk = try await nextChunk()
 
-      try fileHandle.seekToEnd()
-      fileHandle.write(chunk.data)
+      try fd.writeAll(chunk.data)
 
       if chunk.done { break }
     }
